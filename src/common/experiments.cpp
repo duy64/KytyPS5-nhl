@@ -59,9 +59,9 @@ uint64_t EnvironmentMask() {
 	set("KYTY_CPU_COPY_FORWARD", CpuCopyForward, false);
 	set("KYTY_WIDE_WRITE_DOWNLOADS", WideWriteDownloads, true);
 	set("KYTY_ASYNC_SUBMIT", AsyncSubmit, false);
-	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, false);
+	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, true);
 	set("KYTY_NATIVE_FP16", NativeFp16, false);
-	set("KYTY_FAULT_PAGE_READS", FaultPageReads, false);
+	set("KYTY_FAULT_PAGE_READS", FaultPageReads, true);
 	set("KYTY_EXEC_SELECTS", ExecSelects, false);
 	set("KYTY_EXEC_BRANCHES", ExecBranches, true);
 	set("KYTY_EXEC_BRANCH_MEMORY", ExecBranchMemory, true);
@@ -74,10 +74,10 @@ uint64_t EnvironmentMask() {
 	// fewer it would take time from the game's threads, so it stays off there unless asked for.
 	const unsigned cpus = std::thread::hardware_concurrency();
 	set("KYTY_DRAW_RESOLVER", DrawResolver, cpus >= 16);
-	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, false);
+	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, true);
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
-	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, false);
-	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, false);
+	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, true);
+	set("KYTY_BDA_DIRTY_REGIONS", BdaDirtyRegions, true);
 	// On again: the match-start hang it was suspected of was the label readback race
 	// (WriteDataBuffer), and it cuts the execution thread's readback waits to ~20 ms/s.
 	set("KYTY_CP_BACKING_READS", CpBackingReads, true);

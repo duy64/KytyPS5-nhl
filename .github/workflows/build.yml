@@ -1,7 +1,6 @@
 name: Build and Release KytyPS5
 
 on:
-  # Manual builds from nhl27-eadb only (no push/PR triggers).
   workflow_dispatch:
   push:
     branches: [opt/nhl27-fixes]

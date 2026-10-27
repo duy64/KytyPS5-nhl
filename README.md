@@ -197,9 +197,15 @@ Build exactly as upstream KytyPS5: Windows with clang-cl + Ninja + Qt 6. See the
 
 ```powershell
 git submodule update --init --recursive
-cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
+cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64" -DKYTY_PGO=use -DKYTY_THIN_LTO=ON
 cmake --build _Build/windows --target kyty_emulator
 ```
+
+`-DKYTY_PGO=use` builds with the NHL 27 gameplay profile in `tools/pgo`
+(measured +15% in gameplay; the profile matches clang 22.1.8, and a
+mismatched compiler now fails configure instead of silently building
+without PGO). `-DKYTY_THIN_LTO=ON` adds ThinLTO (draw 3.43 -> 3.34 us).
+To build without them, drop both flags.
 
 Build the launcher and stage a runnable installation:
 

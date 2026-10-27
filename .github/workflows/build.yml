@@ -3,6 +3,8 @@ name: Build and Release KytyPS5
 on:
   # Manual builds from nhl27-eadb only (no push/PR triggers).
   workflow_dispatch:
+  push:
+    branches: [opt/nhl27-fixes]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -408,7 +410,7 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'workflow_dispatch' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'push') &&
       needs.linux.result == 'success'
     needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest

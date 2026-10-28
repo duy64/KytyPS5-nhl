@@ -2766,7 +2766,10 @@ void TextureCache::RunGarbageCollector() {
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
-		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
+		// The collector runs after every guest submission, about 16-30 times a frame: idle ages
+		// are about 1 s, 10 frames and 5 frames, so images reused within a second are not freed
+		// and recreated.
+		const uint64_t age = std::min<uint64_t>(aggressive ? 80 : pressured ? 256 : 1024, tick);
 		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
@@ -2782,7 +2785,15 @@ void TextureCache::RunGarbageCollector() {
 			}
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			if (owner == nullptr || !owner->registered) {
+				continue;
+			}
+			// A skipped image is touched so it leaves the head of the LRU list: otherwise every pass
+			// takes the same uncollectable candidates and never reaches the collectable ones behind
+			// them, and video memory grows without bound.
+			if (owner->depth_id) {
+				// Freed with its depth owner.
+				TouchImage(*owner);
 				continue;
 			}
 			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u) {
@@ -2792,13 +2803,17 @@ void TextureCache::RunGarbageCollector() {
 			}
 			if (owner->IsGpuModified()) {
 				const bool safe = owner->SafeToDownload();
-				if (safe && owner->info.IsTiled()) {
+				// Tiled downloads are costly: only under critical pressure.
+				if (safe && owner->info.IsTiled() && !aggressive) {
+					TouchImage(*owner);
 					continue;
 				}
 				if (safe && !pressured) {
+					TouchImage(*owner);
 					continue;
 				}
 				if (safe && !DownloadImageMemory(id)) {
+					TouchImage(*owner);
 					continue;
 				}
 			}

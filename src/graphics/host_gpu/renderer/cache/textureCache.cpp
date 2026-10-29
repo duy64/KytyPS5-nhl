@@ -519,13 +519,13 @@ void TextureCache::FreeImage(ImageId id) {
 			const uint64_t tick = m_scheduler.CurrentTick();
 			const uint64_t last = image.tick_accessed_last;
 			std::printf("NHL27TEXFREE: risky free addr=0x%llx size=0x%llx fmt=%s %ux%u "
-			            "heap_refs=%u is_target=%d is_bound=%d gpu_modified=%d "
+			            "heap_refs=%u is_target=%d is_bound=%d needs_rebind=%d gpu_modified=%d "
 			            "tick=%llu tick_gap=%llu frame=%llu\n",
 			            static_cast<unsigned long long>(image.info.data.address),
 			            static_cast<unsigned long long>(image.info.data.size),
 			            vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
 			            image.info.extent.height, refs, image.binding.is_target ? 1 : 0,
-			            image.binding.is_bound ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+			            image.binding.is_bound ? 1 : 0, image.binding.needs_rebind ? 1 : 0, image.IsGpuModified() ? 1 : 0,
 			            static_cast<unsigned long long>(tick),
 			            static_cast<unsigned long long>(tick >= last ? tick - last : 0),
 			            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));

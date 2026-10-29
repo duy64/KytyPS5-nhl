@@ -508,6 +508,30 @@ void TextureCache::FreeImage(ImageId id) {
 		            image.info.extent.height, image.IsGpuModified() ? 1 : 0,
 		            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
 	}
+	// Diagnostic (not a fix): with KYTY_DBG_TEX_FREE=1, log only frees that look
+	// risky — an image still referenced by a resident heap, or still bound / a
+	// render target — with the tick gap since its last access and the flip
+	// count, so a corrupt frame can be matched to a free that should not have
+	// happened. Normal frees stay silent, so the log stays small.
+	if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE"); dbg != nullptr && dbg[0] == '1') {
+		const uint32_t refs = image.heap_refs.load(std::memory_order_relaxed);
+		if (refs != 0u || image.binding.is_target || image.binding.is_bound) {
+			const uint64_t tick = m_scheduler.CurrentTick();
+			const uint64_t last = image.tick_accessed_last;
+			std::printf("NHL27TEXFREE: risky free addr=0x%llx size=0x%llx fmt=%s %ux%u "
+			            "heap_refs=%u is_target=%d is_bound=%d gpu_modified=%d "
+			            "tick=%llu tick_gap=%llu frame=%llu\n",
+			            static_cast<unsigned long long>(image.info.data.address),
+			            static_cast<unsigned long long>(image.info.data.size),
+			            vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
+			            image.info.extent.height, refs, image.binding.is_target ? 1 : 0,
+			            image.binding.is_bound ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+			            static_cast<unsigned long long>(tick),
+			            static_cast<unsigned long long>(tick >= last ? tick - last : 0),
+			            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+			std::fflush(stdout);
+		}
+	}
 	if (image.IsGpuModified()) {
 		// Only overlap/alias frees write back. Unmap and GC frees must not enqueue guest writes.
 		if (AliasWritebackEnabled() && m_alias_free_in_progress) {

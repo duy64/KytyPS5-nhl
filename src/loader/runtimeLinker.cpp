@@ -1985,7 +1985,18 @@ Program* RuntimeLinker::FindProgramById(int32_t id) {
 	return nullptr;
 }
 
-Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_name) {
+std::vector<int32_t> RuntimeLinker::GetProgramIds() {
+Common::LockGuard lock(m_mutex);
+
+std::vector<int32_t> ids;
+	ids.reserve(m_programs.size());
+	for (auto* p: m_programs) {
+		ids.push_back(p->unique_id);
+	}
+	return ids;
+}
+	
+	Program* RuntimeLinker::FindProgramByFileName(const std::filesystem::path& elf_name) {
 	Common::LockGuard lock(m_mutex);
 
 	auto fixed_name = Common::FixFilenameSlash(Common::PathToGenericString(elf_name));

@@ -74,8 +74,13 @@ bool BreadcrumbInit(GraphicContext& graphics) {
 		return g_breadcrumbs.available;
 	}
 	g_breadcrumbs.initialized = true;
-	const char* enabled       = std::getenv("KYTY_DBG_BREADCRUMBS");
-	if (enabled == nullptr || enabled[0] == '\0' || enabled[0] == '0') {
+	// Diagnostic build: breadcrumbs default ON. They were previously gated
+	// behind KYTY_DBG_BREADCRUMBS, which testers never set, so the marker
+	// buffer was empty at device loss and DumpBreadcrumbs printed nothing.
+	// Set KYTY_DBG_BREADCRUMBS=0 to disable. The markers live in a
+	// host-visible buffer, so the last started/finished ids survive the loss.
+	const char* enabled = std::getenv("KYTY_DBG_BREADCRUMBS");
+	if (enabled != nullptr && enabled[0] == '0') {
 		return false;
 	}
 	if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdWriteBufferMarkerAMD == nullptr) {
@@ -176,21 +181,30 @@ void DumpCpuCrumbs() {
 	const auto known = g_crumb_master->KnownGpuTick();
 	const auto next  = g_cpu_crumb_next.load(std::memory_order_relaxed);
 	const auto first = next > g_cpu_crumbs.size() ? next - g_cpu_crumbs.size() : 0;
-	std::printf("NHL27HANG: GPU finished tick %llu, recording tick %llu\n",
-	            static_cast<unsigned long long>(known),
-	            static_cast<unsigned long long>(g_crumb_master->CurrentTick()));
+	// After a device loss the finished tick is unknown (UINT64_MAX), which
+	// made the old tick filter print "0 unfinished commands" and hide
+	// everything. In that case show the last recorded commands instead.
+	const bool known_valid = known != UINT64_MAX;
+	if (known_valid) {
+		std::printf("NHL27HANG: GPU finished tick %llu, recording tick %llu\n",
+		            static_cast<unsigned long long>(known),
+		            static_cast<unsigned long long>(g_crumb_master->CurrentTick()));
+	} else {
+		std::printf("NHL27HANG: GPU finished tick unknown after device loss, recording tick %llu\n",
+			            static_cast<unsigned long long>(g_crumb_master->CurrentTick()));
+	}
 	// The first unfinished commands and the last ones (the GPU hangs somewhere in between, most
 	// likely early, but the last ones show what was queued behind).
 	uint64_t unfinished = 0;
 	for (auto n = first; n < next; n++) {
 		const auto& c = g_cpu_crumbs[n % g_cpu_crumbs.size()];
-		unfinished += (c.kind != nullptr && c.tick > known) ? 1u : 0u;
+		unfinished += (c.kind != nullptr && (!known_valid || c.tick > known)) ? 1u : 0u;
 	}
 	std::printf("NHL27HANG: %llu unfinished commands\n", static_cast<unsigned long long>(unfinished));
 	uint64_t index = 0;
 	for (auto n = first; n < next; n++) {
 		const auto& c = g_cpu_crumbs[n % g_cpu_crumbs.size()];
-		if (c.kind == nullptr || c.tick <= known) {
+		if (c.kind == nullptr || (known_valid && c.tick <= known)) {
 			continue;
 		}
 		if (index < 32 || index + 32 >= unfinished) {

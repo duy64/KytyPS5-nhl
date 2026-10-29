@@ -1255,6 +1255,45 @@ KernelModule KYTY_SYSV_ABI KernelLoadStartModule(const char* module_file_name, s
 	return static_cast<KernelModule>(handle);
 }
 
+// sceKernelGetModuleList2: fill handles with the loaded programs' module
+// handles (the same unique_id values sceKernelLoadStartModule returns).
+// Kyty's programs are all game modules; system libraries are HLE and are
+// not programs, so no system-lib filtering is needed (the difference from
+// GetModuleList in shadPS4's implementation, which hides system libs).
+// Signature mirrors shadPS4: (handles, num_array, out_count); ENOMEM when
+// the buffer fills but modules remain, EFAULT on null pointers.
+int KYTY_SYSV_ABI KernelGetModuleList2(int32_t* handles, uint64_t num_array, uint64_t* out_count) {
+	PRINT_NAME();
+	
+	if (handles == nullptr || out_count == nullptr) {
+		return KERNEL_ERROR_EFAULT;
+	}
+	
+	auto* rt       = Common::Singleton<Loader::RuntimeLinker>::Instance();
+	const auto ids = rt->GetProgramIds();
+	
+	uint64_t written = 0;
+	for (const auto id : ids) {
+		if (written >= num_array) {
+			std::printf("NHL27MODLIST: buffer full num_array=%llu total=%zu written=%llu\n",
+				            static_cast<unsigned long long>(num_array), ids.size(),
+				            static_cast<unsigned long long>(written));
+std::fflush(stdout);
+return KERNEL_ERROR_ENOMEM;
+		}
+handles[written++] = id;
+	}
+
+*out_count = written;
+std::printf("NHL27MODLIST: wrote %llu handles:", static_cast<unsigned long long>(written));
+for (const auto id : ids) {
+std::printf(" %d", id);
+}
+std::printf("\n");
+std::fflush(stdout);
+return OK;
+}
+
 int KYTY_SYSV_ABI KernelStopUnloadModule(KernelModule handle, size_t args, const void* argp,
                                         uint32_t flags, const KernelUnloadModuleOpt* opt,
                                         int* res) {
@@ -3439,6 +3478,7 @@ LIB_DEFINE(InitLibKernel_1) {
 	LIB_FUNC("La9uyZv4Kvw", LibKernel::KernelGetAvailableCpumask);
 	LIB_FUNC("g0VTBxfJyu0", LibKernel::KernelGetCurrentCpu);
 	LIB_FUNC("wzvqT4UqKX8", LibKernel::KernelLoadStartModule);
+LIB_FUNC("ZzzC3ZGVAkc", LibKernel::KernelGetModuleList2);
 	LIB_FUNC("Xjoosiw+XPI", LibKernel::KernelUuidCreate);
 	LIB_FUNC("DLORcroUqbc", LibKernel::KernelGetOpenPsId);
 	LIB_FUNC("zE-wXIZjLoM", LibKernel::KernelDebugRaiseExceptionOnReleaseMode);

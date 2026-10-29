@@ -1,5 +1,7 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+
 #include "common/assert.h"
 #include "common/experiments.h"
 #include "graphics/guest_gpu/graphicsRun.h"
@@ -145,6 +147,14 @@ void MasterSemaphore::Wait(uint64_t tick) {
 			static_cast<int>(result), static_cast<unsigned long long>(tick),
 			on_gpu_thread ? 1 : 0);
 		std::fflush(stdout);
+		// Diagnostic (not a fix): ReportDeviceLost already exists and
+		// VK_EXT_device_fault is enabled at device creation, but the
+		// semaphore-wait path never called it, so device-lost crashes
+		// aborted with no NHL26FAULT lines in the log. Dump breadcrumbs
+		// and fault info before aborting, device-lost only.
+		if (result == vk::Result::eErrorDeviceLost) {
+			ReportDeviceLost(m_graphics);
+		}
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	if (stats) {

@@ -176,7 +176,6 @@ public:
 	static uint64_t ReadFromElf(Program* program, uint64_t vaddr);
 	Program*        FindProgramByAddr(uint64_t vaddr);
 	Program*        FindProgramById(int32_t id);
-		std::vector<int32_t> GetProgramIds();
 	Program*        FindProgramByFileName(const std::filesystem::path& elf_name);
 
 	static uint8_t* TlsGetAddr(Program* program);

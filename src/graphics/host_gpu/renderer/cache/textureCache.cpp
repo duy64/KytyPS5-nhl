@@ -1346,7 +1346,27 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		BumpGeneration(source.info.data.address, source.info.data.address + source.info.data.size);
 		GenCount(FrameBreakdown::g_delta.gen_rebind);
 	}
+	// FIX-TEST: a fresh expanded image with no guest upload keeps undefined
+	// device memory outside the copied intersection. Zero it before the copy
+	// so uncopied regions hold defined data. The flags are captured here
+	// because InitializeImage clears them.
+	const bool texfix_clear = expanded.info.samples == 1 && !expanded.info.IsDepth() &&
+	                          !expanded.info.IsBlock() && !expanded.IsBufferModified() &&
+	                          !expanded.IsCpuDirty();
 	InitializeImage(expanded_id);
+	if (texfix_clear) {
+		expanded.ClearToZero();
+		if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE");
+			    dbg != nullptr && dbg[0] == '1') {
+			std::printf("NHL27TEXFIX: cleared expanded image addr=0x%llx fmt=%s "
+				            "new=%ux%ux%u frame=%llu\n",
+				            static_cast<unsigned long long>(info.data.address),
+				            vk::to_string(info.pixel_format).c_str(), info.extent.width,
+				            info.extent.height, info.extent.depth,
+				            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+			std::fflush(stdout);
+		}
+	}
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
 	const uint32_t src_levels = source.info.HostLevels();

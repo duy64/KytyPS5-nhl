@@ -1310,6 +1310,25 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BumpGeneration(cached.info.data.address, cached.info.data.address + cached.info.data.size);
 		GenCount(FrameBreakdown::g_delta.gen_rebind);
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		auto& merged = m_slot_images[merged_id];
+		if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE");
+			    dbg != nullptr && dbg[0] == '1') {
+			std::printf("NHL27TEXMERGE: merged addr=0x%llx fmt=%s extent=%ux%ux%u levels=%u host_levels=%u samples=%u depth=%d block=%d buf_mod=%d cpu_dirty=%d gpu_mod=%d mip=%d layer=%d past_host=%d freed addr=0x%llx fmt=%s extent=%ux%ux%u frame=%llu\n",
+				            static_cast<unsigned long long>(merged.info.data.address),
+				vk::to_string(merged.info.pixel_format).c_str(), merged.info.extent.width,
+				merged.info.extent.height, merged.info.extent.depth,
+				merged.info.resources.levels, merged.info.HostLevels(),
+				merged.info.samples, merged.info.IsDepth() ? 1 : 0,
+				merged.info.IsBlock() ? 1 : 0, merged.IsBufferModified() ? 1 : 0,
+				merged.IsCpuDirty() ? 1 : 0, merged.IsGpuModified() ? 1 : 0, mip, layer,
+				mip >= static_cast<int32_t>(merged.info.HostLevels()) ? 1 : 0,
+				static_cast<unsigned long long>(cached.info.data.address),
+				vk::to_string(cached.info.pixel_format).c_str(), cached.info.extent.width,
+				cached.info.extent.height, cached.info.extent.depth,
+				static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+			std::fflush(stdout);
+		}
+			
 		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
 		FreeImage(cached_id);

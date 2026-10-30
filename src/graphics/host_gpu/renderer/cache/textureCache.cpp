@@ -1413,8 +1413,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 		CopyImage(expanded_id, source_id);
 	}
 		expanded.diag_bind_logged = false;
-	if (info.pixel_format == vk::Format::eR16Unorm && info.extent.width >= 1024u) {
-		if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE");
+			if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE");
 		    dbg != nullptr && dbg[0] == '1') {
 			std::printf("NHL27TEXEXPAND: addr=0x%llx fmt=%s old=%ux%ux%u old_host_levels=%u "
 			            "new=%ux%ux%u new_host_levels=%u path=%s mip=%d copied_mask=0x%08x "
@@ -1428,7 +1427,6 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 			            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
 			std::fflush(stdout);
 		}
-	}
 	FreeImage(source_id);
 	return expanded_id;
 }

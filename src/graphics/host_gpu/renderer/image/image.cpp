@@ -715,8 +715,7 @@ range.baseMipLevel   = 0;
 range.levelCount     = VK_REMAINING_MIP_LEVELS;
 range.baseArrayLayer = 0;
 range.layerCount     = VK_REMAINING_ARRAY_LAYERS;
-command.clearColorImage(backing.image, vk::ImageLayout::eTransferDstOptimal, clear, 1,
-	                        &range);
+command.clearColorImage(backing.image, vk::ImageLayout::eTransferDstOptimal, clear, range);
 Transit(vk::ImageLayout::eGeneral,
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }

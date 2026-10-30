@@ -45,6 +45,7 @@ struct ImageBinding {
 	bool             is_bound      = false;
 	bool             is_target     = false;
 	bool             needs_rebind  = false;
+const char* diag_rebind_src = "none";
 	bool             force_general = false;
 	bool             shader_write  = false;
 };

@@ -7,6 +7,26 @@ A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused 
 > Not affiliated with Sony Interactive Entertainment, PlayStation or Electronic Arts. No game files or
 > system software are distributed. Use only game files you have obtained legally.
 
+## What this fork adds over upstream
+
+Fixes:
+- Be A Pro tessellation crash fixed (warns and continues instead of aborting)
+- sceKernelGetModuleList2 implemented (was an unimplemented stub that crashed some PCs at boot)
+- Fixed 6 experiment-bit collisions
+
+Performance defaults turned on: LONG_BUFFER_GC_AGE, PM4_WRITE_DATA_FAST, READBACK_QUEUE, DIRECT_EOP_INTERRUPTS, SPARSE_BUFFER_GC, LAZY_SHARED_WRITES, FAULT_PAGE_READS, ASYNC_GUEST_READS, GPU_COLOR_CLEAR, BDA_DIRTY_REGIONS
+
+Launcher kept (upstream removed it).
+
+### Build lines (see Releases — pick by suffix)
+- `-main`: clean playable build for daily play
+- `-crumb`: diagnostic build for the GPU device-loss crash investigation
+- `-modlist`: build with the module-list fix for the boot-crash investigation
+
+### Still unsolved, under investigation
+- The texture glitch (garbled ice/players, HUD fine)
+- The Nvidia device-loss crash
+
 ## Status (2026-10-10)
 
 | | NHL 27 | NHL 26 |

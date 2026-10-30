@@ -1340,6 +1340,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	RefreshCopySource(source_id);
 	const auto expanded_id = InsertImage(info);
 	auto&      source      = m_slot_images[source_id];
+	auto&      expanded    = m_slot_images[expanded_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
 		BumpGeneration(source.info.data.address, source.info.data.address + source.info.data.size);
@@ -1348,11 +1349,42 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	InitializeImage(expanded_id);
 	const int32_t mip = source.info.MipOf(info);
 	const int32_t layer = source.info.SliceOf(info, mip);
+	const uint32_t src_levels = source.info.HostLevels();
+	const uint32_t dst_levels = info.HostLevels();
+	const bool     extent_grew =
+	    info.extent.width > source.info.extent.width ||
+	    info.extent.height > source.info.extent.height ||
+	    info.extent.depth > source.info.extent.depth;
 	if (layer >= 0) {
+		expanded.diag_filled_levels =
+		    (mip >= 0 && static_cast<uint32_t>(mip) < dst_levels) ? (1u << mip) : 0u;
 		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
 		             static_cast<uint32_t>(layer));
-	} else {
+	} else if (extent_grew) {
+		expanded.diag_filled_levels = 0u;
 		CopyImage(expanded_id, source_id);
+	} else {
+		const uint32_t copied = std::min(src_levels, dst_levels);
+		expanded.diag_filled_levels =
+		    copied == 0u ? 0u : (copied >= 32u ? 0xFFFFFFFFu : ((1u << copied) - 1u));
+		CopyImage(expanded_id, source_id);
+	}
+		expanded.diag_bind_logged = false;
+	if (info.pixel_format == vk::Format::eR16Unorm && info.extent.width >= 1024u) {
+		if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE");
+		    dbg != nullptr && dbg[0] == '1') {
+			std::printf("NHL27TEXEXPAND: addr=0x%llx fmt=%s old=%ux%ux%u old_host_levels=%u "
+			            "new=%ux%ux%u new_host_levels=%u path=%s mip=%d copied_mask=0x%08x "
+			            "extent_grew=%d frame=%llu\n",
+			            static_cast<unsigned long long>(info.data.address),
+			            vk::to_string(info.pixel_format).c_str(), source.info.extent.width,
+			            source.info.extent.height, source.info.extent.depth, src_levels,
+			            info.extent.width, info.extent.height, info.extent.depth, dst_levels,
+			            layer >= 0 ? "mip" : "full", mip, expanded.diag_filled_levels,
+			            extent_grew ? 1 : 0,
+			            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+			std::fflush(stdout);
+		}
 	}
 	FreeImage(source_id);
 	return expanded_id;

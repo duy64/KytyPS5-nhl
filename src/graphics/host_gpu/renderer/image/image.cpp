@@ -697,6 +697,30 @@ void Image::CopyMip(Image& source, uint32_t mip, uint32_t layer) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
+void Image::ClearToZero() {
+m_scheduler.EndRendering();
+const auto image_barriers =
+	    GetBarriers(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	            vk::PipelineStageFlagBits2::eCopy, {});
+vk::DependencyInfo dependency {};
+dependency.dependencyFlags          = vk::DependencyFlagBits::eByRegion;
+dependency.imageMemoryBarrierCount = static_cast<uint32_t>(image_barriers.size());
+dependency.pImageMemoryBarriers    = image_barriers.data();
+auto command                       = m_scheduler.Current().Handle();
+command.pipelineBarrier2(dependency);
+const vk::ClearColorValue clear {};
+vk::ImageSubresourceRange range {};
+range.aspectMask     = vk::ImageAspectFlagBits::eColor;
+range.baseMipLevel   = 0;
+range.levelCount     = VK_REMAINING_MIP_LEVELS;
+range.baseArrayLayer = 0;
+range.layerCount     = VK_REMAINING_ARRAY_LAYERS;
+command.clearColorImage(backing.image, vk::ImageLayout::eTransferDstOptimal, clear, 1,
+	                        &range);
+Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+}
+
 namespace ImageOps {
 
 void Validate(const ImageInfo& info) {

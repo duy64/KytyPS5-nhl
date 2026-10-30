@@ -10,11 +10,11 @@ A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused 
 - `-main`: clean playable build for daily play
 - `-crumb`: diagnostic build for the GPU device-loss crash investigation
 - `-modlist`: build with the module-list fix for the boot-crash investigation
-- - `-texdiag`: diagnostic build logging risky texture frees, expansions, and at-risk binds (texture glitch investigation)
-  - - `-texfix`: test build zero-filling fresh expanded textures (texture glitch investigation)
-    - - `-texmerge`: diagnostic build logging texture-cache merges (texture glitch investigation)
-      - - `-readback`: diagnostic build logging second-queue readbacks (device-loss investigation)
-        - - `-rebind`: diagnostic build tagging the source of every needs_rebind flag and logging every texture expansion (texture glitch investigation)
+- `-texdiag`: diagnostic build logging risky texture frees, expansions, and at-risk binds (texture glitch investigation)
+- `-texfix`: test build zero-filling fresh expanded textures (texture glitch investigation)
+- `-texmerge`: diagnostic build logging texture-cache merges (texture glitch investigation)
+- `-readback`: diagnostic build logging second-queue readbacks (device-loss investigation)
+- `-rebind`: diagnostic build tagging the source of every needs_rebind flag and logging every texture expansion (texture glitch investigation)
 
 *Development on this fork is AI-assisted; all changes are reviewed and tested in-game by the maintainer before release.*
 

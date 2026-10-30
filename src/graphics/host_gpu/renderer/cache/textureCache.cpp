@@ -2211,6 +2211,31 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 		}
 		return image.PrepareShadowStorage(desc.view_info);
 	}
+	if (desc.type == BindingType::Texture && !image.diag_bind_logged &&
+	    image.info.pixel_format == vk::Format::eR16Unorm && image.info.extent.width >= 1024u &&
+	    image.diag_filled_levels != 0xFFFFFFFFu && desc.view_info.level_count > 0u) {
+		const uint32_t top = desc.view_info.base_level + desc.view_info.level_count - 1u;
+		uint32_t       view_mask = 0u;
+		for (uint32_t level = desc.view_info.base_level; level <= top && level < 32u; level++) {
+			view_mask |= (1u << level);
+		}
+		if ((view_mask & ~image.diag_filled_levels) != 0u) {
+			if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE");
+			    dbg != nullptr && dbg[0] == '1') {
+				std::printf("NHL27TEXATRISK: addr=0x%llx fmt=%s extent=%ux%ux%u levels=%u "
+				            "view_base=%u view_count=%u filled_mask=0x%08x frame=%llu\n",
+				            static_cast<unsigned long long>(image.info.data.address),
+				            vk::to_string(image.info.pixel_format).c_str(),
+				            image.info.extent.width, image.info.extent.height,
+				            image.info.extent.depth, image.info.HostLevels(),
+				            desc.view_info.base_level, desc.view_info.level_count,
+				            image.diag_filled_levels,
+				            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+				std::fflush(stdout);
+			}
+			image.diag_bind_logged = true;
+		}
+	}
 	return image.FindView(desc.view_info);
 }
 

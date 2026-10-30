@@ -7,25 +7,12 @@ A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused 
 > Not affiliated with Sony Interactive Entertainment, PlayStation or Electronic Arts. No game files or
 > system software are distributed. Use only game files you have obtained legally.
 
-## What this fork adds over upstream
-
-Fixes:
-- Be A Pro tessellation crash fixed (warns and continues instead of aborting)
-- sceKernelGetModuleList2 implemented (was an unimplemented stub that crashed some PCs at boot)
-- Fixed 6 experiment-bit collisions
-
-Performance defaults turned on: LONG_BUFFER_GC_AGE, PM4_WRITE_DATA_FAST, READBACK_QUEUE, DIRECT_EOP_INTERRUPTS, SPARSE_BUFFER_GC, LAZY_SHARED_WRITES, FAULT_PAGE_READS, ASYNC_GUEST_READS, GPU_COLOR_CLEAR, BDA_DIRTY_REGIONS
-
-Launcher kept (upstream removed it).
-
-### Build lines (see Releases — pick by suffix)
+## Build lines
 - `-main`: clean playable build for daily play
 - `-crumb`: diagnostic build for the GPU device-loss crash investigation
 - `-modlist`: build with the module-list fix for the boot-crash investigation
 
-### Still unsolved, under investigation
-- The texture glitch (garbled ice/players, HUD fine)
-- The Nvidia device-loss crash
+*Development on this fork is AI-assisted; all changes are reviewed and tested in-game by the maintainer before release.*
 
 ## Status (2026-10-10)
 
@@ -62,6 +49,8 @@ greater single thread performance.
 - **Bright pixels**
 - **Scrambled team logos**
 - **Volume normalization issues**
+- Texture glitch: garbled / pixel-matrix ice and players, usually right after goals; HUD unaffected; under investigation
+- Nvidia GPU device-loss crash (one tester, RTX 4080): crashes in menus and mid-game; under investigation
 
 ## Notable fixes in this fork
 
@@ -89,6 +78,11 @@ greater single thread performance.
   It is rewritten as if/return.
 - **NHL 26 boot:** `param.json` missing from dumps (use `target-param.json`), and `--redzone` to stop host exception
   dispatch from clobbering the SysV red zone.
+-   Be A Pro tessellation crash fixed (abort in LowerTessellationMemory replaced by a warning)
+  - sceKernelGetModuleList2 implemented (fixes the NHL 27 boot crash on some machines)
+  - Six experiment-bit collisions fixed (bits 38-43 remapped to 52-57)
+  - Performance defaults enabled: LONG_BUFFER_GC_AGE, PM4_WRITE_DATA_FAST, READBACK_QUEUE, DIRECT_EOP_INTERRUPTS, SPARSE_BUFFER_GC, LAZY_SHARED_WRITES, FAULT_PAGE_READS, ASYNC_GUEST_READS, GPU_COLOR_CLEAR, BDA_DIRTY_REGIONS
+  - Slint launcher kept
 <table align="center">
   <tr>
     <td align="center">

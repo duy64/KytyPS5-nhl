@@ -1252,6 +1252,13 @@ bool BufferCache::ReadbackOnSecondQueue(const Buffer& source, const Buffer& dest
 		return false;
 	}
 	Common::Timeline::Mark("readback-queue", wait_tick);
+	if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE");
+		    dbg != nullptr && dbg[0] == '1') {
+		std::printf("NHL27READBACK2: second-queue readback submit ok (kind %u, tick %llu, gpu thread %d)\n",
+			kind, static_cast<unsigned long long>(wait_tick),
+			GuestGpu::IsGpuThread() ? 1 : 0);
+		std::fflush(stdout);
+	}
 	// KYTY_READBACK_SPIN=1: most copies of finished data take tens of microseconds, less than
 	// waking a thread that sleeps on the fence (measured within noise as experiment bit 9).
 	static const bool readback_spin = [] {

@@ -1,7 +1,6 @@
 # KytyPS5-nhl
 
-A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused on getting **EA Sports NHL 27**
-(PPSA34063, v01.003.001) and **NHL 26** (PPSA26785) running well. The working branch is `nhl26`.
+A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused on getting **EA Sports NHL 27** (PPSA34063, v01.003.001) running well. NHL 26 is untested on this fork. The working branch is `cold`.
 
 > [!IMPORTANT]
 > Not affiliated with Sony Interactive Entertainment, PlayStation or Electronic Arts. No game files or
@@ -14,31 +13,16 @@ A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused 
 
 *Development on this fork is AI-assisted; all changes are reviewed and tested in-game by the maintainer before release.*
 
-## Status (2026-10-10)
+## Status (2026-10-29)
 
-| | NHL 27 | NHL 26 |
-|---|---|---|
-| Boots to menus | Yes | Yes |
-| Franchise / Play Now menus | Yes | Yes |
-| Loads into a match | Yes | Yes (slow) |
-| Player / scene lighting | **Fixed** (front-face encoding) | **Fixed** (same fix) |
-| Commentary audio | Working (Opus multistream fix); some lines still garbled | – |
-| Save / profile | Working | – |
-
-## Performance
-
-FPS ranges in normal play mode (no profiler or debug logging), measured after the lighting fix.
-
-| Scene | RX 6800 XT, Ryzen 5 5600 32 GB DDR4-3200| RX 9060 XT, Ryzen 5 9600x|
-|---|---|---|
-| Main menu (game caps at 30) | 26-30| 30 |
-| Franchise menus (game caps at 30) | 30 | 30 |
-| Team select | 18-26 | ? |
-| In match | 12-19 | 22-28 |
-| Free skate | 34-39 | 49-56 |
-
-Fps is mainly limited by CPU-side per-draw preparation (descriptor/resource setup). Newer CPU's will preform better due to
-greater single thread performance.
+| | NHL 27 |
+|---|---|
+| Boots to menus | Yes |
+| Franchise / Play Now menus | Yes |
+| Loads into a match | Yes |
+| Player / scene lighting | **Fixed** (front-face encoding) |
+| Commentary audio | Working (Opus multistream fix); some lines still garbled |
+| Save / profile | Working |
 
 ## Known bugs
 

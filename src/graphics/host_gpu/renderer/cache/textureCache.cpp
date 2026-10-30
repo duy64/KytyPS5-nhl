@@ -519,13 +519,13 @@ void TextureCache::FreeImage(ImageId id) {
 			const uint64_t tick = m_scheduler.CurrentTick();
 			const uint64_t last = image.tick_accessed_last;
 			std::printf("NHL27TEXFREE: risky free addr=0x%llx size=0x%llx fmt=%s %ux%u "
-			            "heap_refs=%u is_target=%d is_bound=%d needs_rebind=%d gpu_modified=%d "
+			            "heap_refs=%u is_target=%d is_bound=%d needs_rebind=%d rebind_src=%s gpu_modified=%d "
 			            "tick=%llu tick_gap=%llu frame=%llu\n",
 			            static_cast<unsigned long long>(image.info.data.address),
 			            static_cast<unsigned long long>(image.info.data.size),
 			            vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
 			            image.info.extent.height, refs, image.binding.is_target ? 1 : 0,
-			            image.binding.is_bound ? 1 : 0, image.binding.needs_rebind ? 1 : 0, image.IsGpuModified() ? 1 : 0,
+			            image.binding.is_bound ? 1 : 0, image.binding.needs_rebind ? 1 : 0, image.binding.diag_rebind_src, image.IsGpuModified() ? 1 : 0,
 			            static_cast<unsigned long long>(tick),
 			            static_cast<unsigned long long>(tick >= last ? tick - last : 0),
 			            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
@@ -1069,6 +1069,7 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	replacement.usage         = cached.usage;
 	if (cached.binding.is_bound || cached.binding.is_target) {
 		cached.binding.needs_rebind = true;
+		cached.binding.diag_rebind_src = "depth";
 		BumpGeneration(cached.info.data.address, cached.info.data.address + cached.info.data.size);
 		GenCount(FrameBreakdown::g_delta.gen_rebind);
 	}
@@ -1181,6 +1182,7 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 		}
 	}
 	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+	if (cached.binding.is_bound || cached.binding.is_target) cached.binding.diag_rebind_src = "bcalias";
 	cache.FreeImage(cached_id);
 }
 
@@ -1307,6 +1309,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		if (cached.binding.is_bound || cached.binding.is_target) cached.binding.diag_rebind_src = "merge";
 		BumpGeneration(cached.info.data.address, cached.info.data.address + cached.info.data.size);
 		GenCount(FrameBreakdown::g_delta.gen_rebind);
 		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
@@ -1362,6 +1365,7 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	auto&      expanded    = m_slot_images[expanded_id];
 	if (source.binding.is_bound || source.binding.is_target) {
 		source.binding.needs_rebind = true;
+		source.binding.diag_rebind_src = "expand";
 		BumpGeneration(source.info.data.address, source.info.data.address + source.info.data.size);
 		GenCount(FrameBreakdown::g_delta.gen_rebind);
 	}

@@ -1127,6 +1127,28 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		            vk::to_string(replacement.backing.format).c_str(),
 		            replacement.info.IsDepth() ? 1 : 0, copy_path);
 	}
+	if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE"); dbg != nullptr && dbg[0] == '1') {
+		std::printf("NHL27DEPTH2: recreate old addr=0x%llx size=0x%llx fmt=%s backing=%s samples=%u gpu_modified=%d buffer_modified=%d cpu_dirty=%d -> new fmt=%s backing=%s samples=%u depth=%d copy=%s frame=%llu\n",
+		            static_cast<unsigned long long>(cached.info.data.address),
+		            static_cast<unsigned long long>(cached.info.data.size),
+		            vk::to_string(cached.info.pixel_format).c_str(),
+		            vk::to_string(cached.backing.format).c_str(), cached.backing.samples,
+		            cached.IsGpuModified() ? 1 : 0, cached.IsBufferModified() ? 1 : 0, cached.IsCpuDirty() ? 1 : 0,
+		            vk::to_string(replacement.info.pixel_format).c_str(),
+		            vk::to_string(replacement.backing.format).c_str(), replacement.backing.samples,
+		            replacement.info.IsDepth() ? 1 : 0, copy_path,
+		            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+		std::fflush(stdout);
+		if (std::strcmp(copy_path, "none") == 0) {
+			std::printf("NHL27NOCOPY: depth_recreate old addr=0x%llx size=0x%llx fmt=%s -> new fmt=%s frame=%llu\n",
+			            static_cast<unsigned long long>(cached.info.data.address),
+			            static_cast<unsigned long long>(cached.info.data.size),
+			            vk::to_string(cached.info.pixel_format).c_str(),
+			            vk::to_string(replacement.info.pixel_format).c_str(),
+			            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+			std::fflush(stdout);
+		}
+	}
 	FreeImage(cached_id);
 	return replacement_id;
 }
@@ -1351,6 +1373,18 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		            static_cast<unsigned long long>(cached.info.data.size),
 		            vk::to_string(cached.info.pixel_format).c_str(),
 		            (requested.data.address >= cached.info.data.address && safe_to_delete) ? 1 : 0);
+	}
+	if (const char* dbg = std::getenv("KYTY_DBG_TEX_FREE"); dbg != nullptr && dbg[0] == '1') {
+		std::printf("NHL27NOCOPY: partial_overlap requested addr=0x%llx size=0x%llx fmt=%s | cached addr=0x%llx size=0x%llx fmt=%s freed=%d frame=%llu\n",
+		            static_cast<unsigned long long>(requested.data.address),
+		            static_cast<unsigned long long>(requested.data.size),
+		            vk::to_string(requested.pixel_format).c_str(),
+		            static_cast<unsigned long long>(cached.info.data.address),
+		            static_cast<unsigned long long>(cached.info.data.size),
+		            vk::to_string(cached.info.pixel_format).c_str(),
+		            (requested.data.address >= cached.info.data.address && safe_to_delete) ? 1 : 0,
+		            static_cast<unsigned long long>(BufferCache::PerfFlipCount()));
+		std::fflush(stdout);
 	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
 		FreeImage(cached_id);

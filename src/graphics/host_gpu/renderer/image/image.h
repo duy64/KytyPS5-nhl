@@ -85,6 +85,7 @@ public:
 	             const ImageSubresourceRange& destination_range);
 	void CopyImageWithBuffer(Image& source, Buffer& buffer, TileManager& tiler);
 	void CopyMip(Image& source, uint32_t mip, uint32_t layer);
+void ClearToZero();
 
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;

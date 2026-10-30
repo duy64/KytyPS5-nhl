@@ -178,6 +178,17 @@ public:
 	uint64_t         lru_tick           = ~uint64_t {0}; // GC tick of the last LRU touch
 	// Resident image heap elements that select this image.
 	std::atomic<uint32_t> heap_refs {0};
+	// Diagnostic only (KYTY_DBG_TEX_FREE): bitmask of the host mip levels this
+	// image is known to hold valid data in. All-ones means "not expansion
+	// tracked": every level is treated as valid. ExpandImage replaces the mask
+	// with exactly the levels its copy filled; levels outside the mask were
+	// never copied or uploaded by the expansion and still hold undefined
+	// device memory. A level counts as filled only if the copy covered its
+	// full extent, so an extent-growing expansion leaves the mask at zero.
+	uint32_t diag_filled_levels = 0xFFFFFFFFu;
+	// Set once the first at-risk bind of this expanded image has been logged,
+	// so the bind log stays at one line per expansion.
+	bool diag_bind_logged = false;
 
 private:
 	friend struct ImageTestAccess;

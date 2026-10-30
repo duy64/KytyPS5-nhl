@@ -3,7 +3,7 @@ name: Build and Release KytyPS5
 on:
   workflow_dispatch:
   push:
-    branches: [opt/nhl27-texfix]
+    branches: [opt/nhl27-texmerge]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -26,7 +26,7 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}-texfix" >> "$GITHUB_OUTPUT"
+          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}-texmerge" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Build KytyPS5 (Windows)

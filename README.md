@@ -185,6 +185,19 @@ Useful debug options:
 | `KYTY_DBG_FORCE_SHADOW_COMPARE=always` | Force every depth-compare sampler to "lit" (diagnostic) |
 | `KYTY_DBG_DEPTH_ALIAS=1` (+`_ADDR=`) | Log depth/texture aliasing events |
 
+### Resolution scaling
+
+Render resolution is the Frostbite 4K preset multiplied by `KYTY_NHL_RES_SCALE` (0.25–1.0). The shipped configuration sets 0.6667 (about 1440p). Set it in the launcher environment table (Advanced tab), then Save and relaunch:
+
+| `KYTY_NHL_RES_SCALE` | Internal resolution |
+|---|---|
+| 1.0 | 4K |
+| 0.6667 | About 1440p (shipped default) |
+| 0.5 | 1080p |
+| 0.3333 | 720p |
+
+A blank environment table keeps the shipped 0.6667. Values outside 0.25–1.0 are ignored. The launcher's Screen resolution setting only changes the output window, not the render resolution.
+
 ## Credits
 
 - [KytyPS5](https://github.com/KytyPS5/KytyPS5) and the original [Kyty](https://github.com/InoriRus/Kyty).

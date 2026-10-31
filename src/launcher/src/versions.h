@@ -76,4 +76,11 @@ std::string install_release(const ReleaseInfo& r, const std::string& versions_di
                             const std::atomic<bool>* cancel = nullptr);
 
 
+// Downloads the release zip and unpacks it into versions_dir/<folder>/.kyty-update-pending/payload,
+// the staging layout kyty_updater --install expects: the updater swaps those files into the folder
+// after the launcher exits, which is the only way to update the build the launcher itself runs from
+// (Windows cannot replace a running program). Returns the payload path, or "" with *error set.
+std::string stage_release_for_updater(const ReleaseInfo& r, const std::string& versions_dir, const ProgressFn& progress, std::string* error,
+                                      const std::atomic<bool>* cancel = nullptr);
+
 } // namespace kyty_launcher

@@ -821,7 +821,7 @@ std::string install_release(const ReleaseInfo& r, const std::string& versions_di
 }
 
 std::string stage_release_for_updater(const ReleaseInfo& r, const std::string& versions_dir, const ProgressFn& progress, std::string* error,
-                                      const std::atomic<bool>* cancel = nullptr)
+                                      const std::atomic<bool>* cancel)
 {
     std::error_code ec;
     const fs::path root = utf8_path(versions_dir);

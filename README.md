@@ -39,7 +39,7 @@ A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused 
 - **Scrambled team logos**
 - **Volume normalization issues**
 - Texture glitch: garbled / pixel-matrix ice and players, usually right after goals; HUD unaffected; under investigation
-- Nvidia GPU device-loss crash (one tester, RTX 4080): crashes in menus and mid-game; under investigation
+- GPU device-loss crash (RTX 4080 tester, systematic; also one occurrence on AMD RX 7900 XTX, cause unconfirmed): crashes in menus and mid-game; under investigation
 
 ## Notable fixes in this fork
 

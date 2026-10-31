@@ -1306,6 +1306,19 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		            vk::to_string(cached.info.pixel_format).c_str(),
 		            (requested.data.address >= cached.info.data.address && safe_to_delete) ? 1 : 0);
 	}
+	// A partial overlap with no prior resolution must not drop the cached
+	// image's bytes: the next draw would sample an uninitialized image.
+	// Carry the bytes across with the same helper the mip cases use, but
+	// only when the copy cannot fault (equal sample counts and a direct
+	// copy); otherwise keep the old fall-through rather than risk a fault.
+	if (!merged_id && requested.samples == cached.info.samples &&
+		    requested.GetColorTransform() == cached.info.GetColorTransform() &&
+		    requested.type == cached.info.type &&
+		    (requested.pixel_format == cached.info.pixel_format ||
+		     (!requested.IsDepth() && !cached.info.IsDepth() &&
+		      vk::blockSize(requested.pixel_format) == vk::blockSize(cached.info.pixel_format)))) {
+		    return {ExpandImage(requested, cached_id)};
+	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
 		FreeImage(cached_id);
 	}

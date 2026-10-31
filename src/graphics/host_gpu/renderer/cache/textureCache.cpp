@@ -1319,6 +1319,31 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		      vk::blockSize(requested.pixel_format) == vk::blockSize(cached.info.pixel_format)))) {
 		    return {ExpandImage(requested, cached_id)};
 	}
+	// A partial overlap WITH a prior resolution must not drop the cached
+	// image's bytes either: the next draw would sample the merged image
+	// without the candidate's texels (stale backing or uninitialized
+	// memory). Copy the candidate into the merged image, mirroring the
+	// mip branch above — but only when the copy is provably safe: same
+	// base address (so the copy lands at the merged origin), equal sample
+	// counts, a direct copy, and a safe free. Otherwise keep the old
+	// fall-through rather than risk a fault or a worse corruption.
+	// Speculative lookups are discarded, so never free on that path.
+	if (merged_id && !speculative && safe_to_delete &&
+	    requested.data.address == cached.info.data.address &&
+	    requested.samples == cached.info.samples &&
+	    requested.GetColorTransform() == cached.info.GetColorTransform() &&
+	    requested.type == cached.info.type &&
+	    (requested.pixel_format == cached.info.pixel_format ||
+	     (!requested.IsDepth() && !cached.info.IsDepth() &&
+	      vk::blockSize(requested.pixel_format) == vk::blockSize(cached.info.pixel_format)))) {
+		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		BumpGeneration(cached.info.data.address, cached.info.data.address + cached.info.data.size);
+		GenCount(FrameBreakdown::g_delta.gen_rebind);
+		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		CopyImage(merged_id, cached_id);
+		FreeImage(cached_id);
+		return {merged_id};
+	}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
 		FreeImage(cached_id);
 	}
@@ -1935,9 +1960,16 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 					return {};
 				}
 				if (overlap.image) {
-					result     = overlap.image;
-					view_mip   = overlap.mip;
-					view_layer = overlap.layer;
+					// A pass-through returning the same image must not
+					// wipe the view refinement an earlier iteration set:
+					// the tail returns default mip/layer, so adopting
+					// them would sample level 0 instead of the intended
+					// mip. Only a changed image adopts a new view.
+					if (overlap.image != result) {
+						result     = overlap.image;
+						view_mip   = overlap.mip;
+						view_layer = overlap.layer;
+					}
 				}
 			}
 		} else if (block_alias) {

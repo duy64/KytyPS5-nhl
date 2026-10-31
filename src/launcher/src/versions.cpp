@@ -820,6 +820,82 @@ std::string install_release(const ReleaseInfo& r, const std::string& versions_di
 	return exe;
 }
 
+std::string stage_release_for_updater(const ReleaseInfo& r, const std::string& versions_dir, const ProgressFn& progress, std::string* error,
+                                      const std::atomic<bool>* cancel = nullptr)
+{
+    std::error_code ec;
+    const fs::path root = utf8_path(versions_dir);
+    const std::string name = r.folder.empty()? r.tag: r.folder;
+    const fs::path dir = root / utf8_path(name);
+    // The updater's cleanup expects the staging folder inside the installation, named.kyty-update-*,
+    // with the build in a `payload` folder.
+    const fs::path staging = dir / utf8_path(".kyty-update-pending");
+    const fs::path payload = staging / utf8_path("payload");
+    auto cancelled = [&] { return cancel!= nullptr && cancel->load();};
+
+    fs::remove_all(staging, ec);
+    fs::create_directories(payload, ec);
+    if (ec)
+    {
+        *error = "Could not create " + path_utf8(payload);
+        return {};
+    }
+    auto fail = [&](const std::string& why)
+    {
+        *error = why;
+        fs::remove_all(staging, ec);
+        return std::string();
+    };
+
+    fs::path zip = payload / (std::string("download") + kArchiveExt);
+    {
+        std::ofstream f(zip, std::ios::binary | std::ios::trunc);
+        uint64_t total = r.zip_size;
+        uint64_t done = 0;
+        std::string http_error;
+        bool via_api = false;
+        bool ok = f && GetReleaseFile(
+                       r,
+                       [&](const char* p, size_t n)
+                       {
+                           if (cancelled())
+                           {
+                               return false;
+                           }
+                           f.write(p, static_cast<std::streamsize>(n));
+                           done += n;
+                           progress(done, total);
+                           return static_cast<bool>(f);
+                       },
+                       &total, &http_error, std::string(), nullptr, &via_api);
+        f.close();
+        if (!ok)
+        {
+            return fail(cancelled()? "Cancelled": http_error.empty()? "Could not write " + path_utf8(zip): http_error);
+        }
+    }
+    if (cancelled())
+    {
+        return fail("Cancelled");
+    }
+    std::string unzip_error;
+    if (!Unzip(zip, payload, &unzip_error))
+    {
+        return fail(unzip_error);
+    }
+    fs::remove(zip, ec);
+    {
+        // Which release the staged build is, for the installed check and the date after the swap.
+        std::ofstream marker(payload / "release.txt", std::ios::trunc);
+        marker << r.tag << "\n";
+    }
+    if (FindExe(payload).empty())
+    {
+        return fail(std::string("No ") + kExeName + " in the release archive");
+    }
+    return path_utf8(payload);
+}
+
 namespace {
 
 uint16_t Rd16(const std::string& b, size_t o)

@@ -1,6 +1,9 @@
 name: Build and Release KytyPS5
 
 on:
+  push:
+    branches:
+      - opt/nhl27-launchupd
   # Manual builds from nhl27-eadb only (no push/PR triggers).
   workflow_dispatch:
 
@@ -25,7 +28,7 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}-launchupd" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Build KytyPS5 (Windows)

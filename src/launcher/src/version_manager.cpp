@@ -2,6 +2,7 @@
 
 #include "library.h"
 #include "net.h"
+#include "paths.h"
 #include "platform.h"
 #include "secret_store.h"
 #include "versions.h"
@@ -11,10 +12,14 @@
 #include <cctype>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <set>
 #include <thread>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace kyty_launcher {
 
@@ -24,6 +29,51 @@ std::string ToStd(const slint::SharedString& s)
 {
 	return std::string(std::string_view(s));
 }
+
+#ifdef _WIN32
+// Whether the file is open by another process (a running program, or a scanner still on it):
+// opening it with no sharing allowed fails while anything holds it. Retried briefly so a passing
+// antivirus scan does not read as a running game.
+bool FileLocked(const std::filesystem::path& file)
+{
+	    for (int attempt = 0;; attempt++)
+			{
+				        HANDLE handle = CreateFileW(file.wstring().c_str(), GENERIC_READ, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+				        if (handle!= INVALID_HANDLE_VALUE)
+						{
+							            CloseHandle(handle);
+							            return false;
+						}
+				        if (GetLastError()!= ERROR_SHARING_VIOLATION || attempt >= 4)
+						{
+							            return GetLastError() == ERROR_SHARING_VIOLATION;
+						}
+				        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+			}
+}
+
+// Starts kyty_updater to swap the staged payload into the target folder once this launcher exits,
+// then the caller quits: the updater relaunches the launcher from the new build.
+bool StartUpdater(const std::filesystem::path& updater, const std::filesystem::path& payload, const std::filesystem::path& target,
+                  const std::wstring& launcher_rel, std::string* error)
+{
+	    std::wstring command = L"\"" + updater.wstring() + L"\" --install \"" + payload.wstring() + L"\" \"" + target.wstring() + L"\" \"" +
+	                           launcher_rel + L"\" " + std::to_wstring(GetCurrentProcessId()) + L" \"" + target.wstring() + L"\"";
+	    STARTUPINFOW startup {};
+	    startup.cb = sizeof(startup);
+	    PROCESS_INFORMATION process {};
+	    if (!CreateProcessW(updater.wstring().c_str(), command.data(), nullptr, nullptr, FALSE, 0, nullptr, target.wstring().c_str(), &startup,
+			                        &process))
+		{
+			        *error = "Could not start kyty_updater";
+			        return false;
+		}
+	    CloseHandle(process.hThread);
+	    CloseHandle(process.hProcess);
+	    return true;
+}
+#endif
+
 
 } // namespace
 
@@ -1009,7 +1059,73 @@ struct VersionManager::Impl: std::enable_shared_from_this<Impl>
 			// The newest build goes to "<tab>-latest" (e.g. KytyPS5-main-latest), replaced on each download.
 			r.folder = TabName(sources[static_cast<size_t>(current_source)].repo) + "-latest";
 		}
-		SetBusy(true);
+#ifdef _WIN32
+			        // Windows cannot replace a running program, so a download into the folder this launcher runs
+		        // from cannot swap in place: the new build is staged for kyty_updater instead, which waits
+		        // for this process to exit, swaps the files and reopens the launcher on the new build.
+        // On Windows ExePath ignores its argument, so exe_dir("") is this launcher's own folder.
+		        const std::filesystem::path own_dir = exe_dir("");
+        if (path_key(VersionsDir() + "/" + r.folder) == path_key(path_utf8(own_dir)))
+				{
+					            const std::filesystem::path target = utf8_path(VersionsDir()) / utf8_path(r.folder);
+					            if (FileLocked(target / "kyty_emulator.exe"))
+								{
+									                Status("Close the game first: the emulator is running from " + r.folder + ".");
+									                return;
+								}
+					            SetBusy(true);
+					            Status("Downloading " + r.tag + "…");
+					            Spawn(
+            [self = shared_from_this(), r, dir = VersionsDir(), target, own_dir](const auto& cancel)
+									{
+										                int last_pct = -1;
+										                std::string error;
+										                std::string payload = stage_release_for_updater(
+										                    r, dir,
+										                [&](uint64_t done, uint64_t total)
+										{
+	                    int pct = total > 0 ? static_cast<int>(done * 100 / total) : -1;
+	                    if (pct == last_pct)
+						{
+							                        return;
+						}
+	                    last_pct = pct;
+	                    std::string text = "Downloading " + r.tag + ": " + std::to_string(done >> 20) + " / " + std::to_string(total >> 20) + " MB";
+	                    slint::invoke_from_event_loop([self, text] { self->Status(text); });
+},
+										                &error, cancel.get());
+										                slint::invoke_from_event_loop(
+															                [self, r, payload, error, target, own_dir]
+															{
+																                    self->SetBusy(false);
+																                    if (payload.empty())
+																					{
+																						                        self->Status(error == "Cancelled" ? "Download cancelled" : "Download failed: " + error);
+																						                        return;
+																					}
+																                    const std::filesystem::path updater = own_dir / "kyty_updater.exe";
+																                    std::error_code ec;
+																                    if (!std::filesystem::exists(updater, ec))
+																					{
+																						                        self->Status("Download failed: kyty_updater.exe is missing from this build.");
+																						                        return;
+																					}
+																                    std::string spawn_error;
+																                    // kyty_launcher.exe is the launcher's output name; launcher.exe is a copy of it.
+																                    if (!StartUpdater(updater, utf8_path(payload), target, L"kyty_launcher.exe", &spawn_error))
+																					{
+																						                        self->Status("Download failed: " + spawn_error);
+																						                        return;
+																					}
+																                    self->Status("Update staged; restarting to finish…");
+																                    slint::quit_event_loop();
+															});
+									});
+					            return;
+				}
+		#endif
+		        SetBusy(true);
+
 		Status("Downloading " + r.tag + "…");
 		Spawn(
 		    [self = shared_from_this(), r, dir = VersionsDir()](const auto& cancel)
@@ -1734,7 +1850,31 @@ struct VersionManager::Impl: std::enable_shared_from_this<Impl>
 				                   self->CheckForUpdates();
 			                   }
 		                   });
-	}
+#ifdef _WIN32
+	        // A finished updater run leaves its result here; show it once, then clear it.
+		{
+			            const std::filesystem::path result_file = exe_dir("") / ".kyty-update-result";
+			            std::ifstream in(result_file);
+			            if (in)
+						{
+							                std::string first, rest, line;
+							                std::getline(in, first);
+							                while (std::getline(in, line))
+												{
+													                    if (!rest.empty())
+																		{
+																			                        rest += "\n";
+																		}
+													                    rest += line;
+												}
+							                std::error_code ec;
+							                std::filesystem::remove(result_file, ec);
+							                Status(first == "success"? "Update installed" + (rest.empty()? std::string(): ": " + rest): "Update failed: " + rest);
+						}
+		}
+		#endif
+	
+		}
 };
 
 VersionManager::VersionManager(const slint::ComponentHandle<AppWindow>& ui, Settings& settings, std::string default_versions_dir, std::string cache_dir,

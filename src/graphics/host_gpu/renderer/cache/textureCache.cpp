@@ -435,6 +435,17 @@ bool AliasWritebackEnabled() {
 	}();
 	return enabled;
 }
+// KYTY_DBG_TAIL_SAFE=1 forces the partial-overlap tail OFF: instead of
+// returning the holey merged image, ResolveOverlap logs NHL27TAILSAFE and
+// returns the discard_partial marker so FindImageImpl takes a fresh image
+// with a forced guest upload. Off by default; default behavior unchanged.
+bool TailSafeEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DBG_TAIL_SAFE");
+		return value!= nullptr && value[0] == '1';
+	}();
+	return enabled;	}
+}
 
 enum class AliasAction : int {
 	Writeback,
@@ -1360,6 +1371,30 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		FreeImage(cached_id);
 		return {merged_id};
 	}
+	// Tail-safe kill-switch: fires ONLY when the flag is on, the lookup is
+	// non-speculative (speculative results are discarded anyway, so firing
+	// there would prove nothing), a prior resolution exists (merged_id
+	// non-empty — the hole case), and execution reached the tail (v2
+	// guards failed, above). The candidate is NOT freed here: freeing it
+	// would destroy the bytes the fresh path may still need, and GC
+	// reclaims it on its normal tick schedule.
+	if (TailSafeEnabled() && merged_id &&!speculative) {
+		// DIAGNOSTIC (KYTY_DBG_TAIL_SAFE): tail fell through with a prior
+		// resolution; the merged image is discarded, not returned.
+		// Fields mirror NHL27DEPTH partial_overlap_skipped (no freed=
+		// field: nothing is freed on this path). fflush: the line count
+		// is the engagement proof and must survive a later host crash.
+		std::printf("NHL27TAILSAFE: tail_safe_fallback requested addr=0x%llx size=0x%llx "
+		            "fmt=%s | cached addr=0x%llx size=0x%llx fmt=%s\n",
+					            static_cast<unsigned long long>(reqaddress),
+								            static_cast<unsigned long long>(requested.data.size),
+											            vk::to_string(requested.pixel_format).c_str(),
+														            static_cast<unsigned long long>(cached.info.data.address),
+																	static_cast<unsigned long long>(cached.info.data.size),
+																	vk::to_string(cached.info.pixel_format).c_str());
+				std::fflush(stdout);
+				return {.discard_partial = true};
+		}
 	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
 		FreeImage(cached_id);
 	}
@@ -1867,6 +1902,7 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 	const auto metadata_base_layer = desc.view_info.base_layer;
 
 	ImageId result {};
+	bool tail_safe_fallback = false;
 	{
 		std::scoped_lock lock {m_lock};
 		// Draws look up the same targets and textures over and over: remember lookups that found
@@ -1975,6 +2011,17 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				if (overlap.rejected) {
 					return {};
 				}
+				if (overlap.discard_partial) {
+					// Tail-safe kill-switch: drop the accumulated merged
+					// image (it has the hole) and stop scanning candidates;
+					// the post-loop fresh-insert path takes over with a
+					// forced guest upload (see tail_safe_fallback below).
+					result = {};
+					view_mip = -1;
+					view_layer = -1;
+					tail_safe_fallback = true;
+					break;
+				}
 				if (overlap.image) {
 					// A pass-through returning the same image must not
 					// wipe the view refinement an earlier iteration set:
@@ -2028,7 +2075,16 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				inserted.MarkBufferModified();
 				AliasLogOnce(AliasAction::ForcedUpload, inserted.info.data.address,
 				             inserted.info.data.size, vk::to_string(desc.info.pixel_format).c_str());
-			} else if (desc.type == BindingType::Texture && DepthAliasLog::Enabled() &&
+					} else if (tail_safe_fallback) {
+						// Tail-safe kill-switch: the merged image was discarded, so
+						// the fresh image must not stay uninitialized either —
+						// upload guest memory on first use (InitializeImage /
+						// RefreshImage consume IsBufferModified). Same mechanism
+						// as the AliasWritebackEnabled arm above; see Deviation 1
+						// in commit3-killswitch.md for why the mark, not a direct
+						// InitializeImage call, is the real call path here.
+						inserted.MarkBufferModified();
+								} else if (desc.type == BindingType::Texture && DepthAliasLog::Enabled() &&
 			           DepthAliasLog::Want(inserted.info.data.address, inserted.info.data.size) &&
 			           DepthAliasLog::TakeLine()) {
 				// DIAGNOSTIC (KYTY_DBG_DEPTH_ALIAS): sampled image created fresh, nothing to upload.

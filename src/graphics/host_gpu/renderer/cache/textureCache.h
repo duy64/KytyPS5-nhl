@@ -197,6 +197,12 @@ private:
 		int32_t layer = -1;
 		// Speculative lookups only: resolving the overlap would replace an owned image.
 		bool rejected = false;
+		// Tail-safe kill-switch (KYTY_DBG_TAIL_SAFE=1): the tail fell through
+		// with a prior resolution, so the accumulated merged image is
+		// discarded instead of returned. NOT `rejected`: that aborts the
+		// whole lookup and would bind null (the H7 shape). The
+		// FindImageImpl loop resets result/view and breaks on this marker.
+		bool discard_partial = false;
 	};
 
 	using ImageIds       = InlinePageOwnerList<ImageId, 16>;

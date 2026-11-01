@@ -1025,7 +1025,24 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
 	    (cached.info.metadata.kind == ImageMetadataKind::None ||
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
-	if (!DepthOverlapNeedsRecreate(requested, binding, cached)) {
+	// Adapted from official 0543c3d2 ("texture_cache: copy depth sampled
+	// through non-depth color formats"). Depth bytes sampled through a color
+	// format no depth view provides (16_UINT, 8_8_UNORM) need a color copy of
+	// the whole single-sample depth layout.
+	// Placement note: this lives here, not in DepthOverlapNeedsRecreate,
+	// because retain_cached_layout is computed in this function only.
+	// Additive by design: main's raw_d16_texture rule in
+	// DepthOverlapNeedsRecreate (PPSA26785 HTile note, NHL26DBG diagnostic,
+	// size <= rule) is left completely untouched; this predicate ORs with it.
+	// The binding == Texture gate reproduces the official commit's effective
+	// scope (official applies the predicate only in the Texture switch arm).
+	const bool raw_depth_texture =
+	    binding == BindingType::Texture && cached.info.IsDepth() && !requested.IsDepth() &&
+	    !cached.info.HasStencil() && !requested.HasMetadata() && cached.backing.samples == 1 &&
+	    requested.samples == 1 && requested.pitch == cached.info.pitch &&
+	    (requested.resources == cached.info.resources || retain_cached_layout) &&
+	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
+	if (!DepthOverlapNeedsRecreate(requested, binding, cached) && !raw_depth_texture) {
 		return cached_id;
 	}
 	RefreshImage(cached_id);

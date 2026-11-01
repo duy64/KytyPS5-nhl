@@ -1814,6 +1814,44 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
+static void DecodeIndirectArgs(std::shared_ptr<Buffer> snapshot, uint64_t seq, uint64_t vs, uint64_t ps, bool indexed, uint64_t args_addr, uint64_t args_bytes, uint32_t stride, uint32_t max_count, uint64_t count_addr, std::atomic<uint32_t>& budget) {
+const auto mapped = snapshot->Mapped();
+if (mapped.size() < args_bytes + 4) {
+std::printf("NHL27INDIRECTARGS_ERR: seq=%llu snapshot too small\n", static_cast<unsigned long long>(seq));
+return;
+}
+snapshot->Invalidate(0, args_bytes + 4);
+const uint8_t* bytes = mapped.data();
+uint32_t executed = 0;
+std::memcpy(&executed, bytes + args_bytes, 4);
+if (count_addr == 0) {
+executed = max_count;
+}
+if (executed > max_count) {
+executed = max_count;
+}
+const uint32_t record_size = indexed ? 20 : 16;
+const uint32_t n = std::min(executed, 8u);
+for (uint32_t i = 0; i < n; i++) {
+const uint64_t off = static_cast<uint64_t>(i) * stride;
+if (off + record_size > args_bytes) {
+break;
+}
+uint32_t words[5] = {};
+std::memcpy(words, bytes + off, record_size);
+if (budget.fetch_add(1) >= 4096) {
+return;
+}
+if (indexed) {
+std::printf("NHL27INDIRECTARGS_REC: seq=%llu i=%u vs=0x%016llx ps=0x%016llx index_count=%u instance_count=%u first_index=%u base_vertex=%d first_instance=%u\n", static_cast<unsigned long long>(seq), i, static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps), words[0], words[1], words[2], static_cast<int32_t>(words[3]), words[4]);
+} else {
+std::printf("NHL27INDIRECTARGS_REC: seq=%llu i=%u vs=0x%016llx ps=0x%016llx vertex_count=%u instance_count=%u first_vertex=%u first_instance=%u\n", static_cast<unsigned long long>(seq), i, static_cast<unsigned long long>(vs), static_cast<unsigned long long>(ps), words[0], words[1], words[2], words[3]);
+}
+std::fflush(stdout);
+}
+(void)args_addr;
+}
+
 void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer,
                                          const DrawCallInfo& draw, DrawRenderState& state,
                                          vk::PrimitiveTopology topology, const DrawEmitInfo& emit,
@@ -2145,6 +2183,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		}
 		return list;
 	}();
+	static const std::vector<uint64_t> indirect_args_vs = [] {
+		std::vector<uint64_t> list;
+		const char* value = std::getenv("KYTY_DBG_INDIRECT_ARGS");
+		while (value != nullptr && *value != '\0') {
+			char* end = nullptr;
+			const auto hash = std::strtoull(value, &end, 16);
+			if (end == value) break;
+			if (hash != 0) list.push_back(hash);
+			value = *end == ',' ? end + 1 : end;
+		}
+		return list;
+	}();
+	static std::atomic<uint32_t> indirect_args_lines {0};
+	static std::atomic<uint64_t> indirect_args_seq {0};
+
 	const auto skipped_shader = std::find(skip_ps.begin(), skip_ps.end(), crumb_ps);
 	const bool skip_draw = skipped_shader != skip_ps.end();
 	if (skip_draw) {
@@ -2159,8 +2212,40 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			std::fflush(stdout);
 		}
 	} else {
+const bool indirect_args_match = emit.indirect_stage != nullptr && std::find(indirect_args_vs.begin(), indirect_args_vs.end(), crumb_vs) != indirect_args_vs.end();
+		const uint64_t indirect_args_seq_no = indirect_args_match ? indirect_args_seq.fetch_add(1) : 0;
+		const bool indirect_args_budget = indirect_args_match && indirect_args_lines.fetch_add(1) < 4096;
+		const bool indirect_args_indexed = indirect_args_match ? emit.indirect_stage->indexed : false;
+		const uint64_t indirect_args_addr = indirect_args_match ? emit.indirect_stage->args_addr : 0;
+		const uint64_t indirect_args_bytes = indirect_args_match ? emit.indirect_stage->ArgsSize() : 0;
+		const uint32_t indirect_args_stride = indirect_args_match ? emit.indirect_stage->stride : 0;
+		const uint32_t indirect_args_max_count = indirect_args_match ? emit.indirect_stage->max_count : 0;
+		const uint64_t indirect_args_count_addr = indirect_args_match ? emit.indirect_stage->count_addr : 0;
+		std::shared_ptr<Buffer> indirect_args_snapshot = indirect_args_match ? emit.indirect_stage->snapshot : nullptr;
+		uint64_t indirect_args_rt0_addr = 0;
+		int indirect_args_rt0_fmt = -1;
+		uint32_t indirect_args_rt0_w = 0;
+		uint32_t indirect_args_rt0_h = 0;
+		if (indirect_args_match && state.color_count != 0) {
+			const auto& indirect_rt0 = state.colors[0];
+			const auto indirect_ext = indirect_rt0.Extent();
+			indirect_args_rt0_addr = indirect_rt0.desc.info.data.address;
+			indirect_args_rt0_fmt = static_cast<int>(indirect_rt0.desc.info.pixel_format);
+			indirect_args_rt0_w = indirect_ext.width;
+			indirect_args_rt0_h = indirect_ext.height;
+		}
+		uint64_t indirect_args_depth_addr = 0;
+		if (indirect_args_match && state.depth != nullptr && state.depth->image_id != 0) {
+			indirect_args_depth_addr = state.depth->desc.info.data.address;
+		}
+		uint32_t indirect_args_frame = buffer.GetContext().GetGpu().GetFrameNum();
+		if (indirect_args_budget) {
+			std::printf("NHL27INDIRECTARGS: seq=%llu vs=0x%016llx ps=0x%016llx indexed=%u args_addr=0x%llx args_bytes=%llu stride=%u max_count=%u count_addr=0x%llx rt0_addr=0x%llx rt0_fmt=%d rt0_extent=%ux%u depth_addr=0x%llx frame=%u\n", static_cast<unsigned long long>(indirect_args_seq_no), static_cast<unsigned long long>(crumb_vs), static_cast<unsigned long long>(crumb_ps), static_cast<unsigned int>(indirect_args_indexed), static_cast<unsigned long long>(indirect_args_addr), static_cast<unsigned long long>(indirect_args_bytes), indirect_args_stride, indirect_args_max_count, static_cast<unsigned long long>(indirect_args_count_addr), static_cast<unsigned long long>(indirect_args_rt0_addr), indirect_args_rt0_fmt, indirect_args_rt0_w, indirect_args_rt0_h, static_cast<unsigned long long>(indirect_args_depth_addr), indirect_args_frame);
+			std::fflush(stdout);
+		}
+		
 		const auto crumb =
-		    BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, mesh_active ? "draw-mesh" : "draw",
+		    BreadcrumbBegin(m_context.GetGraphics(), vk_buffer, mesh_active ? "draw-mesh" : (indirect_args_match ? "draw-indirect" : "draw"),
 		                    crumb_vs, crumb_ps, crumb_info, crumb_aux);
 		if (mesh_active) {
 			vk_buffer.drawMeshTasksEXT(mesh_groups, draw.instance_count, 1);
@@ -2176,11 +2261,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 				} else {
 					vk_buffer.drawIndirect(source.snapshot->Handle(), 0, source.max_count, source.stride);
 				}
+				if (indirect_args_match) { BreadcrumbCaptureArgs(vk_buffer, crumb, source.snapshot->Handle(), 0, 16); }
 			} else {
 				EmitDrawPrimitives(ucfg, vk_buffer, draw, emit);
 			}
 		}
 		BreadcrumbEnd(m_context.GetGraphics(), vk_buffer, crumb);
+		if (indirect_args_budget) {
+			m_context.GetCommandScheduler().DeferOperation([snapshot = indirect_args_snapshot, seq = indirect_args_seq_no, vs = crumb_vs, ps = crumb_ps, indexed = indirect_args_indexed, args_addr = indirect_args_addr, args_bytes = indirect_args_bytes, stride = indirect_args_stride, max_count = indirect_args_max_count, count_addr = indirect_args_count_addr, &indirect_args_lines]() mutable {
+				DecodeIndirectArgs(snapshot, seq, vs, ps, indexed, args_addr, args_bytes, stride, max_count, count_addr, indirect_args_lines);
+			});
+		}
 		FrameBreakdown::DrawEmitted();
 	}
 	emit_timer.reset();

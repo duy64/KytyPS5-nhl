@@ -7422,7 +7422,7 @@ public:
       scheduler.Finish();
       Require(name, "raw D16 8_8 texture bytes",
               ReadBuffer(name, raw_d16_rg8_readback, 1)[0] == 0x40004000u,
-              "D16 sampled as 8_8 UNORM lost the depth bytes");");
+              "D16 sampled as 8_8 UNORM lost the depth bytes");
 
       constexpr uint64_t layered_raw_d16_offset = raw_d16_offset + 0x1000;
       constexpr std::array<uint16_t, 12> layered_raw_d16_values{

@@ -1162,6 +1162,37 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 
 } // namespace BcAlias
 
+bool OverlapSafeToDelete(uint64_t current_tick, uint64_t tick_accessed_last,
+                         uint32_t heap_refs) noexcept {
+	return current_tick - std::min(current_tick, tick_accessed_last) > NumFramesBeforeRemoval &&
+	       heap_refs == 0u;
+}
+
+OverlapPlan PlanOverlapCopy(const ImageInfo& requested, const ImageInfo& cached,
+                            bool merged_present, bool speculative, bool safe_to_delete) {
+	// The v2 guard set, verbatim from the tail block below, minus the base
+	// address: same samples, same color transform, same type, and a direct
+	// copy (format-equal, or both non-depth with equal block size).
+	const bool direct_copy =
+	    requested.pixel_format == cached.pixel_format ||
+	    (!requested.IsDepth() && !cached.IsDepth() &&
+	     vk::blockSize(requested.pixel_format) == vk::blockSize(cached.pixel_format));
+	const bool guards_except_base =
+	    merged_present && !speculative && safe_to_delete &&
+	    requested.samples == cached.samples &&
+	    requested.GetColorTransform() == cached.GetColorTransform() &&
+	    requested.type == cached.type && direct_copy;
+	OverlapPlan plan;
+	// Stage B gate: every guard holds but the bases differ (offset alias).
+	plan.fix_eligible = guards_except_base && requested.data.address != cached.data.address;
+	// Current behavior: the v2 copy fires only on a same-base address.
+	// Anything else falls through, with no regions copied.
+	if (guards_except_base && requested.data.address == cached.data.address) {
+		plan.branch = OverlapPlanBranch::MergedCopy;
+	}
+	return plan;
+}
+
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id, bool speculative) {
@@ -1178,8 +1209,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	auto&      cached       = *owner;
 	const auto current_tick = m_scheduler.CurrentTick();
 	const bool safe_to_delete =
-	    current_tick - std::min(current_tick, cached.tick_accessed_last) > NumFramesBeforeRemoval &&
-	    cached.heap_refs.load(std::memory_order_relaxed) == 0u;
+	    OverlapSafeToDelete(current_tick, cached.tick_accessed_last,
+	    cached.heap_refs.load(std::memory_order_relaxed));
 
 	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
 	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
@@ -1315,14 +1346,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 	// counts, a direct copy, and a safe free. Otherwise keep the old
 	// fall-through rather than risk a fault or a worse corruption.
 	// Speculative lookups are discarded, so never free on that path.
-	if (merged_id && !speculative && safe_to_delete &&
-	    requested.data.address == cached.info.data.address &&
-	    requested.samples == cached.info.samples &&
-	    requested.GetColorTransform() == cached.info.GetColorTransform() &&
-	    requested.type == cached.info.type &&
-	    (requested.pixel_format == cached.info.pixel_format ||
-	     (!requested.IsDepth() && !cached.info.IsDepth() &&
-	      vk::blockSize(requested.pixel_format) == vk::blockSize(cached.info.pixel_format)))) {
+	// Tail decision is PlanOverlapCopy (pure, fixture-tested); the body
+	// below is unchanged. fix_eligible is intentionally unused here on
+	// Stage A: the offset-alias fix is Stage B, not this commit.
+	if (PlanOverlapCopy(requested, cached.info, static_cast<bool>(merged_id), speculative,
+	                    safe_to_delete)
+	    .branch == OverlapPlanBranch::MergedCopy) {
 		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
 		BumpGeneration(cached.info.data.address, cached.info.data.address + cached.info.data.size);
 		GenCount(FrameBreakdown::g_delta.gen_rebind);

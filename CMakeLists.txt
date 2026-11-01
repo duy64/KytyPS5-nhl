@@ -730,6 +730,8 @@ add_kyty_full_emulator_test(virtual_memory_allocation_tests "${KYTY_TESTS_DIR}/V
 target_compile_definitions(virtual_memory_allocation_tests PRIVATE
 	KYTY_VIRTUAL_MEMORY_ALLOCATION_TESTS=1)
 
+add_kyty_full_emulator_test(texcache_overlap_tests "${KYTY_TESTS_DIR}/TextureCacheOverlapTests.cpp")
+
 # Common::SoftExitScope turns a fatal error of the current thread into a C++ exception: its
 # thrower and the renderer code that catches it need exceptions where they are off by default.
 if(NOT KYTY_CLANG_CL)

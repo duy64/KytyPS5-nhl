@@ -43,6 +43,49 @@ namespace BcAlias {
 void Resolve(TextureCache& cache, ImageId cached, ImageId merged);
 } // namespace BcAlias
 
+// Pure tail decision for TextureCache::ResolveOverlap, extracted so the
+// texture-cache overlap fixture can test it without a Vulkan device.
+// Precondition: execution has reached the tail block (all earlier
+// ResolveOverlap branches failed). `requested` is the ResolveOverlap first
+// argument (the FindImageImpl accumulator's info, or the lookup description
+// when there is no prior resolution) — not necessarily the original desc.
+enum class OverlapPlanBranch : uint8_t { TailFallThrough, MergedCopy };
+
+struct OverlapCopyRegion {
+	uint32_t src_mip = 0;
+	uint32_t src_layer = 0;
+	uint32_t src_x = 0;
+	uint32_t src_y = 0;
+	uint32_t dst_mip = 0;
+	uint32_t dst_layer = 0;
+	uint32_t dst_x = 0;
+	uint32_t dst_y = 0;
+	uint32_t width_blocks = 0;
+	uint32_t height_blocks = 0;
+};
+
+struct OverlapPlan {
+	OverlapPlanBranch branch = OverlapPlanBranch::TailFallThrough;
+	// Stage B gate: every v2 guard holds EXCEPT the base address (offset
+	// alias). Computed on Stage A but not acted on; the tail still falls
+	// through for these shapes until CopyImageRegion lands.
+	bool fix_eligible = false;
+	// Copy regions for the fix. Empty on Stage A (the tail copies nothing);
+	// Stage B fills them and the fixture's coverage assertions apply.
+	std::vector<OverlapCopyRegion> regions;
+};
+
+// Tail-block decision only (see the precondition above). `safe_to_delete`
+// is precomputed by the caller with OverlapSafeToDelete so this stays pure.
+[[nodiscard]] OverlapPlan PlanOverlapCopy(const ImageInfo& requested, const ImageInfo& cached,
+                                          bool merged_present, bool speculative,
+                                          bool safe_to_delete);
+
+// textureCache.cpp:1180-1182, extracted verbatim: tick age strictly greater
+// than NumFramesBeforeRemoval (32) and zero heap refs.
+[[nodiscard]] bool OverlapSafeToDelete(uint64_t current_tick, uint64_t tick_accessed_last,
+                                       uint32_t heap_refs) noexcept;
+
 class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };

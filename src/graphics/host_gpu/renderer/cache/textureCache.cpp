@@ -445,7 +445,6 @@ bool TailSafeEnabled() {
 		return value!= nullptr && value[0] == '1';
 	}();
 	return enabled;	}
-}
 
 enum class AliasAction : int {
 	Writeback,

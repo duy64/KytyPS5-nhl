@@ -1385,7 +1385,7 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		// is the engagement proof and must survive a later host crash.
 		std::printf("NHL27TAILSAFE: tail_safe_fallback requested addr=0x%llx size=0x%llx "
 		            "fmt=%s | cached addr=0x%llx size=0x%llx fmt=%s\n",
-					            static_cast<unsigned long long>(reqaddress),
+					            static_cast<unsigned long long>(requested.data.address),
 								            static_cast<unsigned long long>(requested.data.size),
 											            vk::to_string(requested.pixel_format).c_str(),
 														            static_cast<unsigned long long>(cached.info.data.address),

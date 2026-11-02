@@ -203,6 +203,8 @@ struct VideoOutConfig {
 	int                                 flip_rate   = 0;
 	// The rate the game asked for (flip_rate is the one flips use, see VideoOutSetFlipRate).
 	int                                 requested_flip_rate = 0;
+	// vblank_status.count at the last completed flip (late flips, see IsFlipDueLocked).
+	uint64_t                            last_flip_vblank    = 0;
 	uint64_t                            output_mode = VIDEO_OUT_OUTPUT_MODE_DEFAULT;
 	float                               gamma       = 1.0f;
 	VideoOutFlipStatus                  flip_status;
@@ -517,8 +519,19 @@ static bool IsFlipDueLocked(const VideoOutConfig& cfg, uint64_t generation) {
 		return false;
 	}
 	const int interval = cfg.flip_rate + 1;
-
-	return interval <= 1 || (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
+	if (interval <= 1) {
+		return true;
+	}
+	// A frame that misses its vblank flips on the next one once <interval> vblanks have passed since the
+	// last flip (50 ms at 30 Hz), instead of waiting for the next multiple (66 ms). KYTY_LATE_FLIP=0: old way.
+	static const bool late_flip = [] {
+		const char* value = std::getenv("KYTY_LATE_FLIP");
+		return value == nullptr || value[0] != '0';
+	}();
+	if (late_flip) {
+		return cfg.vblank_status.count - cfg.last_flip_vblank >= static_cast<uint64_t>(interval);
+	}
+	return (cfg.vblank_status.count % static_cast<uint64_t>(interval)) == 0;
 }
 
 static bool IsValidBufferIndex(int index) {
@@ -864,14 +877,14 @@ static std::atomic<int> g_requested_flip_rate {0};
 // KYTY_MENU_VBLANK_HZ=<hz>: while the game asks for 30 or 20 Hz (menus, the pause menu,
 // presentation scenes) the emulated display runs at this rate, so those screens are not held to
 // 60 fps (flips go out at every vblank, see VideoOutSetFlipRate). KYTY_PLAY_VBLANK_HZ=<hz>: the
-// same while it asks for 60 Hz (play). Both 240 by default, so neither is held to 60 fps (NHL 27
-// times its game by the clock: nothing runs faster at more frames); 0 = the configured vblank
-// frequency. The game is not told of a faster display (its 120 Hz output mode follows the
+// same while it asks for 60 Hz (play). Both 0 by default = the configured vblank frequency (60 Hz),
+// so menus hold a steady 30 fps and play a steady 60 fps; 240 lets either run uncapped (NHL 27
+// times its game by the clock: nothing runs faster at more frames, but uncapped fps swings 50-120). The game is not told of a faster display (its 120 Hz output mode follows the
 // configured one).
 static uint32_t VblankHzFromEnv(const char* name) {
 	const char* value = std::getenv(name);
 	return value != nullptr ? static_cast<uint32_t>(std::clamp<unsigned long>(std::strtoul(value, nullptr, 10), 0ul, 1000ul))
-	                        : 240u;
+	                        : 0u;
 }
 static uint32_t MenuVblankHz() {
 	static const uint32_t hz = VblankHzFromEnv("KYTY_MENU_VBLANK_HZ");
@@ -1392,6 +1405,7 @@ bool FlipQueue::Flip(uint32_t micros) {
 		}
 		auto& r = *it;
 		r.cfg->flip_status.count++;
+	r.cfg->last_flip_vblank                     = r.cfg->vblank_status.count;
 		r.cfg->flip_status.processTime              = LibKernel::KernelGetProcessTime();
 		r.cfg->flip_status.processTimeCounter       = LibKernel::KernelGetProcessTimeCounter();
 		r.cfg->flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1504,12 +1518,12 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	if (rate < 0 || rate > 2) {
 		return VIDEO_OUT_ERROR_INVALID_VALUE;
 	}
-	// Flips go out at every vblank: NHL 27 asks for 30 Hz in menus, the pause menu and
-	// presentation scenes, which then run at up to 60 fps (Petr prefers it). KYTY_FORCE_FLIP_RATE
-	// =<0-2> forces that rate instead, =off keeps the game's.
+	// The game's rate is kept by default: NHL 27 asks for 30 Hz in menus, the pause menu and
+	// presentation scenes and 60 Hz in play, which gives even frame pacing. KYTY_FORCE_FLIP_RATE
+	// =<0-2> forces that rate instead (=0: flips at every vblank, menus up to 60 fps).
 	static const int forced_rate = [] {
 		const char* value = std::getenv("KYTY_FORCE_FLIP_RATE");
-		if (value == nullptr) return 0;
+		if (value == nullptr) return -1;
 		return value[0] >= '0' && value[0] <= '2' ? value[0] - '0' : -1;
 	}();
 	const int requested = rate;

@@ -1125,7 +1125,52 @@ struct PresentCapture {
 	void*         mapped = nullptr;
 	uint32_t      w = 0, h = 0;
 	vk::Format    format = vk::Format::eUndefined;
-};
+\};
+
+// Frame pacing of the presented frames (stutter shows in the lows, not in the per-second fps):
+// every 5 s NHL27FRAMETIME prints the average and the 1% / 0.1% low fps plus the longest frame,
+// and each frame longer than 40 ms prints NHL27HITCH (t = seconds, as in NHL27FPS t=). miss_ms sums how far
+// the frames over 40 ms ran past a 30 Hz frame (33.3 ms): the time lost to missed vblanks.
+static void TrackPresentInterval() {
+	static std::vector<float> window_ms;
+	static auto               last         = std::chrono::steady_clock::now();
+	static auto               window_begin = last;
+	const auto                now          = std::chrono::steady_clock::now();
+	const float               dt = std::chrono::duration<float, std::milli>(now - last).count();
+	last                         = now;
+	window_ms.push_back(dt);
+	if (dt > 40.0f) {
+		std::printf("NHL27HITCH t=%.2f dt=%.1fms\n", static_cast<double>(SDL_GetTicks()) / 1000.0, static_cast<double>(dt));
+		std::fflush(stdout);
+	}
+	if (now - window_begin < std::chrono::seconds(5)) {
+		return;
+	}
+	const double span_ms = std::chrono::duration<double, std::milli>(now - window_begin).count();
+	window_begin         = now;
+	auto sorted          = window_ms;
+	std::sort(sorted.begin(), sorted.end(), std::greater<>());
+	// The 1% / 0.1% low fps: the average fps over the slowest 1% / 0.1% of frames (at least one).
+	auto low_fps = [&](double fraction) {
+		const auto n   = std::max<size_t>(1, static_cast<size_t>(static_cast<double>(sorted.size()) * fraction));
+		double     sum = 0.0;
+		for (size_t i = 0; i < n; i++) sum += sorted[i];
+		return 1000.0 * static_cast<double>(n) / sum;
+	};
+	const auto over = [&](float ms) { return std::count_if(sorted.begin(), sorted.end(), [ms](float v) { return v > ms; }); };
+	double     miss_ms = 0.0;
+	for (const float v : sorted) {
+		if (v > 40.0f) miss_ms += static_cast<double>(v) - 33.3;
+	}
+	std::printf("NHL27FRAMETIME t=%llu frames=%zu avg_fps=%.1f low1=%.1f low01=%.1f max=%.1fms over20=%lld over34=%lld over50=%lld "
+                "over40=%lld miss_ms=%.0f\n",
+                static_cast<unsigned long long>(SDL_GetTicks() / 1000), sorted.size(),
+                1000.0 * static_cast<double>(sorted.size()) / span_ms, low_fps(0.01), low_fps(0.001),
+                static_cast<double>(sorted.front()), static_cast<long long>(over(20.0f)), static_cast<long long>(over(34.0f)),
+                static_cast<long long>(over(50.0f)), static_cast<long long>(over(40.0f)), miss_ms);
+	std::fflush(stdout);
+	window_ms.clear();
+}
 
 static bool CapturablePresentFormat(vk::Format format) {
 	switch (format) {
@@ -1285,7 +1330,8 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		window.loop.window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		TrackPresentInterval();
 		return;
 	}
 	LOGF("Vulkan presentation retry exhausted; dropping frame\n");

@@ -1012,8 +1012,8 @@ bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, Binding
 			}
 			recreate |= depth_grow;
 			break;
-		}
-			 BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
+	}
+			case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
 	}
 	return recreate;

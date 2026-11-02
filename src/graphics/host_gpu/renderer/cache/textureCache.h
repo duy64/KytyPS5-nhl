@@ -135,6 +135,14 @@ public:
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
+	// Stills: armed when one is drawn to, published before the next end-of-pipe label.
+	[[nodiscard]] bool StillPublishPending() const noexcept {
+		return m_still_pending.load(std::memory_order_relaxed);
+	}
+	void               ArmStillPublish(ImageId id);
+	[[nodiscard]] bool PublishPendingStills();
+	void               NoteStillDrain(uint64_t ns) { m_rb_drain_ns += ns; }
+	void               LogReadbackWindow();
 	// Advances whenever an image is registered or unregistered.
 	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
 	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the
@@ -189,7 +197,7 @@ private:
 	void                      UntrackImageHead(ImageId id);
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
-	void                      TrackImageDownload(ImageId id, Image& image);
+	void                      TrackImageDownload(ImageId id, Image& image, bool storage);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
@@ -283,6 +291,14 @@ private:
 
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	std::atomic<bool>                                 m_still_pending {false};
+	// NHL27RBENROL, per window: enrolled binds by format and size, downloads, label drains.
+	std::map<uint64_t, uint32_t>                      m_rb_images;
+	uint32_t                                          m_rb_rule      = 0;
+	uint32_t                                          m_rb_flag      = 0;
+	uint32_t                                          m_rb_downloads = 0;
+	uint32_t                                          m_rb_label     = 0;
+	uint64_t                                          m_rb_drain_ns  = 0;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
@@ -292,6 +308,7 @@ private:
 	mutable uint32_t m_image_query_epoch      = 0;
 	uint64_t         m_image_set_epoch        = 0;
 	bool             m_readback_linear_images = false;
+	bool             m_readback_stills        = false;
 	// Set while an overlap/alias resolution frees an image; only those frees write back.
 	bool             m_alias_free_in_progress = false;
 	std::atomic<uint64_t> m_generation {0};

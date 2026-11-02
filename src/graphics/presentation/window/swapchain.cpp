@@ -1125,7 +1125,7 @@ struct PresentCapture {
 	void*         mapped = nullptr;
 	uint32_t      w = 0, h = 0;
 	vk::Format    format = vk::Format::eUndefined;
-\};
+};
 
 // Frame pacing of the presented frames (stutter shows in the lows, not in the per-second fps):
 // every 5 s NHL27FRAMETIME prints the average and the 1% / 0.1% low fps plus the longest frame,
@@ -1330,7 +1330,7 @@ void Presenter::Impl::Present() {
 		}
 
 		presented_overlay_revision.store(overlay_visual.revision, std::memory_order_release);
-		window.loop.window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
+		window.loop.presented_frames.fetch_add(1, std::memory_order_relaxed);
 		TrackPresentInterval();
 		return;
 	}

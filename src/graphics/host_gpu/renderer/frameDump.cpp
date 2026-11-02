@@ -1156,9 +1156,25 @@ uint32_t RingFinalW() {
             const unsigned long p = std::strtoul(v, nullptr, 10);
             if (p != 0) return static_cast<uint32_t>(p);
         }
-        return 960u;
+        return 480u;
     }();
     return w;
+}
+
+uint32_t RingFinalEvery() {
+    static const uint32_t every = [] {
+        const char* v = std::getenv("KYTY_DBG_RING_FINAL_EVERY");
+        if (v != nullptr && *v != '\0') {
+            const unsigned long p = std::strtoul(v, nullptr, 10);
+            if (p < 1) {
+                std::printf("NHL27RING: ring final every clamped to 1\n");
+                return 1u;
+			}
+            return static_cast<uint32_t>(p);
+		}
+        return 10u;
+	}();
+    return every;
 }
 
 void RingConsumeFinal(uint64_t flip_id) {
@@ -1169,7 +1185,56 @@ void RingConsumeFinal(uint64_t flip_id) {
     g_ring_pending_busy = false;
     lock.unlock();
     vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
-    Decoded d = Decode(p.target, static_cast<const uint8_t*>(p.mapped));
+        const vk::Format ff = p.target.format;
+	    const bool fast8 = (ff == vk::Format::eR8G8B8A8Unorm || ff == vk::Format::eR8G8B8A8Srgb ||
+	                        ff == vk::Format::eB8G8R8A8Unorm || ff == vk::Format::eB8G8R8A8Srgb);
+	    if (fast8) {
+			        if (p.mapped == nullptr) {
+						            std::printf("NHL27RING: final image skipped for frame %PRIu64 (staging not mapped)\n", flip_id);
+					} else {
+						            const bool bgra = (ff == vk::Format::eB8G8R8A8Unorm || ff == vk::Format::eB8G8R8A8Srgb);
+						            const uint8_t* src = static_cast<const uint8_t*>(p.mapped);
+						            const uint32_t tw = p.target.w;
+						            const uint32_t th = p.target.h;
+						            uint32_t out_w = tw;
+						            uint32_t out_h = th;
+						            if (tw > RingFinalW()) {
+										                out_w = RingFinalW();
+										                out_h = std::max(1u, th * RingFinalW() / tw);
+									}
+						            std::vector<uint8_t> rgb;
+						            rgb.resize(static_cast<size_t>(out_w) * out_h * 3);
+						            const uint32_t sx = tw / out_w;
+						            const uint32_t sy = th / out_h;
+						            for (uint32_t y = 0; y < out_h; y++) {
+										                for (uint32_t x = 0; x < out_w; x++) {
+															                    uint32_t sum[3] = {0, 0, 0};
+															                    uint32_t cnt = 0;
+															                    const uint32_t y0 = y * sy;
+															                    const uint32_t y1 = std::min(th, y0 + sy);
+															                    const uint32_t x0 = x * sx;
+															                    const uint32_t x1 = std::min(tw, x0 + sx);
+															                        for (uint32_t syi = y0; syi < y1; syi++) {
+																						                            for (uint32_t sxi = x0; sxi < x1; sxi++) {
+																														                                const uint8_t* px = src + (static_cast<size_t>(syi) * tw + sxi) * 4;
+																														                                sum[0] += px[bgra ? 2 : 0];
+																														                                sum[1] += px[1];
+																														                                sum[2] += px[bgra ? 0 : 2];
+																														                                cnt++;
+																													}
+																					}
+															                    if (cnt == 0) cnt = 1;
+															                    const size_t oidx = (static_cast<size_t>(y) * out_w + x) * 3;
+															                    for (int c = 0; c < 3; c++) rgb[oidx + c] = static_cast<uint8_t>(sum[c] / cnt);
+														}
+									}
+						            const std::string path = RingRoot() + "/ring/final_" + std::to_string(flip_id) + ".png";
+						            if (!WriteRgbPng(path, out_w, out_h, rgb)) {
+										                std::printf("NHL27RING: cannot write final_%PRIu64.png\n", flip_id);
+									}
+					}
+		} else {
+			Decoded d = Decode(p.target, static_cast<const uint8_t*>(p.mapped));
     if (!d.ok || d.kind == Kind::Depth || d.kind == Kind::Int) {
         std::printf("NHL27RING: final image skipped for frame %" PRIu64 " (decode/depth/int)\n", flip_id);
     } else {
@@ -1213,7 +1278,8 @@ void RingConsumeFinal(uint64_t flip_id) {
             std::printf("NHL27RING: cannot write final_%" PRIu64 ".png\n", flip_id);
         }
     }
-    vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
+		}
+	vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
 }
 
 void RingRecordReadback(CommandBuffer& buffer, const Target& t, uint64_t flip_id) {
@@ -1263,7 +1329,11 @@ void RingArmFinal(CommandBuffer& buffer, uint64_t flip_id) {
     Target t = g_ring_last_target;
     g_ring_last_valid = false;
     g_ring_targets.clear();
-    if (g_ring_pending_busy) {
+        static uint32_t ring_final_flips = 0;
+    if (++ring_final_flips % RingFinalEvery() != 1) {
+        return;
+	}
+if (g_ring_pending_busy) {
         std::printf("NHL27RING: final image skipped for frame %" PRIu64 " (previous readback still pending)\n", flip_id);
         return;
     }

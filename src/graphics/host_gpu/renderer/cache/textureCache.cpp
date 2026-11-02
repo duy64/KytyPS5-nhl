@@ -2184,7 +2184,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
 			}
-			TrackImageDownload(id, image, true);(id, image);
+			TrackImageDownload(id, image, true);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -2228,7 +2228,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
-	TrackImageDownload(id, image, false);(id, image);
+	TrackImageDownload(id, image, false);
 	return image.FindView(desc.view_info);
 }
 

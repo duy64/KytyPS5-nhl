@@ -73,10 +73,13 @@ jobs:
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz"
           $archive = Join-Path $env:RUNNER_TEMP "llvm-22.1.8.tar.xz"
           $dest = Join-Path $env:RUNNER_TEMP "llvm-22.1.8"
-          curl.exe --silent --show-error --fail --location --retry 3 --output $archive $url
+          Write-Host "Downloading LLVM 22.1.8 tarball..."
+          curl.exe --show-error --fail --location --retry 3 --max-time 600 --output $archive $url
           if (-not (Test-Path $archive)) { throw "LLVM 22.1.8 tarball download failed" }
+          Write-Host "Extracting LLVM 22.1.8 tarball..."
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           tar.exe -xf $archive -C $dest
+          Write-Host "Verifying LLVM 22.1.8 install..."
           $clangCl = Join-Path $dest "clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin\clang-cl.exe"
           if (-not (Test-Path $clangCl)) { throw "LLVM 22.1.8 clang-cl not found at $clangCl after extract" }
           $installedVersion = (& $clangCl --version | Select-Object -First 1)

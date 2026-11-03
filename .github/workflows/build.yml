@@ -75,6 +75,14 @@ jobs:
           curl.exe --silent --show-error --fail --location --retry 3 --output $installer $url
           & $installer /S
           "C:\Program Files\LLVM\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $clangCl = "C:\Program Files\LLVM\bin\clang-cl.exe"
+          $deadline = (Get-Date).AddMinutes(3)
+          while (-not (Test-Path $clangCl)) {
+            if ((Get-Date) -gt $deadline) { throw "LLVM 22.1.8 install failed: clang-cl not found at $clangCl" }
+            Start-Sleep -Seconds 10
+          }
+          $installedVersion = (& $clangCl --version | Select-Object -First 1)
+          if ($installedVersion -notmatch "22\.1\.8") { throw "LLVM install is not 22.1.8: $installedVersion" }
           
       - name: Verify toolchain
         shell: cmd
@@ -97,8 +105,8 @@ jobs:
             -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
             -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
-            -DCMAKE_C_COMPILER=clang-cl ^
-            -DCMAKE_CXX_COMPILER=clang-cl ^
+            --DCMAKE_C_COMPILER="C:\Program Files\LLVM\bin\clang-cl.exe" ^
+            --DCMAKE_CXX_COMPILER="C:\Program Files\LLVM\bin\clang-cl.exe" ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
           -DKYTY_ARCH_AVX2=ON ^

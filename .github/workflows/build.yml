@@ -105,8 +105,8 @@ jobs:
             -DKYTY_BUILD_ORIGIN=%KYTY_BUILD_ORIGIN% ^
             -DKYTY_BUILD_REPOSITORY=%KYTY_BUILD_REPOSITORY% ^
             -DKYTY_RELEASE_TAG=${{ needs.metadata.outputs.release_tag }} ^
-            --DCMAKE_C_COMPILER="C:\Program Files\LLVM\bin\clang-cl.exe" ^
-            --DCMAKE_CXX_COMPILER="C:\Program Files\LLVM\bin\clang-cl.exe" ^
+            -DCMAKE_C_COMPILER="C:\Program Files\LLVM\bin\clang-cl.exe" ^
+            -DCMAKE_CXX_COMPILER="C:\Program Files\LLVM\bin\clang-cl.exe" ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
             -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
           -DKYTY_ARCH_AVX2=ON ^

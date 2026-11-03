@@ -80,7 +80,7 @@ jobs:
         shell: cmd
         run: |
           git --version
-          cmake --version
+      cmake --version
           ninja --version
           clang-cl --version
           glslang --version

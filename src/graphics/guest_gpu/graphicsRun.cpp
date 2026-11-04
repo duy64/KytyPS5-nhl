@@ -3609,7 +3609,7 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
                                                uint32_t event_write_source, void* dst_gpu_addr,
                                                T value, uint32_t interrupt_selector,
                                                uint32_t interrupt_context_id) {
-		// A label or interrupt tells the guest a draw is done, and it reads a still at once (P8), so the
+	// A label or interrupt tells the guest a draw is done, and it reads a still at once (P8), so the
 	// still reaches guest memory first. Before CurrentBuffer(): the finish moves to a new buffer.
 	static const bool label_publish = [] {
 		const char* setting = std::getenv("KYTY_LABEL_PUBLISH");
@@ -3629,7 +3629,7 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
 			        .count()));
 		}
 	}
-auto& command = CurrentBuffer();
+	auto& command = CurrentBuffer();
 
 	bool with_interrupt = false;
 	switch (interrupt_selector) {

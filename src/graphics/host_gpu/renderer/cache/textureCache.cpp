@@ -680,7 +680,8 @@ void TextureCache::UntrackImageTail(ImageId id) {
 constexpr uint64_t LargeLinearReadbackTexels = 100000;
 
 uint64_t ImageTexels(const ImageInfo& info) {
-	return static_cast<uint64_t>(info.extent.width) * info.extent.height * info.resources.layers;
+	return static_cast<uint64_t>(info.extent.width) * info.extent.height * info.extent.depth *
+	       info.resources.layers;
 }
 
 bool IsLargeLinear(const ImageInfo& info) {
@@ -695,8 +696,8 @@ void TextureCache::TrackImageDownload(ImageId id, Image& image, bool storage) {
 	const bool  large = IsLargeLinear(info);
 	const bool  still = large && m_readback_stills && image.IsGpuModified();
 	const bool  flag  = info.IsTiled() ? m_readback_tiled_images &&
-		ImageTexels(info) <= SmallTiledReadbackTexels
-		: m_readback_linear_images;
+	                                        ImageTexels(info) <= SmallTiledReadbackTexels
+	                                      : m_readback_linear_images;
 	if (large) {
 		// One line per address per flip, enrolled or not: a still takes many binds.
 		static std::unordered_set<uint64_t> seen;
@@ -2680,15 +2681,15 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 	                                               1, &barrier, 0, nullptr);
 	// Only what is still mapped by then (unmaps no longer wait for the publish).
 	const auto unmap_sequence = m_scheduler.Context().UnmapSequence();
-	const bool still          = image.download_still;
+		const bool still          = image.download_still;
 	const auto tick           = m_scheduler.CurrentTick();
 	const auto recorded       = std::chrono::steady_clock::now();
 	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tolerant_write, unmap_sequence,
 	                                    still, tick, recorded] {
 		download.Invalidate(offset, range.size);
-		uint64_t published = 0;
+			uint64_t published = 0;
 		uint32_t pieces = 0;
-		m_scheduler.Context().WriteUnlessUnmapped(
+m_scheduler.Context().WriteUnlessUnmapped(
 		    unmap_sequence, range.address, range.size, [&](uint64_t address, uint64_t bytes) {
 			    const auto* data = static_cast<const uint8_t*>(mapped) + (address - range.address);
 			published += bytes;
@@ -2760,7 +2761,7 @@ void TextureCache::LogReadbackWindow() {
 	}
 	std::printf("NHL27RBENROL: flip=%llu rule=%u flag=%u downloads=%u label=%u drain_ms=%.1f sizes=%u%s\n",
 	            static_cast<unsigned long long>(BufferCache::PerfFlipCount()), m_rb_rule, m_rb_flag,
-	            static_cast<unsigned long long>(m_rb_downloads), m_rb_label, static_cast<double>(m_rb_drain_ns) / 1e6,
+	            m_rb_downloads, m_rb_label, static_cast<double>(m_rb_drain_ns) / 1e6,
 	            static_cast<uint32_t>(m_rb_images.size()), top.c_str());
 	std::fflush(stdout);
 	m_rb_images.clear();

@@ -22,6 +22,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <deque>
 
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #define STB_IMAGE_WRITE_STATIC
@@ -78,6 +79,26 @@ uint32_t                                g_frame = 0;
 bool                                    g_capturing = false;
 std::atomic<bool>                       g_request {false};
 std::atomic<uint64_t>                   g_trace_frame {0};
+struct RingEntry {
+    uint64_t flip_id = 0;
+    uint64_t text_bytes = 0;
+};
+std::deque<RingEntry> g_ring_entries;
+uint64_t g_ring_text_bytes = 0;
+std::string g_ring_cur_text;
+std::unordered_map<uint64_t, Target> g_ring_targets;
+Target g_ring_last_target {};
+bool g_ring_last_valid = false;
+bool g_ring_alive = true;
+bool g_ring_started = false;
+std::atomic<bool> g_ring_request {false};
+bool g_ring_save_in_flight = false;
+bool g_ring_save_pending = false;
+std::string g_ring_save_dir;
+std::vector<uint64_t> g_ring_save_snapshot;
+uint64_t g_ring_save_press = 0;
+Pending g_ring_pending {};
+bool g_ring_pending_busy = false;
 
 // ---- buffer / volume content capture (lighting investigation) ----
 struct BufReq {
@@ -1062,44 +1083,373 @@ void AppendImages(std::string& s, const char* tag, const std::vector<TextureBind
 	}
 }
 
-void BeginCapture(CommandBuffer& buffer) {
-	buffer.EndRendering();
-	std::error_code ec;
-	const char* root_env = std::getenv("KYTY_DBG_FRAME_DUMP_DIR");
-	const std::string root = (root_env != nullptr && *root_env != '\0') ? root_env : "F:/emuf/captures";
-	for (;; g_frame++) {
-		const auto p = std::filesystem::path(root) / ("frame_" + std::to_string(g_frame));
-		if (!std::filesystem::exists(p, ec)) {
-			g_dir = p.generic_string();
-			break;
+std::string NextFreeDir(const std::string& root, const std::string& prefix) {
+    std::error_code ec;
+    for (uint32_t n = 0;; n++) {
+        const auto p = std::filesystem::path(root) / (prefix + std::to_string(n));
+        if (!std::filesystem::exists(p, ec)) return p.generic_string();
+    }
+}
+
+void BeginCaptureAt(CommandBuffer& buffer, const std::string& dir) {
+    buffer.EndRendering();
+    g_dir = dir;
+    std::error_code ec;
+    std::filesystem::create_directories(g_dir, ec);
+    if (ec || !std::filesystem::is_directory(g_dir)) {
+        std::printf("NHL27FRAMEDUMP: cannot create %s: %s (%d)\n", g_dir.c_str(), ec.message().c_str(), ec.value());
+    }
+    g_targets.clear();
+    g_pending.clear();
+    g_log.clear();
+    g_seq = 0;
+    g_images = 0;
+    g_pending_bytes = 0;
+    g_bufreq.clear();
+    g_volreq.clear();
+    g_bufpending.clear();
+    g_buflog.clear();
+    g_seen_vol.clear();
+    g_seen_buf.clear();
+    g_capturing = true;
+    g_active.store(true, std::memory_order_relaxed);
+    std::printf("NHL27FRAMEDUMP: capturing frame -> %s\n", g_dir.c_str());
+    std::fflush(stdout);
+}
+
+std::string RingRoot() {
+    static const std::string root = [] {
+        const char* v = std::getenv("KYTY_DBG_RING_DIR");
+        if (v != nullptr && *v != '\0') return std::string(v);
+        const char* f = std::getenv("KYTY_DBG_FRAME_DUMP_DIR");
+        if (f != nullptr && *f != '\0') return std::string(f);
+        return std::string("F:/emuf/captures");
+    }();
+    return root;
+}
+
+uint32_t RingCount() {
+    static const uint32_t count = [] {
+        const char* v = std::getenv("KYTY_DBG_RING_COUNT");
+        uint32_t n = 300;
+        if (v != nullptr && *v != '\0') {
+            const unsigned long p = std::strtoul(v, nullptr, 10);
+            if (p != 0) n = static_cast<uint32_t>(p);
+        }
+        if (n < 30) {
+            std::printf("NHL27RING: ring count clamped to 30\n");
+            return 30u;
+        }
+        if (n > 1200) {
+            std::printf("NHL27RING: ring count clamped to 1200\n");
+            return 1200u;
+        }
+        return n;
+    }();
+    return count;
+}
+
+uint32_t RingFinalW() {
+    static const uint32_t w = [] {
+        const char* v = std::getenv("KYTY_DBG_RING_FINAL_W");
+        if (v != nullptr && *v != '\0') {
+            const unsigned long p = std::strtoul(v, nullptr, 10);
+            if (p != 0) return static_cast<uint32_t>(p);
+        }
+        return 480u;
+    }();
+    return w;
+}
+
+uint32_t RingFinalEvery() {
+    static const uint32_t every = [] {
+        const char* v = std::getenv("KYTY_DBG_RING_FINAL_EVERY");
+        if (v != nullptr && *v != '\0') {
+            const unsigned long p = std::strtoul(v, nullptr, 10);
+            if (p < 1) {
+                std::printf("NHL27RING: ring final every clamped to 1\n");
+                return 1u;
+			}
+            return static_cast<uint32_t>(p);
 		}
+        return 10u;
+	}();
+    return every;
+}
+
+void RingConsumeFinal(uint64_t flip_id) {
+    Pending p;
+    std::unique_lock lock(g_mutex);
+    if (!g_ring_pending_busy || g_ring_pending.seq != static_cast<uint32_t>(flip_id)) return;
+    p = std::move(g_ring_pending);
+    g_ring_pending_busy = false;
+    lock.unlock();
+    vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
+        const vk::Format ff = p.target.format;
+	    const bool fast8 = (ff == vk::Format::eR8G8B8A8Unorm || ff == vk::Format::eR8G8B8A8Srgb ||
+	                        ff == vk::Format::eB8G8R8A8Unorm || ff == vk::Format::eB8G8R8A8Srgb);
+	    if (fast8) {
+			        if (p.mapped == nullptr) {
+						            std::printf("NHL27RING: final image skipped for frame %PRIu64 (staging not mapped)\n", flip_id);
+					} else {
+						            const bool bgra = (ff == vk::Format::eB8G8R8A8Unorm || ff == vk::Format::eB8G8R8A8Srgb);
+						            const uint8_t* src = static_cast<const uint8_t*>(p.mapped);
+						            const uint32_t tw = p.target.w;
+						            const uint32_t th = p.target.h;
+						            uint32_t out_w = tw;
+						            uint32_t out_h = th;
+						            if (tw > RingFinalW()) {
+										                out_w = RingFinalW();
+										                out_h = std::max(1u, th * RingFinalW() / tw);
+									}
+						            std::vector<uint8_t> rgb;
+						            rgb.resize(static_cast<size_t>(out_w) * out_h * 3);
+						            const uint32_t sx = tw / out_w;
+						            const uint32_t sy = th / out_h;
+						            for (uint32_t y = 0; y < out_h; y++) {
+										                for (uint32_t x = 0; x < out_w; x++) {
+															                    uint32_t sum[3] = {0, 0, 0};
+															                    uint32_t cnt = 0;
+															                    const uint32_t y0 = y * sy;
+															                    const uint32_t y1 = std::min(th, y0 + sy);
+															                    const uint32_t x0 = x * sx;
+															                    const uint32_t x1 = std::min(tw, x0 + sx);
+															                        for (uint32_t syi = y0; syi < y1; syi++) {
+																						                            for (uint32_t sxi = x0; sxi < x1; sxi++) {
+																														                                const uint8_t* px = src + (static_cast<size_t>(syi) * tw + sxi) * 4;
+																														                                sum[0] += px[bgra ? 2 : 0];
+																														                                sum[1] += px[1];
+																														                                sum[2] += px[bgra ? 0 : 2];
+																														                                cnt++;
+																													}
+																					}
+															                    if (cnt == 0) cnt = 1;
+															                    const size_t oidx = (static_cast<size_t>(y) * out_w + x) * 3;
+															                    for (int c = 0; c < 3; c++) rgb[oidx + c] = static_cast<uint8_t>(sum[c] / cnt);
+														}
+									}
+						            const std::string path = RingRoot() + "/ring/final_" + std::to_string(flip_id) + ".png";
+						            if (!WriteRgbPng(path, out_w, out_h, rgb)) {
+										                std::printf("NHL27RING: cannot write final_%PRIu64.png\n", flip_id);
+									}
+					}
+		} else {
+			Decoded d = Decode(p.target, static_cast<const uint8_t*>(p.mapped));
+    if (!d.ok || d.kind == Kind::Depth || d.kind == Kind::Int) {
+        std::printf("NHL27RING: final image skipped for frame %" PRIu64 " (decode/depth/int)\n", flip_id);
+    } else {
+        uint32_t out_w = d.w;
+        uint32_t out_h = d.h;
+        if (d.w > RingFinalW()) {
+            out_w = RingFinalW();
+            out_h = std::max(1u, d.h * RingFinalW() / d.w);
+        }
+        std::vector<uint8_t> rgb;
+        rgb.resize(static_cast<size_t>(out_w) * out_h * 3);
+        const uint32_t sx = d.w / out_w;
+        const uint32_t sy = d.h / out_h;
+        for (uint32_t y = 0; y < out_h; y++) {
+            for (uint32_t x = 0; x < out_w; x++) {
+                float sum[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+                uint32_t cnt = 0;
+                const uint32_t y0 = y * sy;
+                const uint32_t y1 = std::min(d.h, y0 + sy);
+                const uint32_t x0 = x * sx;
+                const uint32_t x1 = std::min(d.w, x0 + sx);
+                for (uint32_t syi = y0; syi < y1; syi++) {
+                    for (uint32_t sxi = x0; sxi < x1; sxi++) {
+                        const size_t idx = (static_cast<size_t>(syi) * d.w + sxi) * 4;
+                        for (int c = 0; c < 4; c++) sum[c] += d.px[idx + c];
+                        cnt++;
+                    }
+                }
+                if (cnt == 0) cnt = 1;
+                const size_t oidx = (static_cast<size_t>(y) * out_w + x) * 3;
+                for (int c = 0; c < 3; c++) {
+                    float v = sum[c] / static_cast<float>(cnt);
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 1.0f) v = 1.0f;
+                    rgb[oidx + c] = static_cast<uint8_t>(v * 255.0f);
+                }
+            }
+        }
+        const std::string path = RingRoot() + "/ring/final_" + std::to_string(flip_id) + ".png";
+        if (!WriteRgbPng(path, out_w, out_h, rgb)) {
+            std::printf("NHL27RING: cannot write final_%" PRIu64 ".png\n", flip_id);
+        }
+    }
+		}
+	vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
+}
+
+void RingRecordReadback(CommandBuffer& buffer, const Target& t, uint64_t flip_id) {
+    auto& gfx = buffer.GetGraphics();
+    const auto cmd = buffer.Handle();
+    const uint32_t bpp = BytesPerPixel(t.format);
+    const uint64_t size = static_cast<uint64_t>(t.w) * t.h * bpp * t.slices;
+    vk::BufferCreateInfo bi {};
+    bi.size = size;
+    bi.usage = vk::BufferUsageFlagBits::eTransferDst;
+    VmaAllocationCreateInfo ai {};
+    ai.usage = VMA_MEMORY_USAGE_AUTO;
+    ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+    VkBuffer native = VK_NULL_HANDLE;
+    VmaAllocation alloc = nullptr;
+    VmaAllocationInfo info {};
+    if (vmaCreateBuffer(gfx.allocator, reinterpret_cast<const VkBufferCreateInfo*>(&bi), &ai, &native, &alloc, &info) != VK_SUCCESS) {
+        std::printf("NHL27RING: final image skipped for frame %" PRIu64 " (staging allocation failed)\n", flip_id);
+        return;
+    }
+    using S = vk::PipelineStageFlagBits2;
+    using A = vk::AccessFlagBits2;
+    BarrierImage(cmd, t, t.layout, vk::ImageLayout::eTransferSrcOptimal, S::eAllCommands, A::eMemoryWrite, S::eTransfer, A::eTransferRead);
+    vk::BufferImageCopy copy {};
+    copy.imageSubresource = {t.copy_aspect, t.mip, t.layer, 1};
+    copy.imageExtent = vk::Extent3D {t.w, t.h, t.slices};
+    cmd.copyImageToBuffer(t.image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(native), 1, &copy);
+    BarrierImage(cmd, t, vk::ImageLayout::eTransferSrcOptimal, t.layout, S::eTransfer, A::eTransferRead, S::eAllCommands, A::eMemoryRead | A::eMemoryWrite);
+    Pending p;
+    p.buffer = vk::Buffer(native);
+    p.alloc = alloc;
+    p.mapped = info.pMappedData;
+    p.size = size;
+    p.target = t;
+    p.seq = static_cast<uint32_t>(flip_id);
+    p.graphics = &gfx;
+    g_ring_pending = std::move(p);
+    g_ring_pending_busy = true;
+    buffer.GetContext().GetCommandScheduler().DeferOperation([flip_id]() { RingConsumeFinal(flip_id); }, t.addr, size);
+}
+
+void RingArmFinal(CommandBuffer& buffer, uint64_t flip_id) {
+    if (!g_ring_last_valid) {
+        g_ring_targets.clear();
+        return;
+    }
+    Target t = g_ring_last_target;
+    g_ring_last_valid = false;
+    g_ring_targets.clear();
+        static uint32_t ring_final_flips = 0;
+    if (++ring_final_flips % RingFinalEvery() != 1) {
+        return;
 	}
-	std::filesystem::create_directories(g_dir, ec);
-	if (ec || !std::filesystem::is_directory(g_dir)) {
-		std::printf("NHL27FRAMEDUMP: cannot create %s: %s (%d)\n", g_dir.c_str(), ec.message().c_str(),
-		            ec.value());
-	}
-	g_targets.clear();
-	g_pending.clear();
-	g_log.clear();
-	g_seq = 0;
-	g_images = 0;
-	g_pending_bytes = 0;
-	g_bufreq.clear();
-	g_volreq.clear();
-	g_bufpending.clear();
-	g_buflog.clear();
-	g_seen_vol.clear();
-	g_seen_buf.clear();
-	g_capturing = true;
-	g_active.store(true, std::memory_order_relaxed);
-	std::printf("NHL27FRAMEDUMP: capturing frame -> %s\n", g_dir.c_str());
-	std::fflush(stdout);
+if (g_ring_pending_busy) {
+        std::printf("NHL27RING: final image skipped for frame %" PRIu64 " (previous readback still pending)\n", flip_id);
+        return;
+    }
+    if (t.samples > 1) {
+        std::printf("NHL27RING: final image skipped for frame %" PRIu64 " (multisampled)\n", flip_id);
+        return;
+    }
+    const uint32_t bpp = BytesPerPixel(t.format);
+    const uint64_t size = static_cast<uint64_t>(t.w) * t.h * bpp * t.slices;
+    if (static_cast<VkImage>(t.image) == VK_NULL_HANDLE || bpp == 0 || t.w < kMinSize || (t.h < kMinSize && !t.img3d) || size > (256ull << 20)) {
+        std::printf("NHL27RING: final image skipped for frame %" PRIu64 " (unsupported/small/oversize target)\n", flip_id);
+        return;
+    }
+    if (t.depth) {
+        std::printf("NHL27RING: final image skipped for frame %" PRIu64 " (depth target)\n", flip_id);
+        return;
+    }
+    RingRecordReadback(buffer, t, flip_id);
+}
+
+void RingCommitFrame(uint64_t flip_id) {
+    const std::string path = RingRoot() + "/ring/frame_" + std::to_string(flip_id) + ".txt";
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(g_ring_cur_text.data(), 1, g_ring_cur_text.size(), f);
+        std::fclose(f);
+        g_ring_entries.push_back(RingEntry {flip_id, g_ring_cur_text.size()});
+        g_ring_text_bytes += g_ring_cur_text.size();
+    } else {
+        std::printf("NHL27RING: ring recording stopped (cannot write %s)\n", path.c_str());
+        g_ring_alive = false;
+    }
+    g_ring_cur_text.clear();
+    while (!g_ring_entries.empty() && (g_ring_entries.size() > RingCount() || g_ring_text_bytes > (128ull << 20))) {
+        const RingEntry old_entry = g_ring_entries.front();
+        g_ring_entries.pop_front();
+        g_ring_text_bytes -= old_entry.text_bytes;
+        std::error_code ec;
+        std::filesystem::remove(RingRoot() + "/ring/frame_" + std::to_string(old_entry.flip_id) + ".txt", ec);
+        std::filesystem::remove(RingRoot() + "/ring/final_" + std::to_string(old_entry.flip_id) + ".png", ec);
+    }
+}
+
+void RingConsumeSaveRequest(CommandBuffer& buffer, uint64_t flip_id) {
+    if (!g_ring_request.exchange(false)) return;
+    if (g_ring_save_in_flight || g_ring_save_pending) {
+        std::printf("NHL27RING: ring save ignored (a save is already in flight)\n");
+        return;
+    }
+    if (!g_ring_alive) {
+        std::printf("NHL27RING: ring save ignored (ring recording stopped)\n");
+        return;
+    }
+    if (g_ring_entries.size() < 2) {
+        std::printf("NHL27RING: ring save has no prior frame (press at first flip)\n");
+        g_ring_save_snapshot.clear();
+        g_ring_save_press = flip_id;
+    } else {
+        g_ring_save_press = g_ring_entries[g_ring_entries.size() - 2].flip_id;
+        g_ring_save_snapshot.clear();
+        for (const auto& e : g_ring_entries) {
+            if (e.flip_id > g_ring_save_press) break;
+            g_ring_save_snapshot.push_back(e.flip_id);
+        }
+    }
+    g_ring_save_dir = NextFreeDir(RingRoot(), "ring_save_");
+    std::error_code ec;
+    std::filesystem::create_directories(g_ring_save_dir, ec);
+    for (uint64_t id : g_ring_save_snapshot) {
+        std::filesystem::copy_file(RingRoot() + "/ring/frame_" + std::to_string(id) + ".txt", g_ring_save_dir + "/frame_" + std::to_string(id) + ".txt", ec);
+        const std::string final_src = RingRoot() + "/ring/final_" + std::to_string(id) + ".png";
+        if (std::filesystem::exists(final_src, ec))
+            std::filesystem::copy_file(final_src, g_ring_save_dir + "/final_" + std::to_string(id) + ".png", ec);
+    }
+    std::string idx = "# Ring save. Press frame marked; frames are in flip order.\n";
+    for (uint64_t id : g_ring_save_snapshot) {
+        idx += "frame " + std::to_string(id) + " text frame_" + std::to_string(id) + ".txt final ";
+        idx += std::filesystem::exists(g_ring_save_dir + "/final_" + std::to_string(id) + ".png") ? ("final_" + std::to_string(id) + ".png") : "missing";
+        if (id == g_ring_save_press) idx += " *** SAVE PRESSED HERE ***";
+        idx += "\n";
+    }
+    if (FILE* f = std::fopen((g_ring_save_dir + "/ring_index.txt").c_str(), "wb")) {
+        std::fwrite(idx.data(), 1, idx.size(), f);
+        std::fclose(f);
+    }
+    std::printf("NHL27RING: ring save pressed at frame %" PRIu64 " (%zu frames) -> %s\n", g_ring_save_press, g_ring_save_snapshot.size(), g_ring_save_dir.c_str());
+    std::fflush(stdout);
+    if (g_capturing) {
+        g_ring_save_pending = true;
+        return;
+    }
+    BeginCaptureAt(buffer, g_ring_save_dir + "/full");
+    g_ring_save_in_flight = true;
+}
+
+void RingCompleteSave() {
+    size_t finals = 0;
+    for (uint64_t id : g_ring_save_snapshot)
+        if (std::filesystem::exists(g_ring_save_dir + "/final_" + std::to_string(id) + ".png")) finals++;
+    if (FILE* f = std::fopen((g_ring_save_dir + "/save_complete.txt").c_str(), "wb")) {
+        std::fprintf(f, "ring save complete: %zu frames, %zu final images\n", g_ring_save_snapshot.size(), finals);
+        std::fclose(f);
+    }
+    std::printf("NHL27RING: ring save done -> %s (%zu frames, %zu final images)\n", g_ring_save_dir.c_str(), g_ring_save_snapshot.size(), finals);
+    std::fflush(stdout);
+    g_ring_save_in_flight = false;
+}
+
+void BeginCapture(CommandBuffer& buffer) {
+    const char* root_env = std::getenv("KYTY_DBG_FRAME_DUMP_DIR");
+	const std::string root = (root_env != nullptr && *root_env != '\0') ? root_env : "F:/emuf/captures";
+	BeginCaptureAt(buffer, NextFreeDir(root, "frame_"));
 }
 
 void FinishCapture(CommandBuffer& buffer) {
 	buffer.GetContext().GetCommandScheduler().FlushAndWait();
-	g_active.store(false, std::memory_order_relaxed);
+	g_active.store(RingEnabled(), std::memory_order_relaxed); // A classic capture finishing must not switch the ring's call sites off.
 	g_capturing = false;
 	std::string draws = g_log;
 	g_log.clear();
@@ -1160,8 +1510,51 @@ void Request() {
 	std::fflush(stdout);
 }
 
+bool RingEnabled() noexcept {
+    static const bool enabled = [] {
+        const char* v = std::getenv("KYTY_DBG_RING_FRAMES");
+        return v != nullptr && *v != '\0' && *v != '0';
+    }();
+    return enabled;
+}
+
+void RingSaveRequest() {
+    if (!RingEnabled()) return;
+    g_ring_request.store(true);
+    std::printf("NHL27RING: ring save requested\n");
+    std::fflush(stdout);
+}
+
 void OnGuestFlip(CommandBuffer& buffer) {
-	g_trace_frame.fetch_add(1, std::memory_order_relaxed);
+	const uint64_t flip_id = g_trace_frame.fetch_add(1, std::memory_order_relaxed);
+    if (RingEnabled() && g_ring_alive) {
+        std::lock_guard ring_lock(g_mutex);
+        if (!g_ring_started) {
+            g_ring_started = true;
+            g_active.store(true, std::memory_order_relaxed);
+            std::error_code ec;
+            std::filesystem::create_directories(std::filesystem::path(RingRoot()) / "ring", ec);
+            if (ec || !std::filesystem::is_directory(std::filesystem::path(RingRoot()) / "ring")) {
+                std::printf("NHL27RING: ring recording stopped (cannot create %s/ring)\n", RingRoot().c_str());
+                g_ring_alive = false;
+            } else {
+                std::printf("NHL27RING: ring recording -> %s (%u frames)\n", (RingRoot() + "/ring").c_str(), RingCount());
+                std::fflush(stdout);
+            }
+        }
+        if (g_ring_alive) {
+            static uint32_t ring_flips = 0;
+            if (++ring_flips % 30 == 0) {
+                std::error_code ec;
+                if (std::filesystem::remove("framedump.trigger", ec)) {
+                    g_ring_request.store(true);
+                }
+            }
+            RingCommitFrame(flip_id);
+            RingArmFinal(buffer, flip_id);
+            RingConsumeSaveRequest(buffer, flip_id);
+        }
+    }
 	if (!Enabled()) return;
 	// Scripts request a capture too: a file named framedump.trigger in the working directory
 	// (looked for every 30 flips, removed when found).
@@ -1175,6 +1568,13 @@ void OnGuestFlip(CommandBuffer& buffer) {
 	std::lock_guard lock(g_mutex);
 	if (g_capturing) {
 		FinishCapture(buffer);
+        if (g_ring_save_in_flight) {
+            RingCompleteSave();
+        } else if (g_ring_save_pending) {
+            BeginCaptureAt(buffer, g_ring_save_dir + "/full");
+            g_ring_save_in_flight = true;
+            g_ring_save_pending = false;
+        }
 	} else if (g_request.exchange(false)) {
 		BeginCapture(buffer);
 	}
@@ -1182,7 +1582,7 @@ void OnGuestFlip(CommandBuffer& buffer) {
 
 void OnDraw(RenderContext& context, const DrawLog& draw) {
 	std::lock_guard lock(g_mutex);
-	if (!g_capturing) return;
+	const bool ring = RingEnabled() && g_ring_alive;    if (!g_capturing && !ring) return;
 	const uint32_t seq = g_seq++;
 	char b[512];
 	std::snprintf(b, sizeof(b),
@@ -1195,7 +1595,7 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	std::string s = b;
 	s += draw.state_text;
 	s += std::string("    emitted=") + (draw.skipped ? "0 (shader skip)\n" : "1\n");
-	if (draw.indirect_snapshot != nullptr && WantBuffers(draw.ps_hash)) {
+	if (g_capturing && draw.indirect_snapshot != nullptr && WantBuffers(draw.ps_hash)) {
 		// Copy the frozen bytes actually consumed by vkCmdDraw*Indirect, not a CPU view
 		// of the guest argument page. Every draw is captured even when guest addresses repeat.
 		BufReq req;
@@ -1219,7 +1619,7 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 		     std::to_string(c.mip) + " target_layer=" + std::to_string(c.layer) + " extent=" +
 		     std::to_string(c.extent.width) + "x" + std::to_string(c.extent.height) + "\n";
 		Target t;
-		if (c.view && MakeTarget(context, c.image_id, c.desc->view_info, c.layout, c.desc->info.data.address, t)) {
+		if (g_capturing && c.view && MakeTarget(context, c.image_id, c.desc->view_info, c.layout, c.desc->info.data.address, t)) {
 			t.slot = c.slot;
 			t.seq  = seq;
 			t.dirty = true;
@@ -1230,7 +1630,7 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 		const auto& c = *draw.depth;
 		s += "    depth: " + DescribeImage(*c.desc) + "\n";
 		Target t;
-		if (c.view && MakeTarget(context, c.image_id, c.desc->view_info, c.layout, c.desc->info.data.address, t)) {
+		if (g_capturing && c.view && MakeTarget(context, c.image_id, c.desc->view_info, c.layout, c.desc->info.data.address, t)) {
 			t.seq   = seq;
 			t.dirty = true;
 			g_targets[reinterpret_cast<uint64_t>(static_cast<VkImageView>(c.view))] = t;
@@ -1238,8 +1638,24 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	}
 	for (int i = 0; i < 3; i++) AppendImages(s, ("vs_img" + std::to_string(i)).c_str(), draw.vs_images[i]);
 	AppendImages(s, "ps_img", draw.ps_images);
-	g_log += s;
-	if (draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {
+	g_log += s;    if (ring) g_ring_cur_text += s;
+	if (ring) {
+        for (const auto& c : draw.colors) {
+            Target t;
+            if (c.view && MakeTarget(context, c.image_id, c.desc->view_info, c.layout, c.desc->info.data.address, t)) {
+                t.slot = c.slot;
+                g_ring_targets[reinterpret_cast<uint64_t>(static_cast<VkImageView>(c.view))] = t;
+            }
+        }
+        if (draw.depth != nullptr && draw.depth->desc != nullptr) {
+            const auto& c = *draw.depth;
+            Target t;
+            if (c.view && MakeTarget(context, c.image_id, c.desc->view_info, c.layout, c.desc->info.data.address, t)) {
+                g_ring_targets[reinterpret_cast<uint64_t>(static_cast<VkImageView>(c.view))] = t;
+            }
+        }
+    }
+    if (g_capturing && draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {
 		CaptureBindings(*draw.ps_bindings, seq, draw.ps_hash);
 		if (draw.ps_images != nullptr) {
 			for (size_t si = 0; si < draw.ps_images->size(); si++) {
@@ -1270,11 +1686,12 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 
 void OnEndRendering(const CommandBuffer& buffer, const RenderState& pass) {
 	std::lock_guard lock(g_mutex);
-	if (!g_capturing) return;
+	const bool ring = RingEnabled() && g_ring_alive;    if (!g_capturing && !ring) return;
 	auto&      gfx = buffer.GetGraphics();
 	const auto cmd = buffer.Handle();
-	FlushRequests(gfx, cmd);
+	if (g_capturing) FlushRequests(gfx, cmd);
 	const auto dump = [&](vk::ImageView view, const char* label_prefix, bool is_depth) {
+        if (!g_capturing) return;
 		if (!view) return;
 		const auto it = g_targets.find(reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
 		if (it == g_targets.end() || !it->second.dirty) return;
@@ -1283,7 +1700,14 @@ void OnEndRendering(const CommandBuffer& buffer, const RenderState& pass) {
 		if (!is_depth) label += std::to_string(it->second.slot);
 		RecordReadback(gfx, cmd, it->second, label.c_str(), it->second.seq);
 	};
-	for (uint32_t i = 0; i < pass.num_color_attachments; i++) {
+	if (ring && pass.num_color_attachments > 0) {
+        const auto it = g_ring_targets.find(reinterpret_cast<uint64_t>(static_cast<VkImageView>(pass.color_attachments[0].image_view)));
+        if (it != g_ring_targets.end()) {
+            g_ring_last_target = it->second;
+            g_ring_last_valid = true;
+        }
+    }
+    for (uint32_t i = 0; i < pass.num_color_attachments; i++) {
 		dump(pass.color_attachments[i].image_view, "rt", false);
 	}
 	if (pass.depth_stencil_attachment.has_depth || pass.depth_stencil_attachment.has_stencil) {
@@ -1295,7 +1719,7 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
                 uint32_t gy, uint32_t gz, bool indirect, std::span<const StorageUse> images,
                 const PreparedBindings* bindings) {
 	std::lock_guard lock(g_mutex);
-	if (!g_capturing) return;
+	const bool ring = RingEnabled() && g_ring_alive;    if (!g_capturing && !ring) return;
 	const uint32_t seq = g_seq++;
 	char b[256];
 	std::snprintf(b, sizeof(b), "#%05u dispatch cs=0x%016" PRIx64 " groups=%ux%ux%u%s\n", seq, cs_hash, gx,
@@ -1305,11 +1729,11 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 		return value != nullptr && std::strcmp(value, "1") == 0;
 	}();
 	const bool trace_cs = TraceCsEnabled(cs_hash);
-	if (bindings != nullptr && (trace_cs || capture_constants)) {
+	if (g_capturing && bindings != nullptr && (trace_cs || capture_constants)) {
 		g_buflog += "# compute bindings captured AFTER dispatch\n";
 		CaptureBindings(*bindings, seq, cs_hash, capture_constants && !trace_cs);
 	}
-	FlushRequests(buffer.GetGraphics(), buffer.Handle());
+	if (g_capturing) FlushRequests(buffer.GetGraphics(), buffer.Handle());
 	std::string s = b;
 	for (size_t i = 0; i < images.size(); i++) {
 		const auto& u = images[i];
@@ -1317,10 +1741,10 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 		s += "    img[" + std::to_string(i) + "]: " + DescribeImage(u.binding->desc) +
 		     (u.storage ? " STORAGE" : " sampled") + (u.written ? " WRITTEN" : "") + "\n";
 	}
-	g_log += s;
+	g_log += s;    if (ring) g_ring_cur_text += s;
 	for (size_t i = 0; i < images.size(); i++) {
 		const auto& u = images[i];
-		if (u.binding == nullptr || !u.written || !u.storage) continue;
+		if (u.binding == nullptr || !u.written || !u.storage) continue;        if (!g_capturing) continue;
 		Target t;
 		if (!MakeTarget(context, u.binding->image_id, u.binding->desc.view_info, u.binding->layout,
 		                u.binding->desc.info.data.address, t)) {

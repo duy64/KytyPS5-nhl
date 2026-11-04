@@ -69,7 +69,7 @@ jobs:
 
       - name: Install LLVM 22.1.8
         timeout-minutes: 15
-                shell: pwsh
+        shell: pwsh
         run: |
           $url = "https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.8/clang+llvm-22.1.8-x86_64-pc-windows-msvc.tar.xz"
           $archive = Join-Path $env:RUNNER_TEMP "llvm-22.1.8.tar.xz"
@@ -80,7 +80,7 @@ jobs:
           Write-Host "Extracting LLVM 22.1.8 tarball..."
           New-Item -ItemType Directory -Force -Path $dest | Out-Null
           $sevenZip = "C:\Program Files\7-Zip\7z.exe"
-if (-not (Test-Path $sevenZip)) { throw "7z not found at $sevenZip" }
+          if (-not (Test-Path $sevenZip)) { throw "7z not found at $sevenZip" }
           & $sevenZip x $archive -o"$dest" -y
           Write-Host "Verifying LLVM 22.1.8 install..."
           $clangCl = Join-Path $dest "clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin\clang-cl.exe"

@@ -373,6 +373,10 @@ static std::vector<ReleaseInfo> FetchFromGitHub(const std::string& repo, HttpVal
 						r.date = pub->second.s.substr(0, 10);
 					}
 				}
+				if (auto pub = rel.o.find("published_at"); pub != rel.o.end())
+				{
+					r.published = pub->second.s;
+				}
 				r.folder = repo == kDefaultRepo ? r.tag : repo.substr(repo.find('/') + 1) + "-" + r.tag;
 				out.push_back(r);
 			}
@@ -382,8 +386,12 @@ static std::vector<ReleaseInfo> FetchFromGitHub(const std::string& repo, HttpVal
 			break;
 		}
 	}
-	// The API orders by creation; sort by tag date so the newest build is first.
-	std::stable_sort(out.begin(), out.end(), [](const ReleaseInfo& a, const ReleaseInfo& b) { return a.date > b.date; });
+	// Sort by tag date so the newest build is first; same-day builds tie on the date, so break
+		// the tie by publish time (newest first) — the API's order does not put the newest
+		// same-day build first.
+	std::stable_sort(out.begin(), out.end(), [](const ReleaseInfo& a, const ReleaseInfo& b) {
+		return a.date != b.date ? a.date > b.date : a.published > b.published;
+	});
 	return out;
 }
 
@@ -447,7 +455,7 @@ bool LoadCache(const fs::path& file, CachedReleases& c)
 	while (std::getline(f, line))
 	{
 		auto parts = SplitTabs(line);
-		if (parts.size() != 7)
+		if (parts.size() != 7 && parts.size() != 8)
 		{
 			return false;
 		}
@@ -459,6 +467,7 @@ bool LoadCache(const fs::path& file, CachedReleases& c)
 		r.zip_url  = parts[4];
 		r.api_url  = parts[5];
 		r.zip_size = std::strtoull(parts[6].c_str(), nullptr, 10);
+		r.published = parts.size() == 8 ? parts[7] : std::string();
 		c.list.push_back(std::move(r));
 	}
 	return !c.list.empty();
@@ -476,7 +485,7 @@ void SaveCache(const fs::path& file, const CachedReleases& c)
 		f << "etag\t" << c.etag << "\n" << "fetched\t" << c.fetched << "\n";
 		for (const auto& r: c.list)
 		{
-			f << r.tag << '\t' << r.folder << '\t' << r.date << '\t' << r.codename << '\t' << r.zip_url << '\t' << r.api_url << '\t' << r.zip_size << "\n";
+			f << r.tag << '\t' << r.folder << '\t' << r.date << '\t' << r.codename << '\t' << r.zip_url << '\t' << r.api_url << '\t' << r.zip_size << '\t' << r.published << "\n";
 		}
 		if (!f)
 		{

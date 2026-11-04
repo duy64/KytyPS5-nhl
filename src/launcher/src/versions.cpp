@@ -380,7 +380,7 @@ static std::vector<ReleaseInfo> FetchFromGitHub(const std::string& repo, HttpVal
 				r.folder = repo == kDefaultRepo ? r.tag : repo.substr(repo.find('/') + 1) + "-" + r.tag;
 				out.push_back(r);
 			}
-	
+		}
 		if (root.a.size() < kPerPage)
 		{
 			break;

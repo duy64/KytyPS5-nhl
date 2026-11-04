@@ -82,6 +82,8 @@ jobs:
           $sevenZip = "C:\Program Files\7-Zip\7z.exe"
           if (-not (Test-Path $sevenZip)) { throw "7z not found at $sevenZip" }
           & $sevenZip x $archive -o"$dest" -y
+          $tarFile = Join-Path $dest "llvm-22.1.8.tar"
+          if (Test-Path $tarFile) { & $sevenZip x $tarFile -o"$dest" -y; Remove-Item $tarFile }
           Write-Host "Verifying LLVM 22.1.8 install..."
           $clangCl = Join-Path $dest "clang+llvm-22.1.8-x86_64-pc-windows-msvc\bin\clang-cl.exe"
           if (-not (Test-Path $clangCl)) { throw "LLVM 22.1.8 clang-cl not found at $clangCl after extract" }

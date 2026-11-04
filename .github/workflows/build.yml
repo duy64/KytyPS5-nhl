@@ -93,7 +93,11 @@ jobs:
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DKYTY_ARCH_AVX2=ON ^
+            -DKYTY_PGO=use ^
+            -DKYTY_PGO_PROFILE=%CD%/tools/pgo/nhl27-clang19.profdata ^
+            -DKYTY_PGO_PROFILE_COMPILER=19.1.5
 
       - name: Build
         shell: cmd

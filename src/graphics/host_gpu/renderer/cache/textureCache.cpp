@@ -2687,7 +2687,7 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tolerant_write, unmap_sequence,
 	                                    still, tick, recorded] {
 		download.Invalidate(offset, range.size);
-			uint64_t published = 0;
+				uint64_t published = 0;
 		uint32_t pieces = 0;
 m_scheduler.Context().WriteUnlessUnmapped(
 		    unmap_sequence, range.address, range.size, [&](uint64_t address, uint64_t bytes) {

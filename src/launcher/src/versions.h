@@ -18,6 +18,7 @@ struct ReleaseInfo
 	std::string zip_url;  // the ...-Windows-x64.zip asset
 	std::string api_url;  // the same asset through the API (takes the token: private repos)
 	uint64_t    zip_size = 0;
+	std::string published; // published_at from GitHub, e.g. 2026-11-04T20:12:53Z; breaks same-day date ties
 };
 
 // An emulator build on disk.

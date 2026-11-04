@@ -993,7 +993,8 @@ bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, Binding
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
-		case BindingType::DepthTarget: {			recreate |= !cached.info.IsDepth();
+		case BindingType::DepthTarget: {
+						recreate |= !cached.info.IsDepth();
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
 			// The render area follows the request, so a narrower image would be drawn past its edge.
 			const bool depth_grow = DepthGrowRecreate() && cached.info.extent.width < requested.extent.width;

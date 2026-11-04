@@ -428,7 +428,7 @@ struct TextureCacheTestAccess {
 
   static void TrackDownload(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
-    cache.TrackImageDownload(id, cache.m_slot_images[id]);
+    cache.TrackImageDownload(id, cache.m_slot_images[id], false);
   }
 
   static void AssociateStencil(TextureCache &cache, ImageId depth,

@@ -3609,7 +3609,27 @@ void CommandProcessor::ExecuteWriteAtEndOfPipe(uint64_t submit_id, uint32_t eop_
                                                uint32_t event_write_source, void* dst_gpu_addr,
                                                T value, uint32_t interrupt_selector,
                                                uint32_t interrupt_context_id) {
-	auto& command = CurrentBuffer();
+		// A label or interrupt tells the guest a draw is done, and it reads a still at once (P8), so the
+	// still reaches guest memory first. Before CurrentBuffer(): the finish moves to a new buffer.
+	static const bool label_publish = [] {
+		const char* setting = std::getenv("KYTY_LABEL_PUBLISH");
+		return setting == nullptr || setting[0] != '0';
+	}();
+	auto& textures = m_renderer.GetTextureCache();
+	if (textures.StillPublishPending() && label_publish && !IsAsyncComputeQueue() &&
+	    !CommandScheduler::InDeferredOperation()) {
+		auto&      scheduler = m_renderer.GetCommandScheduler();
+		const auto tick      = scheduler.CurrentTick();
+		const auto start     = std::chrono::steady_clock::now();
+		if (textures.PublishPendingStills()) {
+			scheduler.Finish();
+			scheduler.WaitPriorityOperations(tick);
+			textures.NoteStillDrain(static_cast<uint64_t>(
+			    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
+			        .count()));
+		}
+	}
+auto& command = CurrentBuffer();
 
 	bool with_interrupt = false;
 	switch (interrupt_selector) {

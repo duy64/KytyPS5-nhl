@@ -55,6 +55,12 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
 constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
 
+// KYTY_READBACK_STILLS=0 leaves large linear images to --readback-linear-images.
+bool ReadbackStillsEnabled() {
+	const char* value = std::getenv("KYTY_READBACK_STILLS");
+	return value == nullptr || value[0] != '0';
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -145,7 +151,8 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
-      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()) {
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
+	m_readback_stills(ReadbackStillsEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;
 		const auto        budget =
@@ -669,19 +676,54 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 }
 
-void TextureCache::TrackImageDownload(ImageId id, Image& image) {
+// The size class of the Be a Pro stills (P8), which the game encodes to PNG on the CPU.
+constexpr uint64_t LargeLinearReadbackTexels = 100000;
+
+uint64_t ImageTexels(const ImageInfo& info) {
+	return static_cast<uint64_t>(info.extent.width) * info.extent.height * info.resources.layers;
+}
+
+bool IsLargeLinear(const ImageInfo& info) {
+	return !info.IsTiled() && ImageTexels(info) >= LargeLinearReadbackTexels;
+}
+
+void TextureCache::TrackImageDownload(ImageId id, Image& image, bool storage) {
 	// Small tiled targets are written back too: games read GPU results such as reductions and
 	// simulation state from them on the CPU (PPSA04263 keeps the origin of its ocean wave grid
 	// in a 1x1 R32G32 target, and its water physics read it to sample the wave heights).
-	const auto& info   = image.info;
-	const auto  texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
-	                     info.extent.depth * info.resources.layers;
-	if (info.IsTiled() ? m_readback_tiled_images && texels <= SmallTiledReadbackTexels
-	                   : m_readback_linear_images) {
+		const auto& info  = image.info;
+	const bool  large = IsLargeLinear(info);
+	const bool  still = large && m_readback_stills && image.IsGpuModified();
+	const bool  flag  = info.IsTiled() ? m_readback_tiled_images &&
+		ImageTexels(info) <= SmallTiledReadbackTexels
+		: m_readback_linear_images;
+	if (large) {
+		// One line per address per flip, enrolled or not: a still takes many binds.
+		static std::unordered_set<uint64_t> seen;
+		const auto flip = BufferCache::PerfFlipCount();
+		if (seen.size() < 200 && seen.insert((info.data.address << 20) ^ flip).second) {
+			std::printf("NHL27READBACKTRACK: addr=0x%llx fmt=%s %ux%u bind=%s enrolled=%d flip=%llu "
+			            "tick=%llu\n",
+			            static_cast<unsigned long long>(info.data.address),
+			            vk::to_string(info.pixel_format).c_str(), info.extent.width,
+			            info.extent.height, storage ? "storage" : "rt", still || flag ? 1 : 0,
+			            static_cast<unsigned long long>(flip),
+			            static_cast<unsigned long long>(m_scheduler.CurrentTick()));
+			std::fflush(stdout);
+		}
+	}
+	if (still || flag) {
 		if (!image.IsGpuModified()) {
 			EXIT("TextureCache: cannot enroll a non-GPU-owned image for download\n");
 		}
 		m_download_images.insert(id);
+		m_rb_images[(static_cast<uint64_t>(info.pixel_format) << 32) |
+		            (static_cast<uint64_t>(info.extent.width) << 16) | info.extent.height]++;
+		(flag ? m_rb_flag : m_rb_rule)++;
+	}
+	if (still) {
+		image.download_still = true;
+		m_still_pending.store(true, std::memory_order_relaxed);
 	}
 }
 
@@ -2165,7 +2207,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			if (!image.info.data.Empty()) {
 				CommitGpuWrite(image);
 			}
-			TrackImageDownload(id, image);
+			TrackImageDownload(id, image, true);
 			break;
 		default: EXIT("TextureCache: invalid texture binding\n");
 	}
@@ -2209,7 +2251,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 	image.usage.render_target = true;
 	RefreshImage(id);
 	CommitGpuWrite(image);
-	TrackImageDownload(id, image);
+	TrackImageDownload(id, image, false);
 	return image.FindView(desc.view_info);
 }
 
@@ -2638,19 +2680,92 @@ bool TextureCache::DownloadImageMemory(ImageId id, bool tolerant_write) {
 	                                               1, &barrier, 0, nullptr);
 	// Only what is still mapped by then (unmaps no longer wait for the publish).
 	const auto unmap_sequence = m_scheduler.Context().UnmapSequence();
-	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tolerant_write, unmap_sequence] {
+	const bool still          = image.download_still;
+	const auto tick           = m_scheduler.CurrentTick();
+	const auto recorded       = std::chrono::steady_clock::now();
+	m_scheduler.DeferPriorityOperation([this, &download, range, mapped, offset, tolerant_write, unmap_sequence,
+	                                    still, tick, recorded] {
 		download.Invalidate(offset, range.size);
+		uint64_t published = 0;
+		uint32_t pieces = 0;
 		m_scheduler.Context().WriteUnlessUnmapped(
 		    unmap_sequence, range.address, range.size, [&](uint64_t address, uint64_t bytes) {
 			    const auto* data = static_cast<const uint8_t*>(mapped) + (address - range.address);
+			published += bytes;
+			pieces++;
 			    if (tolerant_write) {
 				    (void)LibKernel::Memory::TryWriteBacking(address, data, bytes);
 			    } else {
 				    LibKernel::Memory::WriteBacking(address, data, bytes);
 			    }
 		    });
+		static std::atomic<uint32_t> lines {0};
+		if (still && lines.fetch_add(1, std::memory_order_relaxed) < 200) {
+			const std::chrono::duration<double, std::milli> wall =
+			    std::chrono::steady_clock::now() - recorded;
+			std::printf("NHL27RBPUBLISH: addr=0x%llx bytes=%llu size=%llu pieces=%u tick=%llu wall_ms=%.2f\n",
+			            static_cast<unsigned long long>(range.address),
+			            static_cast<unsigned long long>(published),
+			            static_cast<unsigned long long>(range.size), pieces,
+			            static_cast<unsigned long long>(tick), wall.count());
+			std::fflush(stdout);
+		}
 	}, range.address, range.size);
 	return true;
+}
+
+
+void TextureCache::ArmStillPublish(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	// A memo hit skips FindRenderTarget, and the frame boundary may have cleared the enrolment.
+	m_download_images.insert(id);
+	m_still_pending.store(true, std::memory_order_relaxed);
+}
+
+bool TextureCache::PublishPendingStills() {
+	std::scoped_lock lock {m_lock};
+	m_still_pending.store(false, std::memory_order_relaxed);
+	bool published = false;
+	for (const auto id: m_download_images) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner != nullptr && owner->download_still && owner->registered &&
+		    owner->IsGpuModified()) {
+			const bool downloaded = DownloadImageMemory(id);
+			m_rb_downloads++;
+			if (downloaded) {
+				published = true;
+				m_rb_label++;
+			}
+		}
+	}
+	// The set stays: a later draw into the still needs the frame boundary's download too.
+	return published;
+}
+
+void TextureCache::LogReadbackWindow() {
+	static auto last = std::chrono::steady_clock::now();
+	const auto  now  = std::chrono::steady_clock::now();
+	if (now - last < std::chrono::seconds(5) || (m_rb_images.empty() && m_rb_downloads == 0)) {
+		return;
+	}
+	last = now;
+	std::string top;
+	uint32_t    shown = 0;
+	for (const auto& [key, binds]: m_rb_images) {
+		if (shown++ < 8) {
+			top += " " + vk::to_string(static_cast<vk::Format>(key >> 32)) + ":" +
+			       std::to_string((key >> 16) & 0xffff) + "x" + std::to_string(key & 0xffff) + "=" +
+			       std::to_string(binds);
+		}
+	}
+	std::printf("NHL27RBENROL: flip=%llu rule=%u flag=%u downloads=%u label=%u drain_ms=%.1f sizes=%u%s\n",
+	            static_cast<unsigned long long>(BufferCache::PerfFlipCount()), m_rb_rule, m_rb_flag,
+	            static_cast<unsigned long long>(m_rb_downloads), m_rb_label, static_cast<double>(m_rb_drain_ns) / 1e6,
+	            static_cast<uint32_t>(m_rb_images.size()), top.c_str());
+	std::fflush(stdout);
+	m_rb_images.clear();
+	m_rb_rule = m_rb_flag = m_rb_downloads = m_rb_label = 0;
+	m_rb_drain_ns = 0;
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
@@ -2869,9 +2984,11 @@ void TextureCache::ProcessDownloadImages() {
 		const auto owner = m_slot_images.try_get(id);
 		if (owner != nullptr && owner->registered && owner->IsGpuModified()) {
 			(void)DownloadImageMemory(id);
+			m_rb_downloads++;
 		}
 	}
 	m_download_images.clear();
+	LogReadbackWindow();
 }
 
 } // namespace Libs::Graphics

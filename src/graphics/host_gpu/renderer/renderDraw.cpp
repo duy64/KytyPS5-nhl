@@ -1011,6 +1011,9 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		                            : cache.FindRenderTarget(target.image_id, target.desc);
 		color_views[i]        = image_view;
 		auto&      image      = cache.GetImage(target.image_id);
+		if (image.download_still) {
+			cache.ArmStillPublish(target.image_id);
+		}
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral

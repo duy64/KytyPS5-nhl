@@ -42,6 +42,14 @@
 namespace Libs::Graphics {
 
 namespace {
+[[nodiscard]] bool DepthGrowRecreate() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_DEPTH_GROW_RECREATE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 
 constexpr uint64_t NumFramesBeforeRemoval = 32;
 // Largest GPU-written tiled image (in texels) that is written back to guest memory on submit.
@@ -985,10 +993,25 @@ bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, Binding
 			break;
 		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
 		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
-		case BindingType::DepthTarget:
-			recreate |= !cached.info.IsDepth();
+		case BindingType::DepthTarget: {			recreate |= !cached.info.IsDepth();
 			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			// The render area follows the request, so a narrower image would be drawn past its edge.
+			const bool depth_grow = DepthGrowRecreate() && cached.info.extent.width < requested.extent.width;
+			if (depth_grow) {
+				static std::atomic<uint64_t> grows {0};
+				const auto grow = grows.fetch_add(1, std::memory_order_relaxed) + 1;
+				if ((grow & (grow - 1)) == 0) {
+					std::printf("NHL27DEPTHGROW: addr=0x%llx req=%ux%u cached=%ux%u n=%llu\n",
+						static_cast<unsigned long long>(requested.data.address),
+						requested.extent.width, requested.extent.height,
+						cached.info.extent.width, cached.info.extent.height,
+						static_cast<unsigned long long>(grow));
+						std::fflush(stdout);
+				}
+			}
+			recreate |= depth_grow;
 			break;
+		}
 		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
 	}
 	return recreate;

@@ -512,6 +512,7 @@ void WindowContext::ProcessEvent(double time_s) {
 						TogglePerformanceOverlayDetails();
 					} else {
 						TogglePerformanceOverlay();
+						Libs::Graphics::FrameDump::Request();
 					}
 				}
 				return;

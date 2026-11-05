@@ -84,4 +84,8 @@ std::string install_release(const ReleaseInfo& r, const std::string& versions_di
 std::string stage_release_for_updater(const ReleaseInfo& r, const std::string& versions_dir, const ProgressFn& progress, std::string* error,
 							const std::atomic<bool>* cancel = nullptr);
 
+// Copies an already-installed build's files into target_dir/.kyty-update-pending/payload,
+// the same staging layout kyty_updater --install expects. Returns the payload path, or "" with *error set.
+std::string stage_folder_for_updater(const std::string& source_dir, const std::string& tag, const std::string& target_dir, std::string* error);
+
 } // namespace kyty_launcher

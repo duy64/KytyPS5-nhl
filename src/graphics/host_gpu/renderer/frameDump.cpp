@@ -1066,7 +1066,7 @@ void BeginCapture(CommandBuffer& buffer) {
 	buffer.EndRendering();
 	std::error_code ec;
 	const char* root_env = std::getenv("KYTY_DBG_FRAME_DUMP_DIR");
-	const std::string root = (root_env != nullptr && *root_env != '\0') ? root_env : "F:/emuf/captures";
+	const std::string root = (root_env != nullptr && *root_env != '\0') ? root_env : "captures";
 	for (;; g_frame++) {
 		const auto p = std::filesystem::path(root) / ("frame_" + std::to_string(g_frame));
 		if (!std::filesystem::exists(p, ec)) {

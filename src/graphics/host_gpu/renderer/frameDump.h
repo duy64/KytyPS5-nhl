@@ -38,6 +38,12 @@ extern std::atomic<bool> g_active;
 
 // F2 in the game window: capture the next complete guest frame.
 void Request();
+// True when KYTY_DBG_RING_FRAMES is set (cached). The ring recorder's
+// enable switch, independent of KYTY_DBG_FRAME_DUMP.
+[[nodiscard]] bool RingEnabled() noexcept;
+// F2 in the game window (wired up by the later F2-routing commit):
+// save the current ring contents. No-op when the ring is off.
+void RingSaveRequest();
 
 // Writes 8-bit RGB pixels (rows top to bottom) to a PNG file.
 bool WriteRgbPng(const std::string& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgb);

@@ -936,6 +936,7 @@ std::string stage_folder_for_updater(const std::string& source_dir, const std::s
 		marker << tag << "\n";
 		if (FindExe(payload).empty()) { return fail(std::string("No ") + kExeName + " in the source build"); }
 		return path_utf8(payload);
+}
 	
 
 

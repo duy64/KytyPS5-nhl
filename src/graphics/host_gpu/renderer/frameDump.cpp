@@ -30,6 +30,17 @@
 #include "stb_image_write.h"
 
 namespace Libs::Graphics::FrameDump {
+std::string RingRoot();
+uint32_t RingCount();
+uint32_t RingFinalW();
+uint32_t RingFinalEvery();
+void RingSaveRequest();
+void RingRecordFinal(uint64_t flip_id);
+std::string NextFreeDir(const std::string& root, const std::string& prefix);
+void RingConsumeFinal(uint64_t flip_id);
+void RingArmFinal(CommandBuffer& buffer, uint64_t flip_id);
+void RingConsumeSaveRequest(CommandBuffer& buffer, uint64_t flip_id);
+void RingCompleteSave();
 
 std::atomic<bool> g_active {false};
 
@@ -1156,18 +1167,6 @@ void FinishCapture(CommandBuffer& buffer) {
 }
 
 } // namespace
-std::string RingRoot();
-uint32_t RingCount();
-uint32_t RingFinalW();
-uint32_t RingFinalEvery();
-void RingSaveRequest();
-void RingRecordFinal(uint64_t flip_id);
-std::string NextFreeDir(const std::string& root, const std::string& prefix);
-void RingRecordReadback(CommandBuffer& buffer, const Target& t, uint64_t flip_id);
-void RingConsumeFinal(uint64_t flip_id);
-void RingArmFinal(CommandBuffer& buffer, uint64_t flip_id);
-void RingConsumeSaveRequest(CommandBuffer& buffer, uint64_t flip_id);
-void RingCompleteSave();
 
 bool Enabled() noexcept {
 	static const bool enabled = [] {

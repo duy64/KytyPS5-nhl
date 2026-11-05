@@ -903,6 +903,40 @@ std::string stage_release_for_updater(const ReleaseInfo& r, const std::string& v
 }
 	return path_utf8(payload);
 }
+std::string stage_folder_for_updater(const std::string& source_dir, const std::string& tag, const std::string& target_dir, std::string* error) {
+		std::error_code ec;
+		const fs::path source = utf8_path(source_dir);
+		const fs::path target = utf8_path(target_dir);
+		// The updater's cleanup expects staging inside the installation, named .kyty-update-*, with the build in a payload folder.
+		const fs::path staging = target / utf8_path(".kyty-update-pending");
+		const fs::path payload = staging / utf8_path("payload");
+		fs::remove_all(staging, ec);
+		fs::create_directories(payload, ec);
+		if (ec) {
+			*error = "Could not create " + path_utf8(payload);
+			return {};
+		}
+		auto fail = [&](const std::string& why) {
+			*error = why;
+			fs::remove_all(staging, ec);
+			return std::string();
+		};
+		if (!fs::is_directory(source, ec)) { return fail("Failed to read the source files."); }
+		for (const auto& entry : fs::recursive_directory_iterator(source, fs::directory_options::skip_permission_denied, ec)) {
+			if (ec) { return fail("Failed to read the source files."); }
+			fs::path rel = fs::relative(entry.path(), source, ec);
+			if (ec) { return fail("Failed to read the source files."); }
+			if (!rel.empty() && (*rel.begin()).string().rfind(".kyty-update-", 0) == 0) { continue; }
+			fs::path dest = payload / rel;
+			if (entry.is_directory(ec)) { fs::create_directories(dest, ec); }
+			else if (entry.is_regular_file(ec)) { fs::create_directories(dest.parent_path(), ec); fs::copy_file(entry.path(), dest, fs::copy_options::overwrite_existing, ec); }
+			if (ec) { return fail("Failed to copy the source files."); }
+		}
+		std::ofstream marker(payload / "release.txt", std::ios::trunc);
+		marker << tag << "\n";
+		if (FindExe(payload).empty()) { return fail(std::string("No ") + kExeName + " in the source build"); }
+		return path_utf8(payload);
+	
 
 
 namespace {

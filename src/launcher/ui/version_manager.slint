@@ -1545,18 +1545,20 @@ Rectangle {
 y: (parent.height - self.height) / 2;
 width: min(520px, root.width - 48px);
 height: min(440px, root.height - 48px);
-background: Theme.dialog-bg;
+background: Theme.card;
 border-radius: 10px;
 VerticalLayout {
     padding: 16px;
 spacing: 8px;
 Text {
     text: "Update this folder";
+color: Theme.text;
 font-size: 16px;
 font-weight: 700;
 }
 Text {
     text: "Replace every file in " + VM.installinto-target + " with the picked build's files.";
+color: Theme.muted;
 wrap: word-wrap;
 }
 if VM.installinto-builds.length == 0: Text {
@@ -1575,6 +1577,7 @@ padding-right: 8px;
 VerticalLayout {
     Text {
     text: build.name;
+color: Theme.text;
 }
 Text {
     text: build.path;

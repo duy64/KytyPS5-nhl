@@ -2,7 +2,7 @@ name: Build and Release KytyPS5
 
 on:
   workflow_dispatch:
-  
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false

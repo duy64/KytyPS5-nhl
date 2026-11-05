@@ -372,6 +372,13 @@ export global VM {
     in-out property <int> renaming-source: -1;
     // About dialog of one installed build; the default is a sample for the live preview.
     in-out property <bool> about-open;
+// Update this folder picker (the C++ side fills these and opens it).
+in-out property <bool> installinto-dialog-open;
+in property <[EmuVersion]> installinto-builds;
+in property <string> installinto-target;
+in-out property <int> installinto-pick: -1;
+callback installinto-requested(int);
+callback installinto-confirmed(int);
     in property <BuildAbout> about: {
         title: "KytyPS5-2026-10-12-a1b2c3d",
         author: "KytyPS5",
@@ -468,9 +475,16 @@ export component VersionManagerPage inherits Rectangle {
                     && !VM.installed[VM.current-installed].active;
                 activated => { VM.activate-version(VM.current-installed); }
             }
-            // The selected "-latest" builds get their source's newest release.
-            MenuItem {
-                title: VM.selected-latest-count > 1 ? "Update " + VM.selected-latest-count + " builds" : "Update";
+            // Replace every file in this folder with another installed build's files.
+MenuItem {
+    title: "Update this folder…";
+enabled: VM.selected-count == 1 && VM.current-installed >= 0 && VM.current-installed < VM.installed.length && !VM.busy;
+activated => { VM.installinto-requested(VM.current-installed); }
+}
+// The selected "-latest" builds get their source's newest release.            
+MenuItem {
+                
+title: VM.selected-latest-count > 1 ? "Update " + VM.selected-latest-count + " builds" : "Update";
                 enabled: !VM.busy && VM.selected-latest-count > 0;
                 activated => { VM.update-selected(); }
             }
@@ -1519,4 +1533,77 @@ export component VersionManagerPage inherits Rectangle {
             }
         }
     }
+}
+if VM.installinto-dialog-open: Rectangle {
+    width: 100%;
+height: 100%;
+background: #00000080;
+z: 100;
+TouchArea { }
+Rectangle {
+    x: (parent.width - self.width) / 2;
+y: (parent.height - self.height) / 2;
+width: min(520px, root.width - 48px);
+height: min(440px, root.height - 48px);
+background: Theme.dialog-bg;
+border-radius: 10px;
+VerticalLayout {
+    padding: 16px;
+spacing: 8px;
+Text {
+    text: "Update this folder";
+font-size: 16px;
+font-weight: 700;
+}
+Text {
+    text: "Replace every file in " + VM.installinto-target + " with the picked build's files.";
+wrap: word-wrap;
+}
+if VM.installinto-builds.length == 0: Text {
+    text: "No other installed build is available.";
+color: Theme.muted;
+}
+ListView {
+    vertical-stretch: 1;
+for build[i] in VM.installinto-builds: Rectangle {
+    height: 40px;
+background: i == VM.installinto-pick ? Theme.accent : transparent;
+HorizontalLayout {
+    spacing: 8px;
+padding-left: 8px;
+padding-right: 8px;
+VerticalLayout {
+    Text {
+    text: build.name;
+}
+Text {
+    text: build.path;
+color: Theme.muted;
+font-size: 12px;
+overflow: elide;
+}
+}
+}
+TouchArea {
+    clicked => { VM.installinto-pick = i; }
+double-clicked => { VM.installinto-pick = i; VM.installinto-dialog-open = false; VM.installinto-confirmed(i); }
+}
+}
+}
+HorizontalLayout {
+    alignment: end;
+spacing: 8px;
+AppButton {
+    text: "Cancel";
+clicked => { VM.installinto-dialog-open = false; }
+}
+AppButton {
+    text: "Update";
+primary: true;
+enabled: VM.installinto-pick >= 0 && VM.installinto-pick < VM.installinto-builds.length;
+clicked => { VM.installinto-dialog-open = false; VM.installinto-confirmed(VM.installinto-pick); }
+}
+}
+}
+}
 }

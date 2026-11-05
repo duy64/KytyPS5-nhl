@@ -1080,18 +1080,6 @@ void AppendImages(std::string& s, const char* tag, const std::vector<TextureBind
 	}
 }
 
-std::string RingRoot();
-uint32_t RingCount();
-uint32_t RingFinalW();
-uint32_t RingFinalEvery();
-void RingSaveRequest();
-void RingRecordFinal(uint64_t flip_id);
-std::string NextFreeDir(const std::string& root, const std::string& prefix);
-void RingRecordReadback(CommandBuffer& buffer, const Target& t, uint64_t flip_id);
-void RingConsumeFinal(uint64_t flip_id);
-void RingArmFinal(CommandBuffer& buffer, uint64_t flip_id);
-void RingConsumeSaveRequest(CommandBuffer& buffer, uint64_t flip_id);
-void RingCompleteSave();
 
 void BeginCaptureAt(CommandBuffer& buffer, const std::string& dir) {
 	buffer.EndRendering();
@@ -1168,6 +1156,18 @@ void FinishCapture(CommandBuffer& buffer) {
 }
 
 } // namespace
+std::string RingRoot();
+uint32_t RingCount();
+uint32_t RingFinalW();
+uint32_t RingFinalEvery();
+void RingSaveRequest();
+void RingRecordFinal(uint64_t flip_id);
+std::string NextFreeDir(const std::string& root, const std::string& prefix);
+void RingRecordReadback(CommandBuffer& buffer, const Target& t, uint64_t flip_id);
+void RingConsumeFinal(uint64_t flip_id);
+void RingArmFinal(CommandBuffer& buffer, uint64_t flip_id);
+void RingConsumeSaveRequest(CommandBuffer& buffer, uint64_t flip_id);
+void RingCompleteSave();
 
 bool Enabled() noexcept {
 	static const bool enabled = [] {
@@ -1245,14 +1245,14 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 						            Target t;
 						            if (c.view && MakeTarget(context, c.image_id, c.desc->view_info, c.layout, c.desc->info.data.address, t)) {
 										                t.slot = c.slot;
-										                g_ring_targets[reinterpret_cast<uint64_t>(static_cast<VkImageView>(c.view)]) = t;
+										                g_ring_targets[reinterpret_cast<uint64_t>(static_cast<VkImageView>(c.view))] = t;
 									}
 					}
         if (draw.depth != nullptr && draw.depth->desc != nullptr) {
             const auto& c = *draw.depth;
             Target t;
             if (c.view && MakeTarget(context, c.image_id, c.desc->view_info, c.layout, c.desc->info.data.address, t)) {
-                g_ring_targets[reinterpret_cast<uint64_t>(static_cast<VkImageView>(c.view)]) = t;
+                g_ring_targets[reinterpret_cast<uint64_t>(static_cast<VkImageView>(c.view))] = t;
 			}
 		}
 		}

@@ -1084,7 +1084,6 @@ std::string RingRoot();
 uint32_t RingCount();
 uint32_t RingFinalW();
 uint32_t RingFinalEvery();
-bool RingEnabled();
 void RingSaveRequest();
 void RingRecordFinal(uint64_t flip_id);
 std::string NextFreeDir(const std::string& root, const std::string& prefix);

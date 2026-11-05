@@ -134,6 +134,11 @@ struct VersionManager::Impl: std::enable_shared_from_this<Impl>
 	std::shared_ptr<slint::VectorModel<slint::SharedString>> dropdown_model  = std::make_shared<slint::VectorModel<slint::SharedString>>();
 	// Every installed build for the pin picker: not filtered by the search box or the kind selector (unlike installed_model).
 	std::shared_ptr<slint::VectorModel<BuildChoice>>         pin_model      = std::make_shared<slint::VectorModel<BuildChoice>>();
+// Update this folder picker state.
+int installinto_target = -1;
+std::vector<size_t> installinto_rows;
+std::shared_ptr<slint::VectorModel<EmuVersion>> installinto_model = std::make_shared<slint::VectorModel<EmuVersion>>();
+
 
 	// Worker threads, joined in Shutdown; each gets a token that CancelAll sets. Started from the UI
 	// thread only. Finished ones are joined and dropped before the next one starts, so an hourly
@@ -660,8 +665,80 @@ struct VersionManager::Impl: std::enable_shared_from_this<Impl>
 		Status("Using " + DisplayName(b));
 	}
 
+// Update this folder picker: fill it with every installed build except the target row.
+void RequestInstallinto(int row) {
+const int index = RealIndex(row);
+if (index < 0 || static_cast<size_t>(index) >= installed.size() || busy) { return; }
+installinto_target = index;
+installinto_rows.clear();
+std::vector<EmuVersion> rows;
+for (size_t i = 0; i < installed.size(); i++) {
+if (static_cast<int>(i) == index) { continue; }
+const auto& b = installed[i];
+EmuVersion v;
+v.name = slint::SharedString(DisplayName(b));
+v.codename = slint::SharedString(b.codename);
+v.date = slint::SharedString(b.date);
+v.path = slint::SharedString(b.exe);
+v.tracked = b.managed;
+v.active = path_key(b.exe) == path_key(s.emulator);
+rows.push_back(v);
+installinto_rows.push_back(i);
+}
+installinto_model->set_vector(std::move(rows));
+const InstalledBuild target = installed[static_cast<size_t>(index)];
+WithUi([&](AppWindow&, const VM& vm) {
+vm.set_installinto_target(slint::SharedString(DisplayName(target)));
+vm.set_installinto_pick(-1);
+vm.set_installinto_dialog_open(true);
+});
+}
+// Update this folder picker Set: replace the target folder's files via the updater. No Activate, no pin changes: paths do not change.
+void ConfirmInstallinto(int pick) {
+if (installinto_target < 0 || static_cast<size_t>(installinto_target) >= installed.size()) { return; }
+if (pick < 0 || static_cast<size_t>(pick) >= installinto_rows.size()) { return; }
+const InstalledBuild target_build = installed[static_cast<size_t>(installinto_target)];
+const InstalledBuild source_build = installed[installinto_rows[static_cast<size_t>(pick)]];
+const std::filesystem::path source_dir = utf8_path(source_build.exe).parent_path();
+const std::filesystem::path target_dir = utf8_path(target_build.exe).parent_path();
+if (path_key(path_utf8(source_dir)) == path_key(path_utf8(target_dir))) {
+Status("Nothing to update: that build is already in this folder.");
+return;
+}
+#ifdef _WIN32
+if (FileLocked(target_dir / "kyty_emulator.exe")) {
+Status("Close the game first: the emulator is running from " + path_utf8(target_dir) + ".");
+return;
+}
+const std::filesystem::path own_dir = exe_dir("");
+const std::filesystem::path updater = own_dir / "kyty_updater.exe";
+std::error_code ec;
+if (!std::filesystem::exists(updater, ec)) {
+Status("Download failed: kyty_updater.exe is missing from this build.");
+return;
+}
+std::string error;
+std::string payload = stage_folder_for_updater(path_utf8(source_dir), source_build.tag, path_utf8(target_dir), &error);
+if (payload.empty()) {
+Status("Download failed: " + error);
+return;
+}
+std::string spawn_error;
+if (!StartUpdater(updater, utf8_path(payload), target_dir, L"kyty_launcher.exe", &spawn_error)) {
+Status("Download failed: " + spawn_error);
+return;
+}
+Status("Update staged; restarting to finish…");
+slint::quit_event_loop();
+#else
+(void)source_dir;
+(void)target_dir;
+Status("Update this folder is only available on Windows.");
+#endif
+}
+
 	// A click on an Installed header: the same key flips the direction, a new key sorts ascending.
-	void SortBy(const std::string& key)
+void SortBy(const std::string& key)
 	{
 		const std::string name = SortKeyName(key);
 		if (name == s.vm_sort)
@@ -1762,6 +1839,8 @@ struct VersionManager::Impl: std::enable_shared_from_this<Impl>
 				                            : "Deleted " + std::to_string(n) + " saved release list" + (n == 1 ? "" : "s"));
 			        });
 			    vm.set_installed(installed_model);
+				vm.set_installinto_builds(installinto_model);
+				
 			    vm.set_available(available_model);
 			    vm.set_older(older_model);
 			    vm.set_sources(sources_model);
@@ -1792,6 +1871,9 @@ struct VersionManager::Impl: std::enable_shared_from_this<Impl>
 			        });
 			    // Double-click in the Installed table: the launcher runs that build.
 			    vm.on_activate_version([self](int row) { self->Activate(self->RealIndex(row)); });
+				vm.on_installinto_requested([self](int row) { self->RequestInstallinto(row); });
+				vm.on_installinto_confirmed([self](int pick) { self->ConfirmInstallinto(pick); });
+				
 			    vm.on_browse_path([self] { self->BrowsePath(); });
 			    vm.on_refresh_installed([self] { self->RescanInstalled(); });
 			    vm.on_add_custom([self] { self->AddCustom(); });

@@ -475,7 +475,7 @@ void WindowContext::ProcessDisplayEvent(const SDL_DisplayEvent& display) {
 			}
 
 			break;
-		}
+				}
 		default:
 			LOGF("Display %" PRIu32 " got unknown event 0x%" PRIx32 "\n", display.displayID,
 			     static_cast<uint32_t>(display.type));
@@ -512,6 +512,7 @@ void WindowContext::ProcessEvent(double time_s) {
 						TogglePerformanceOverlayDetails();
 					} else {
 						TogglePerformanceOverlay();
+						Libs::Graphics::FrameDump::RingSaveRequest();
 					}
 				}
 				return;

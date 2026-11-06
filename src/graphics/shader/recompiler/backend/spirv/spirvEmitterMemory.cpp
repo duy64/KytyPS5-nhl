@@ -236,6 +236,7 @@ void RecordBdaFault(EmitterState& state, uint32_t page) {
 
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
 	auto&      state   = ctx.state;
+	coherent = coherent || state.program.info.coherent_buffers;
 	const auto bda     = GetBdaPointer(state, address);
 	const auto present =
 	    Binary(state, spv::OpINotEqual, TypeBool(state), bda, ConstantU64(state, 0));
@@ -1407,6 +1408,7 @@ uint32_t LoadIndirectBuffer(ValueEmitContext& ctx, const IndirectBufferAccess& b
 
 void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uint32_t value) {
 	auto& state = ctx.state;
+	const bool coherent = state.program.info.coherent_buffers;
 	EmitIfCondition(state, active, [&]() {
 		// RDNA2 DWORD accesses ignore the two low address bits.
 		const auto aligned = Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
@@ -1419,7 +1421,9 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uin
 			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
 			                          bda);
 			constexpr uint32_t alignment = sizeof(uint32_t);
-			state.builder.AddFunction(spv::OpStore, pointer, value, spv::MemoryAccessAlignedMask,
+			state.builder.AddFunction(spv::OpStore, pointer, value,
+				                          spv::emoryccesslignedask |
+				                              (coherent ? spv::emoryccessolatileask : spv::emoryccessaskone),
 			                          alignment);
 			RecordBdaWrite(state, BdaPageIndex(state, aligned));
 		});

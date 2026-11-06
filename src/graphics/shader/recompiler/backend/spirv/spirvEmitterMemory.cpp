@@ -1422,8 +1422,8 @@ void StoreBdaDword(ValueEmitContext& ctx, uint32_t address, uint32_t active, uin
 			                          bda);
 			constexpr uint32_t alignment = sizeof(uint32_t);
 			state.builder.AddFunction(spv::OpStore, pointer, value,
-				                          spv::emoryccesslignedask |
-				                              (coherent ? spv::emoryccessolatileask : spv::emoryccessaskone),
+			                          spv::MemoryAccessAlignedMask |
+			                              (coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone),
 			                          alignment);
 			RecordBdaWrite(state, BdaPageIndex(state, aligned));
 		});

@@ -623,6 +623,25 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 	const auto old    = ctx.state.builder.AllocateId();
 	const bool wide   = inst.GetType() == IR::Type::U64;
 	const auto type   = wide ? TypeU64(ctx.state) : TypeU32(ctx.state);
+	// Synced compute shaders build cross-workgroup structures (e.g. per-cell linked lists)
+	// through atomics. Relaxed atomics order nothing across workgroups, so give them
+	// acquire-release semantics for the memory they touch.
+	const auto memory = [&] {
+		if (scope == spv::ScopeWorkgroup) {
+			return ctx.state.lds_storage_class == spv::StorageClassStorageBuffer
+				           ? spv::MemorySemanticsUniformMemoryMask
+				           : spv::MemorySemanticsWorkgroupMemoryMask;
+		}
+		return spv::MemorySemanticsUniformMemoryMask | spv::MemorySemanticsImageMemoryMask;
+	}();
+	const auto acquire_release =
+	    ctx.state.program.info.workgroup_buffer_sync
+	        ? spv::MemorySemanticsAcquireReleaseMask | memory
+	        : spv::MemorySemanticsMaskNone;
+	// The failed-compare semantics must not include Release.
+	const auto acquire = ctx.state.program.info.workgroup_buffer_sync
+	                         ? spv::MemorySemanticsAcquireMask | memory
+	                         : spv::MemorySemanticsMaskNone;
 	if (opcode == spv::OpAtomicCompareExchange) {
 		auto desired    = ctx.Arg(inst, inst.NumArgs() - 3);
 		auto comparator = ctx.Arg(inst, inst.NumArgs() - 2);
@@ -632,13 +651,13 @@ uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32
 		}
 		ctx.state.builder.AddFunction(
 		    spv::OpAtomicCompareExchange, TypeU32(ctx.state), old, pointer,
-		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, spv::MemorySemanticsMaskNone),
-		    ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), desired, comparator);
+		    ConstantU32(ctx.state, scope), ConstantU32(ctx.state, acquire_release),
+		    ConstantU32(ctx.state, acquire), desired, comparator);
 	} else {
 		const auto value = ctx.Arg(inst, inst.NumArgs() - 2);
 		ctx.state.builder.AddFunction(opcode, type, old, pointer,
 		                              ConstantU32(ctx.state, scope),
-		                              ConstantU32(ctx.state, spv::MemorySemanticsMaskNone), value);
+		                              ConstantU32(ctx.state, acquire_release), value);
 	}
 	return old;
 }

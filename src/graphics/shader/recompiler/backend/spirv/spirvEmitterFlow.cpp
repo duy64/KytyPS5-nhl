@@ -717,6 +717,9 @@ void EmitBarrier(EmitterState& state) {
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
+	if (state.program.info.workgroup_buffer_sync) {
+		EmitDataCacheInvalidate(state);
+	}
 }
 
 uint32_t EmitLaneId(EmitterState& state) {

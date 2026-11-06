@@ -2770,17 +2770,13 @@ void TextureCache::LogReadbackWindow() {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
-	// Only images starting at the address change, and every written storage-buffer bind asks:
-	// the start-address filter answers most without the lock and the page walk.
-	if (!GuestRange {address, size}.Valid() || !AddressFilterHit(address)) {
+// Every image overlapping the written range changes: a write into the middle of an image must invalidate it too.
+	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.info.data.address != address) {
-			continue;
-		}
 		if (image.IsGpuModified()) {
 			image.ClearGpuModified();
 		}

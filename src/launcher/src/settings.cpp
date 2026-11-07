@@ -1088,7 +1088,8 @@ bool save_game_overrides(const Paths& paths, const std::string& title_id, const 
 		}
 	}
 	// STEP6:6e: only the differences go into the file: a variable the page added or changed gets its value, a
-	// variable it removed gets an empty value (removed from the child's environment). Values inherited from
+	// variable it removed gets an empty value when it comes from the global table or a build config (removed
+	// from the child's environment), and a per-game-only variable it removed is dropped. Values inherited from
 	// the global table or a build config are never baked in.
 	bool env_changed = false;
 	for (const auto& [name, value]: edited.env)
@@ -1121,7 +1122,20 @@ bool save_game_overrides(const Paths& paths, const std::string& title_id, const 
 		file_env.o[entry.first] = std::move(v);
 		env_changed             = true;
 	}
-	if (env_changed)
+	// A variable the file held that is in neither the page nor the baseline was a per-game-only
+	// row the page removed: it has nothing to unset, so drop it instead of keeping its old value.
+	for (auto it = file_env.o.begin(); it != file_env.o.end();)
+	{
+		if (edited.env.count(it->first) == 0 && baseline.env.count(it->first) == 0)
+		{
+			it = file_env.o.erase(it);
+			env_changed = true;
+		} else
+		{
+			++it;
+		}
+	}
+if (env_changed)
 	{
 		emu.o["env"] = std::move(file_env);
 	} else if (const auto* old = Section(root, "emu"))

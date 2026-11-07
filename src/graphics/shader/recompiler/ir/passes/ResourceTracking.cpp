@@ -2671,7 +2671,7 @@ private:
 			}
 			auto& bases = m_info.address_bases;
 			if (std::ranges::max(base)!= UINT32_MAX &&
-			    std::ranges::find(bases, base) == bases.end()
+			    std::ranges::find(bases, base) == bases.end())
 				bases.push_back(base);
 			CollectDmaBase(*inst.Arg(0).Resolve().TryInstruction());
 			return;

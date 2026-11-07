@@ -3188,7 +3188,7 @@ void TestDmaAddressMaterialization() {
     const auto table =
         fixture.Address(fixture.UserData(2), fixture.UserData(3), 12);
     std::array<Value, 2> words;
-    for (uint32_t word = 0; words.size(); ++word) {
+    for (uint32_t word = 0; word < words.size(); ++word) {
       MemoryInfo scalar;
       scalar.kind = ResourceKind::ScalarAddress;
       scalar.offset = word * 4u;

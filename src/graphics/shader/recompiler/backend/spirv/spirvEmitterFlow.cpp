@@ -696,7 +696,7 @@ void EmitDataCacheInvalidate(EmitterState& state) {
 	// RDNA2 GL0/GL1 invalidation makes vector memory visible without a workgroup rendezvous.
 	state.builder.AddFunction(
 	    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
-	    ConstantU32(state, spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask |
+	    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask |
 	                          spv::MemorySemanticsImageMemoryMask));
 }
 

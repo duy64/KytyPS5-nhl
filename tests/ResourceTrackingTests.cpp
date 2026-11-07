@@ -3190,7 +3190,7 @@ void TestDmaAddressMaterialization() {
     std::array<Value, 2> words;
     for (uint32_t word = 0; words.size(); ++word) {
       MemoryInfo scalar;
-      scalar.kind = ResourceKind::ScalarAddres;
+      scalar.kind = ResourceKind::ScalarAddress;
       scalar.offset = word * 4u;
       words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
                                  {table, Value(0u), Value(0u), Value(true)},

@@ -418,6 +418,20 @@ bool RenderExecutor::TryConsumeComputeFill(const ShaderComputeInputInfo& input,
 	return true;
 }
 
+// Global loads read pages without a buffer as zero. Back the 32 KiB after each base the shader
+// loads from scalar data before the dispatch reads it.
+static void BackAddressBases(RenderContext& context, const ShaderStageRuntime& stage) {
+	constexpr uint64_t Page = BufferCache::CACHING_PAGESIZE;
+	const auto&        flat = stage.resources->flattened_srt;
+	for (const auto [low, high]: stage.program->info.address_bases) {
+		const auto base = flat[low] | uint64_t{flat[high]} << 32u;
+		for (uint64_t index = 0; index <= 2; ++index) {
+			const auto page = base + index * Page;
+			if (context.IsMapped(page, 1)) (void)context.GetBufferCache().FindBuffer(page, 1);
+		}
+	}
+								 }
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (input.stage.program->bindings.descriptor_counts[
@@ -1213,6 +1227,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	bool indirect_writes = false;
 	{
 		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dc_buffers_ns);
+		BackAddressBases(m_context, input_info.stage);
 		FindBuffers(std::span {&descriptor_stage, 1u});
 		// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
 		indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);
@@ -1624,6 +1639,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	bool indirect_writes = false;
 	{
 		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dc_buffers_ns);
+		BackAddressBases(m_context, input_info.stage);
 		FindBuffers(std::span {&descriptor_stage, 1u});
 		// New target buffers must exist before PrepareBda uploads the CPU writes of cached buffers.
 		indirect_writes = PrepareIndirectWriteTargets(m_context, bindings);

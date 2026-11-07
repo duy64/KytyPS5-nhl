@@ -38,7 +38,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_SETREG_B32: EmitControlNop(); return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
 		case O::S_WAITCNT:
-		if (program.stage == ShaderType::Compute && WorkgroupBufferSyncEnabled() {
+		if (program.stage == ShaderType::Compute && WorkgroupBufferSyncEnabled()) {
 			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);
 			}
 			return;

@@ -2034,6 +2034,10 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				inserted.MarkBufferModified();
 				AliasLogOnce(AliasAction::ForcedUpload, inserted.info.data.address,
 				             inserted.info.data.size, vk::to_string(desc.info.pixel_format).c_str());
+			} else if (desc.type == BindingType::Texture) {
+				// A fresh sampled texture must not stay uninitialized: CPU-loaded assets
+				// are written before first bind, so no dirty flag is set. Upload guest memory.
+				inserted.MarkBufferModified();
 			} else if (desc.type == BindingType::Texture && DepthAliasLog::Enabled() &&
 			           DepthAliasLog::Want(inserted.info.data.address, inserted.info.data.size) &&
 			           DepthAliasLog::TakeLine()) {

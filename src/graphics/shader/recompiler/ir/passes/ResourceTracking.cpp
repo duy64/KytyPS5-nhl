@@ -2665,7 +2665,7 @@ private:
 			std::array<uint32_t, 2> base {};
 			for (uint32_t word = 0; word < base.size(); ++word) {
 				const auto* read = handle->Arg(word).Resolve().TryInstruction();
-				base[word]      = read!= nullptr && read->GetOpcode() ValueOpcode::ReadConst
+				base[word]      = read!= nullptr && read->GetOpcode() == ValueOpcode::ReadConst
 				                       ? read->Arg(1).Resolve().U32()
 				                       : UINT32_MAX;
 			}

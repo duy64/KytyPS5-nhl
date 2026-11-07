@@ -1,7 +1,17 @@
+#include <cstdlib>
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 
+namespace {
+bool WorkgroupBufferSyncEnabled() {
+static const bool enabled = [] {
+const char* v = std::getenv("KYTY_WORKGROUP_BUFFER_SYNC");
+return v != nullptr && v[0] == '1';
+}();
+return enabled;
+}
+} // namespace
 void Translator::EmitScalar(const Decoder::Instruction& inst) {
 	using O = Decoder::Opcode;
 	switch (inst.opcode) {
@@ -27,7 +37,11 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 			return;
 		case O::S_SETREG_B32: EmitControlNop(); return;
 		case O::S_WAITCNT_VSCNT: S_WAITCNT_VSCNT(inst); return;
-		case O::S_WAITCNT: return;
+		case O::S_WAITCNT:
+		if (program.stage == ShaderType::Compute && WorkgroupBufferSyncEnabled() {
+			ir.Emit(IR::ValueOpcode::DataCacheInvalidate);
+			}
+			return;
 
 		case O::S_AND_SAVEEXEC_B32:
 			S_SAVEEXEC(inst, IR::ValueOpcode::LogicalAnd, false, false, false);

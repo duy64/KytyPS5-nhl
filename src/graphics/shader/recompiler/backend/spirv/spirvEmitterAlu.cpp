@@ -486,6 +486,19 @@ static uint32_t FlushInputDenorm(EmitterState& state, uint32_t value) {
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = FlushInputDenorm(state, arg0);
+	// ea94 only: a zero divisor yields 0 instead of infinity. FlushInputDenorm turns a
+	// denormal input into signed zero, so without this guard 1/0 is +inf, which a running
+	// max (ea94's st2) then propagates to the whole output, corrupting the versus screen
+	// in the menu where the scene buffer (buf[11]) is empty. Scoped to ea94 because the
+	// broad guard (all shaders) gave players snow: a player shader depends on 1/0 being
+	// infinity. Other shaders keep the plain 1/x.
+	if (state.program.shader_hash == 0xea94f09b2981eb43ULL) {
+		const auto is_zero = Binary(state, spv::OpFOrdEqual, TypeBool(state), source,
+		                            ConstantF32(state, 0));
+		const auto reciprocal =
+		    Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
+		return Select(state, TypeF32(state), is_zero, ConstantF32(state, 0), reciprocal);
+	}
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 

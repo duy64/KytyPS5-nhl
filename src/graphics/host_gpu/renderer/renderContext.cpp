@@ -10,7 +10,6 @@
 #include "graphics/guest_gpu/stageStats.h"
 #include "graphics/host_gpu/pageWriteSeq.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
-#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
@@ -46,7 +45,6 @@ RenderContext::RenderContext(GraphicContext& graphics)
 
 RenderContext::~RenderContext() {
 	ShutdownGpu();
-	FrameDump::Shutdown();
 	m_command_scheduler.Shutdown();
 }
 

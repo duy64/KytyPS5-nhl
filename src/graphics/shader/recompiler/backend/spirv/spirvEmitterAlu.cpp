@@ -486,15 +486,7 @@ static uint32_t FlushInputDenorm(EmitterState& state, uint32_t value) {
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = FlushInputDenorm(state, arg0);
-	// A zero divisor yields 0 instead of infinity. FlushInputDenorm turns a denormal
-	// input into signed zero, so without this guard 1/0 is +inf, which a running max
-	// (e.g. ea94's st2) then propagates to the whole output. Returning 0 keeps a
-	// degenerate input from poisoning the result.
-	const auto is_zero = Binary(state, spv::OpFOrdEqual, TypeBool(state), source,
-	                            ConstantF32(state, 0));
-	const auto reciprocal =
-	    Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
-	return Select(state, TypeF32(state), is_zero, ConstantF32(state, 0), reciprocal);
+	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 
 uint32_t EmitFPRecip64(EmitterState& state, uint32_t arg0) {

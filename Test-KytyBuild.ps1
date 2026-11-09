@@ -26,8 +26,8 @@ param(
     [string]$ReleaseTag = "",
     [int]$BootWaitSec = 45,
     [int]$LoadWaitSec = 60,
-    [int]$ScreenWidth = 1280,
-    [int]$ScreenHeight = 720,
+    [int]$ScreenWidth = 3840,
+    [int]$ScreenHeight = 2160,
     [switch]$KeepRunning,
     [switch]$SkipGameplay,
     [switch]$NoOcr
@@ -510,7 +510,7 @@ Write-Host ("out:   " + $OutDir)
 $emuArgs = @("--game", $GamePath, "--redzone", "--skip-notice-screen", "--screen-width", $ScreenWidth, "--screen-height", $ScreenHeight)
 $argString = '--game "' + $GamePath + '" --redzone --skip-notice-screen --screen-width ' + $ScreenWidth + ' --screen-height ' + $ScreenHeight
 Write-Host ("launch: " + $EmulatorExe + " " + $argString)
-Write-Host ("screen: " + $ScreenWidth + "x" + $ScreenHeight + " (low res for speed; final confirmation runs at full res)")
+Write-Host ("screen: " + $ScreenWidth + "x" + $ScreenHeight + " (full res, matching manual play)")
 # Launch with an explicit environment block so KYTY_INPUT_FILE (and the other
 # KYTY_* rows) definitely reach the emulator. Start-Process inheritance was
 # not delivering KYTY_INPUT_FILE (log showed zero InputFile lines even though

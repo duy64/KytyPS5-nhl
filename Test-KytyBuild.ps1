@@ -190,6 +190,12 @@ function Save-FrameDumpShot {
     $trigDir = Split-Path $TriggerFile -Parent
     if (-not (Test-Path $trigDir)) { New-Item -ItemType Directory -Force -Path $trigDir | Out-Null }
     New-Item -ItemType File -Force -Path $TriggerFile | Out-Null
+    # The emulator looks for a RELATIVE "framedump.trigger" in its own working
+    # directory, which is the build folder when the test launches it (the run
+    # folder only applies when the launcher starts it). Create the trigger in
+    # the build folder too, or the emulator never sees it after the first dump.
+    $buildTrig = Join-Path $BuildDir "framedump.trigger"
+    New-Item -ItemType File -Force -Path $buildTrig | Out-Null
     # Wait for a new frame folder (trigger is checked every 30 flips).
     $deadline = (Get-Date).AddSeconds(60)
     $frameDir = $null

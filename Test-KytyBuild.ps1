@@ -44,6 +44,18 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Cleanup: frame dumps (D:\Downloads\captures\frame_*) from prior runs pile
+# up - the emulator writes a new frame_N folder per dump and nothing ever
+# removes them. Clear the old ones at the start of each run so only this
+# run's dumps remain (this run's dumps stay until the next run starts).
+$captureDir = "D:\Downloads\captures"
+if (Test-Path $captureDir) {
+    Get-ChildItem -Path $captureDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "captures: cleared old frame dumps"
+}
+
 # Build: auto-detects the newest KyTyPS5 build folder under D:\Downloads
 # (D:\Downloads\<build-name>, e.g. KytyPS5-2026-11-09-8bd6ff9-Windows-x64).
 # The watcher passes -BuildDir for a specific build; a manual bat run leaves

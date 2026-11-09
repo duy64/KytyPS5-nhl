@@ -507,8 +507,8 @@ Write-Host ("build: " + $buildTag)
 Write-Host ("game:  " + $GamePath)
 Write-Host ("out:   " + $OutDir)
 
-$emuArgs = @("--game", $GamePath, "--redzone", "--screen-width", $ScreenWidth, "--screen-height", $ScreenHeight)
-$argString = '--game "' + $GamePath + '" --redzone --screen-width ' + $ScreenWidth + ' --screen-height ' + $ScreenHeight
+$emuArgs = @("--game", $GamePath, "--redzone", "--skip-notice-screen", "--screen-width", $ScreenWidth, "--screen-height", $ScreenHeight)
+$argString = '--game "' + $GamePath + '" --redzone --skip-notice-screen --screen-width ' + $ScreenWidth + ' --screen-height ' + $ScreenHeight
 Write-Host ("launch: " + $EmulatorExe + " " + $argString)
 Write-Host ("screen: " + $ScreenWidth + "x" + $ScreenHeight + " (low res for speed; final confirmation runs at full res)")
 # Launch with an explicit environment block so KYTY_INPUT_FILE (and the other

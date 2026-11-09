@@ -484,9 +484,9 @@ if (Test-Path $cfgPath) {
         $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
         if (-not $cfg.emu) { $cfg | Add-Member -NotePropertyName "emu" -NotePropertyValue ([PSCustomObject]@{}) }
         if (-not $cfg.emu.env) { $cfg.emu | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{}) }
-        $cfg.emu.env.KYTY_DBG_FRAME_DUMP = "1"
-        $cfg.emu.env.KYTY_DBG_FRAME_DUMP_DIR = $CaptureDir
-        $cfg.emu.env.KYTY_DBG_FRAME_DUMP_CS_CONSTANTS = "1"
+        $cfg.emu.env | Add-Member -NotePropertyName "KYTY_DBG_FRAME_DUMP" -NotePropertyValue "1" -Force
+        $cfg.emu.env | Add-Member -NotePropertyName "KYTY_DBG_FRAME_DUMP_DIR" -NotePropertyValue $CaptureDir -Force
+        $cfg.emu.env | Add-Member -NotePropertyName "KYTY_DBG_FRAME_DUMP_CS_CONSTANTS" -NotePropertyValue "1" -Force
         $cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgPath -Encoding UTF8
         Write-Host "cfgGlobal.json patched: frame dump enabled."
     } catch {

@@ -189,6 +189,11 @@ function Get-LatestFrameDir {
 # one, so the messages say so.
 function Write-FrameDumpDiagnosis {
     $diag = @()
+    # If the emulator process is gone, no trigger can ever fire - say that
+    # first, instead of guessing the trigger is in the wrong directory.
+    if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
+        $diag += "Frame dump diagnosis: the emulator process (kyty_emulator) is no longer running, so this trigger cannot fire. The emulator exited before this shot - check last-run.log for why."
+    }
     $logPath = Join-Path $env:LOCALAPPDATA "KytyPS5\logs\last-run.log"
     if (-not (Test-Path $logPath)) {
         $diag += ("Frame dump diagnosis: no last-run.log found at " + $logPath + ", so the dump state cannot be checked.")
@@ -534,6 +539,14 @@ $proc = [System.Diagnostics.Process]::Start($psi)
 if (-not (Wait-ForProcess -Name "kyty_emulator" -TimeoutSec 30)) { throw "Emulator did not start." }
 Write-Host ("boot wait: " + $BootWaitSec + " s (first run of a new build compiles shaders - slow)")
 Start-Sleep -Seconds $BootWaitSec
+# Fail fast if the emulator died during the boot wait: the nav loop below would
+# otherwise spend ~25 minutes taking desktop screenshots of a dead process
+# (20 tries x 60 s frame-dump timeout each). No input was sent yet, so a death
+# here means the launch itself did not survive - say so and stop.
+$EmulatorDead = -not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)
+if ($EmulatorDead) {
+    Write-Warning "Emulator exited during the boot wait, before any input was sent. Stopping here - see last-run.log for why it exited."
+}
 
 # ---------------------------------------------------------------- navigation (vision-guided)
 # Key names are SDL key names. Buttons (default KyTy keyboard map):
@@ -567,7 +580,10 @@ function Invoke-BlindNavigation {
     Save-Screenshot -Name "04-versus"
 }
 
-if ((-not $script:TesseractExe) -or $NoOcr) {
+if ($EmulatorDead) {
+    Write-Warning "Skipping navigation: the emulator is no longer running."
+}
+elseif ((-not $script:TesseractExe) -or $NoOcr) {
     Invoke-BlindNavigation
 }
 else {
@@ -583,6 +599,12 @@ else {
     $unknownStreak = 0
     while ((-not $reachedHub) -and (-not $noSave) -and ($tries -lt $maxTries)) {
         $tries++
+        # Fail fast if the emulator died mid-navigation: further tries would
+        # only take desktop screenshots of a dead process.
+        if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
+            Write-Warning ("Emulator exited mid-navigation (try " + $tries + "). Stopping the nav loop - see last-run.log.")
+            break
+        }
         $cur = Get-CurrentScreen -ShotName (New-ShotName)
         $screen = $cur.Screen
         if ($screen -ne "Unknown") { $unknownStreak = 0 }

@@ -182,6 +182,50 @@ function Get-LatestFrameDir {
 # even if another window covers the game, so the user can keep using the PC.
 # Picks the final rt0 (largest area, then highest seq), preferring the _exp
 # (auto-exposed + sRGB) version. Returns the saved path, or $null on failure.
+# Diagnose a frame-dump timeout from the emulator log, so the run says WHY
+# the dump never fired instead of silently falling back to a screen capture.
+# Writes to the host and appends to frame-dump-diagnosis.txt in the result
+# folder. The log may be stale (from an earlier run) if this run never wrote
+# one, so the messages say so.
+function Write-FrameDumpDiagnosis {
+    $diag = @()
+    $logPath = Join-Path $env:LOCALAPPDATA "KytyPS5\logs\last-run.log"
+    if (-not (Test-Path $logPath)) {
+        $diag += ("Frame dump diagnosis: no last-run.log found at " + $logPath + ", so the dump state cannot be checked.")
+    }
+    else {
+        $logText = Get-Content $logPath -Raw -ErrorAction SilentlyContinue
+        if ([string]::IsNullOrWhiteSpace($logText)) {
+            $diag += "Frame dump diagnosis: last-run.log is empty; no dump evidence."
+        }
+        else {
+            $dumpLines = @($logText -split "`r?`n" | Where-Object { $_ -match "NHL27FRAMEDUMP" })
+            if ($dumpLines.Count -eq 0) {
+                $diag += "Frame dump diagnosis: last-run.log has no NHL27FRAMEDUMP line at all, so the dump never fired in that run (KYTY_DBG_FRAME_DUMP likely unset, or the trigger was never consumed). Note: this log may be stale, from an earlier run."
+            }
+            else {
+                $bad = @($dumpLines | Where-Object { $_ -match "cannot create" })
+                if ($bad.Count -gt 0) {
+                    $diag += ("Frame dump diagnosis: the log shows the dump tried and failed to create its output folder: " + ($bad[0].Trim()) + " (the dump dir env var likely did not reach the emulator, so it fell back to its built-in dir).")
+                }
+                else {
+                    $diag += ("Frame dump diagnosis: the log shows the dump fired before (" + $dumpLines.Count + " NHL27FRAMEDUMP lines) but this trigger produced no new frame; the trigger file may not be in the emulator working directory.")
+                }
+            }
+        }
+    }
+    foreach ($line in $diag) { Write-Warning $line }
+    if ($OutDir -and (Test-Path $OutDir)) {
+        try {
+            $diagFile = Join-Path $OutDir "frame-dump-diagnosis.txt"
+            $stamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+            ($diag | ForEach-Object { $stamp + "  " + $_ }) | Add-Content -Path $diagFile -Encoding ASCII -ErrorAction Stop
+        } catch {
+            Write-Warning ("Could not write frame-dump-diagnosis.txt: " + $_.Exception.Message)
+        }
+    }
+}
+
 function Save-FrameDumpShot {
     param([string]$Name)
     $before = Get-LatestFrameDir
@@ -212,7 +256,7 @@ function Save-FrameDumpShot {
         }
         Start-Sleep -Milliseconds 500
     }
-    if (-not $frameDir) { return $null }
+    if (-not $frameDir) { Write-FrameDumpDiagnosis; return $null }
     # Timeout with only a stale frame: the trigger produced nothing new.
     # Fail loudly (return null) instead of reusing the stale frame - reusing
     # it copies an old (often black boot) frame 20 times and OCR reads
@@ -221,6 +265,7 @@ function Save-FrameDumpShot {
     [int]::TryParse(((Split-Path $frameDir -Leaf) -replace "frame_", ""), [ref]$foundNum) | Out-Null
     if ($foundNum -le $beforeNum) {
         Write-Warning ("Frame dump timeout: no new frame after trigger (latest is still frame_" + $foundNum + ").")
+        Write-FrameDumpDiagnosis
         return $null
     }
     # Wait for the rt0 PNGs to land (async writer), then pick the final one.
@@ -507,7 +552,9 @@ function New-ShotName {
 # stages, kept so the test still runs without Tesseract.
 function Invoke-BlindNavigation {
     Write-Host "== blind stage 1: title -> main menu =="
-    Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+    # Try Cross first, then Options (Start): the title screen may want either,
+    # and blind mode gets no feedback to tell which one worked.
+    Invoke-InputStage -Lines @("j 150", "sleep 3000", "Return 150", "sleep 3000") -ExtraWaitSec 2
     Save-Screenshot -Name "01-after-title"
     Write-Host "== blind stage 2: main menu -> Be A Pro =="
     Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
@@ -530,13 +577,28 @@ else {
     $noSave = $false
     $tries = 0
     $maxTries = 20
+    # Title-screen attempts (to alternate Cross / Options) and consecutive
+    # Unknown reads (to dismiss a possible notice dialog after 3 in a row).
+    $titleTries = 0
+    $unknownStreak = 0
     while ((-not $reachedHub) -and (-not $noSave) -and ($tries -lt $maxTries)) {
         $tries++
         $cur = Get-CurrentScreen -ShotName (New-ShotName)
         $screen = $cur.Screen
+        if ($screen -ne "Unknown") { $unknownStreak = 0 }
         if ($screen -eq "Title") {
-            Write-Host "Title screen - pressing confirm to reach the main menu."
-            Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+            # The game may ignore the keyboard player at the title screen, or
+            # the screen may want Start instead of Cross. Alternate: Cross on
+            # odd attempts, Options (Start) on even ones.
+            $titleTries++
+            if (($titleTries % 2) -eq 1) {
+                Write-Host "Title screen - pressing confirm (Cross) to reach the main menu."
+                Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+            }
+            else {
+                Write-Host "Title screen - Cross did not advance it; pressing Options (Start) instead."
+                Invoke-InputStage -Lines @("Return 150", "sleep 3000") -ExtraWaitSec 2
+            }
         }
         elseif ($screen -eq "SignIn") {
             # PSN sign-in dialog. OK is the only button; confirm dismisses it
@@ -568,8 +630,20 @@ else {
             $reachedHub = $true
         }
         elseif ($screen -eq "Unknown") {
-            Write-Host "Screen not recognized - pressing confirm once and re-reading."
-            Invoke-InputStage -Lines @("j 150", "sleep 2000") -ExtraWaitSec 2
+            # After 3 consecutive Unknown reads, a notice dialog (or another
+            # screen OCR cannot name) may be up: dismiss it with Cross then
+            # Options in sequence before re-reading, instead of pressing
+            # Cross forever at a screen that ignores it.
+            $unknownStreak++
+            if ($unknownStreak -ge 3) {
+                Write-Host "Screen still not recognized after 3 tries - dismissing a possible notice dialog with Cross then Options."
+                Invoke-InputStage -Lines @("j 150", "sleep 1500", "Return 150", "sleep 3000") -ExtraWaitSec 2
+                $unknownStreak = 0
+            }
+            else {
+                Write-Host "Screen not recognized - pressing confirm once and re-reading."
+                Invoke-InputStage -Lines @("j 150", "sleep 2000") -ExtraWaitSec 2
+            }
         }
         else {
             Write-Host ("Unexpected screen '" + $screen + "' - pressing back and re-reading.")

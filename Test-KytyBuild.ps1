@@ -199,7 +199,13 @@ function Save-FrameDumpShot {
     # Also send F2 via the scripted input file: F2 calls FrameDump::Request()
     # directly, bypassing the trigger-file working-directory issue entirely.
     # Belt and suspenders - if the trigger file is missed, F2 still fires.
-    Invoke-InputStage -Lines @("F2") -ExtraWaitSec 0
+    # Write it directly (no wait): Invoke-InputStage blocks up to 30s for
+    # consumption, and a pending navigation input must not be overwritten.
+    # Only write F2 when no input file is pending, so a navigation key is
+    # never lost.
+    if (-not (Test-Path $InputFile)) {
+        Set-Content -Path $InputFile -Value @("F2") -Encoding ASCII
+    }
     # Wait for a new frame folder (trigger is checked every 30 flips).
     $deadline = (Get-Date).AddSeconds(60)
     $frameDir = $null

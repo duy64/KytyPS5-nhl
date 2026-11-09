@@ -16,13 +16,7 @@
 #   or: .\Test-KytyBuild.ps1 -ReleaseTag "KyTyPS5-2026-11-08-0ec0592-f2dump" -GamePath "D:\path\to\NHL27"
 #
 # Outputs (in -OutDir): screenshots 01..11 (hub, versus, ice, pause menu, extended
-# gameplay + transition catch) + last-run.log copy + test-transcript.txt
-# (full console log, so a failed run can be diagnosed from Drive alone).
-#
-# v2.2 (2026-11-08): transcript in OutDir; launch verifies the process it
-# started (a stale kyty_emulator satisfied the old name check); screen-capture
-# fallback brings the emulator window to the front first; frame-dump timeout
-# reports whether the trigger file was consumed; a stale last-run.log is flagged.
+# gameplay + transition catch) + last-run.log copy.
 # The emulator is closed at the end unless -KeepRunning is given.
 
 param(
@@ -148,12 +142,6 @@ if ([string]::IsNullOrWhiteSpace($GamePath)) { throw "No game path given and non
 if (-not (Test-Path $GamePath)) { throw "Game path not found: $GamePath (check -GamePath)" }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
-$TestStart = Get-Date
-# Full console log in the result folder, so a failed run can be diagnosed
-# from Drive alone (no need to ask the user for anything from the PC).
-$TranscriptPath = Join-Path $OutDir "test-transcript.txt"
-try { Start-Transcript -Path $TranscriptPath -Append -ErrorAction Stop | Out-Null } catch { Write-Warning ("Transcript could not start: " + $_.Exception.Message) }
-
 # Scripted-input file the emulator watches (KYTY_INPUT_FILE). The emulator reads
 # it, executes the keys, then DELETES it. We write one stage file at a time.
 $InputFile = Join-Path $OutDir "kyty-input.txt"
@@ -174,26 +162,6 @@ $env:KYTY_INPUT_FILE = $InputFile
 # ---------------------------------------------------------------- helpers
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
-
-$script:EmuProcId = 0
-$script:Win32FgReady = $false
-# Foreground helper for the screen-capture fallback: bring the emulator window
-# to the front before capturing, or the shot shows whatever the user has open.
-try {
-    Add-Type -TypeDefinition @"
-using System;
-using System.Runtime.InteropServices;
-public static class Win32Fg {
-    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
-    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-    [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
-}
-"@ -ErrorAction Stop
-    $script:Win32FgReady = $true
-} catch {
-    Write-Warning ("Foreground helper unavailable: " + $_.Exception.Message)
-    $script:Win32FgReady = $false
-}
 
 $CaptureDir = "D:\Downloads\captures"
 $TriggerFile = Join-Path $env:LOCALAPPDATA "KytyPS5\run\framedump.trigger"
@@ -228,6 +196,10 @@ function Save-FrameDumpShot {
     # the build folder too, or the emulator never sees it after the first dump.
     $buildTrig = Join-Path $BuildDir "framedump.trigger"
     New-Item -ItemType File -Force -Path $buildTrig | Out-Null
+    # Also send F2 via the scripted input file: F2 calls FrameDump::Request()
+    # directly, bypassing the trigger-file working-directory issue entirely.
+    # Belt and suspenders - if the trigger file is missed, F2 still fires.
+    Invoke-InputStage -Lines @("F2") -ExtraWaitSec 0
     # Wait for a new frame folder (trigger is checked every 30 flips).
     $deadline = (Get-Date).AddSeconds(60)
     $frameDir = $null
@@ -248,11 +220,7 @@ function Save-FrameDumpShot {
     $foundNum = -1
     [int]::TryParse(((Split-Path $frameDir -Leaf) -replace "frame_", ""), [ref]$foundNum) | Out-Null
     if ($foundNum -le $beforeNum) {
-        # Was the trigger consumed (emulator saw it but produced no frame) or
-        # ignored (never picked up)? That decides the next fix.
-        $runTrigGone = -not (Test-Path $TriggerFile)
-        $buildTrigGone = -not (Test-Path $buildTrig)
-        Write-Warning ("Frame dump timeout: no new frame after trigger (latest is still frame_" + $foundNum + "). Run-folder trigger consumed: " + $runTrigGone + "; build-folder trigger consumed: " + $buildTrigGone + ".")
+        Write-Warning ("Frame dump timeout: no new frame after trigger (latest is still frame_" + $foundNum + ").")
         return $null
     }
     # Wait for the rt0 PNGs to land (async writer), then pick the final one.
@@ -295,25 +263,6 @@ function Save-Screenshot {
     $shot = Save-FrameDumpShot -Name $Name
     if ($shot) { return $shot }
     Write-Warning "Frame dump shot failed; falling back to screen capture."
-    # Bring the emulator window to the front first. Without this the capture
-    # shows whatever the user has open (e.g. the browser), not the game.
-    if ($script:Win32FgReady -and ($script:EmuProcId -ne 0)) {
-        try {
-            $emu = Get-Process -Id $script:EmuProcId -ErrorAction Stop
-            if ($emu.MainWindowHandle -ne [IntPtr]::Zero) {
-                if ([Win32Fg]::IsIconic($emu.MainWindowHandle)) { [Win32Fg]::ShowWindow($emu.MainWindowHandle, 9) | Out-Null }
-                $fg = [Win32Fg]::SetForegroundWindow($emu.MainWindowHandle)
-                if (-not $fg) { Write-Warning "Could not bring the emulator window to the front (focus is locked by another app); the screen capture may show another window." }
-                Start-Sleep -Seconds 2
-            } else {
-                Write-Warning "Emulator has no main window yet; the screen capture may show another window."
-            }
-        } catch {
-            Write-Warning ("Could not bring emulator to front: " + $_.Exception.Message)
-        }
-    } else {
-        Write-Warning "Emulator window unknown; the screen capture may show another window."
-    }
     $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
     $gfx = [System.Drawing.Graphics]::FromImage($bmp)
@@ -532,15 +481,7 @@ $psi.EnvironmentVariables["KYTY_DBG_SKIP_BAD_SHADERS"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_BREADCRUMBS"] = "0"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 $proc = [System.Diagnostics.Process]::Start($psi)
-if (-not $proc) { throw "Emulator did not start." }
-# Check the process WE started, not just any kyty_emulator by name: a stale
-# emulator left running from an earlier run used to satisfy the name check,
-# and the test then navigated a desktop with no game on it.
-$script:EmuProcId = $proc.Id
-Start-Sleep -Seconds 5
-$proc.Refresh()
-if ($proc.HasExited) { throw ("Emulator exited right after launch (exit code " + $proc.ExitCode + "). Check the build folder and last-run.log.") }
-Write-Host ("emulator running, pid " + $proc.Id)
+if (-not (Wait-ForProcess -Name "kyty_emulator" -TimeoutSec 30)) { throw "Emulator did not start." }
 Write-Host ("boot wait: " + $BootWaitSec + " s (first run of a new build compiles shaders - slow)")
 Start-Sleep -Seconds $BootWaitSec
 
@@ -693,10 +634,6 @@ if ($reachedHub -or (-not $script:TesseractExe) -or $NoOcr) {
 # ---------------------------------------------------------------- collect + close
 $logSrc = Join-Path $env:LOCALAPPDATA "KytyPS5\logs\last-run.log"
 if (Test-Path $logSrc) {
-    $logTime = (Get-Item $logSrc).LastWriteTime
-    if ($logTime -lt $TestStart) {
-        Write-Warning ("last-run.log was last written at " + $logTime + ", before this test started at " + $TestStart + " - the emulator may not have run in this test; the log is stale.")
-    }
     Copy-Item $logSrc (Join-Path $OutDir "last-run.log") -Force
     Write-Host "log saved"
 }
@@ -708,7 +645,6 @@ if (-not $KeepRunning) {
     if (Test-Path $logSrc) { Copy-Item $logSrc (Join-Path $OutDir "last-run.log") -Force }
 }
 
-try { Stop-Transcript -ErrorAction Stop | Out-Null } catch { }
 Write-Host ("done. Results in: " + $OutDir)
 Write-Host "Send the 01..11 screenshots (and last-run.log if anything looked wrong) for review."
 

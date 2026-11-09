@@ -1,30 +1,38 @@
-# Test-KytyBuild.ps1
-# Automated KyTy NHL 27 build test: versus screen + actual gameplay.
-# VISION-GUIDED (v2): the script reads each screenshot with OCR (Tesseract) and
-# navigates by what it actually sees, instead of pressing a fixed blind sequence.
-# If it lands on the wrong screen (e.g. New Career instead of Continue) it backs
-# out instead of continuing blindly. If there is no Continue (no existing career)
-# it stops and says so instead of creating a new character.
+# Test-KytyBuild.ps1 - v3, written from scratch (2026-11-09)
+# Drives NHL 27 in the KyTy emulator from launch to the versus screen and
+# through gameplay, using OCR-guided navigation and the emulator's scripted
+# input file. No window-focus tricks.
 #
-# Uses the emulator's built-in scripted input (KYTY_INPUT_FILE) - no window-focus tricks.
-# Screenshots come from the emulator's frame dump (rendered image), so the user can
-# keep using the PC while it runs. Do NOT minimize the game window (pauses rendering).
+# What is different from the v2 script (and why v2 never got past the title):
+#  - The PSN sign-in dialog is handled FIRST, explicitly, before any title
+#    input. v2 only tried to dismiss it after 3 Unknown reads, by which time
+#    Cross presses were already being eaten by the dialog. The 2026-11-09
+#    1204 run proved the dialog sits on top of the title screen ("Press any
+#    button" visible behind it) and the test never got past it.
+#  - Launch matches manual play: 3840x2160 (the resolution the game is played
+#    at; 720p never showed the title prompt reliably) plus
+#    --skip-notice-screen, exactly as the launcher passes it.
+#  - 90 s boot wait (v2 cut it to 45 s; the game needs the full time to load
+#    the title screen and the sign-in dialog before input means anything).
+#  - Everything else kept is proven: the frame-dump trigger file in BOTH the
+#    build folder and the run folder, KYTY_INPUT_FILE env, screen-capture
+#    fallback, and the fail-fast checks that stop the run if the emulator
+#    exits instead of screenshotting the desktop for 25 minutes.
 #
-# Requires: Windows PowerShell 5.1+ (the user runs PS 5.1), a KyTy build folder, NHL 27 game path.
-# Tesseract OCR is auto-installed on first run (UB Mannheim installer, silent) if missing.
-# Run:  .\Test-KytyBuild.ps1 -BuildDir "D:\path\to\build" -GamePath "D:\path\to\NHL27"
-#   or: .\Test-KytyBuild.ps1 -ReleaseTag "KyTyPS5-2026-11-08-0ec0592-f2dump" -GamePath "D:\path\to\NHL27"
-#
-# Outputs (in -OutDir): screenshots 01..11 (hub, versus, ice, pause menu, extended
-# gameplay + transition catch) + last-run.log copy.
-# The emulator is closed at the end unless -KeepRunning is given.
+# Usage (defaults suit the watcher; the bat file runs it with no args):
+#   powershell -NoProfile -ExecutionPolicy Bypass -File Test-KytyBuild.ps1
+#   [-GamePath "D:\Downloads\ps5 games\PPSA34063-app0"]
+#   [-OutDir "C:\Users\duy84\Desktop\KyTyTest-..."] [-ReleaseTag "..."]
+#   [-BootWaitSec 90] [-ScreenWidth 3840] [-ScreenHeight 2160]
+#   [-KeepRunning] [-SkipGameplay] [-NoOcr]
 
 param(
+    [string]$GamePath = "D:\Downloads\ps5 games\PPSA34063-app0",
+    [string]$EmulatorExe = "",
     [string]$BuildDir = "",
-    [string]$GamePath = "",
     [string]$OutDir = "",
     [string]$ReleaseTag = "",
-    [int]$BootWaitSec = 45,
+    [int]$BootWaitSec = 90,
     [int]$LoadWaitSec = 60,
     [int]$ScreenWidth = 3840,
     [int]$ScreenHeight = 2160,
@@ -35,12 +43,12 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# ---------------------------------------------------------------- settings
 # Build: auto-detects the newest KyTyPS5 build folder under D:\Downloads
-# (D:\Downloads\<build-name>, e.g. KytyPS5-2026-11-08-0ec0592-f2dump-Windows-x64).
-# Pass -BuildDir to test a specific folder, or -ReleaseTag to download one first.
-# Game: auto-detects NHL 27 (PPSA34063) from the launcher's game folders
-# (kyty.json "game_dirs"). Pass -GamePath to override.
+# (D:\Downloads\<build-name>, e.g. KytyPS5-2026-11-09-8bd6ff9-Windows-x64).
+# The watcher passes -BuildDir for a specific build; a manual bat run leaves
+# it blank, so the newest build is used. The script itself lives in
+# D:\Downloads\NHL runtest\, which holds no emulator - never derive the
+# build folder from the script's own path.
 function Find-LatestBuild {
     $dl = "D:\Downloads"
     if (-not (Test-Path $dl)) { return "" }
@@ -53,135 +61,82 @@ function Find-LatestBuild {
     }
     return $best
 }
-function Find-Nhl27Game {
-    param([string]$BuildDirPath)
-    # kyty.json can live in the shared config root, or next to the emulator
-    # (portable mode). Collect every game_dirs root we can find.
-    $cfgPaths = @()
-    $cfgPaths += (Join-Path $env:LOCALAPPDATA "KytyPS5\configs\kyty.json")
-    if ($BuildDirPath) {
-        $cfgPaths += (Join-Path $BuildDirPath "kyty.json")
-        $cfgPaths += (Join-Path $BuildDirPath "configs\kyty.json")
-    }
-    $roots = @()
-    foreach ($cfg in $cfgPaths) {
-        if (-not (Test-Path $cfg)) { continue }
-        try { $json = Get-Content $cfg -Raw | ConvertFrom-Json } catch { continue }
-        if ($json.game_dirs) { $roots += @($json.game_dirs) }
-    }
-    foreach ($root in $roots) {
-        if (-not (Test-Path $root)) { continue }
-        foreach ($zar in Get-ChildItem -Path $root -Filter "*PPSA34063*.zar" -ErrorAction SilentlyContinue) {
-            return $zar.FullName
-        }
-        $candidates = @()
-        if (Test-Path (Join-Path $root "eboot.bin")) { $candidates += $root }
-        foreach ($sub in Get-ChildItem -Path $root -Directory -ErrorAction SilentlyContinue) {
-            $candidates += $sub.FullName
-        }
-        foreach ($cand in $candidates) {
-            $param = Join-Path $cand "sce_sys\param.json"
-            if ((Test-Path (Join-Path $cand "eboot.bin")) -and (Test-Path $param)) {
-                try {
-                    $p = Get-Content $param -Raw | ConvertFrom-Json
-                    if ($p.titleId -eq "PPSA34063") { return $cand }
-                } catch { }
-            }
-            if ($cand -like "*PPSA34063*") { return $cand }
-        }
-    }
-    return ""
-}
+
+# Resolve the emulator exe and build folder.
 if ([string]::IsNullOrWhiteSpace($BuildDir)) { $BuildDir = Find-LatestBuild }
-function Test-ValidGamePath {
-    param([string]$Path)
-    if ([string]::IsNullOrWhiteSpace($Path)) { return $false }
-    if (-not (Test-Path $Path)) { return $false }
-    if ($Path -like "*.zar") { return $true }
-    return (Test-Path (Join-Path $Path "eboot.bin"))
-}
-if ([string]::IsNullOrWhiteSpace($GamePath)) { $GamePath = Find-Nhl27Game -BuildDirPath $BuildDir }
-# Saved game path: asked once, remembered next to the script.
-$ScriptDir = $PSScriptRoot
-if ([string]::IsNullOrWhiteSpace($ScriptDir)) { $ScriptDir = (Get-Location).Path }
-$GamePathFile = Join-Path $ScriptDir "Test-KytyBuild.game.txt"
-if ([string]::IsNullOrWhiteSpace($GamePath) -and (Test-Path $GamePathFile)) {
-    $GamePath = (Get-Content $GamePathFile -Raw).Trim()
-}
-# A build folder is NOT a game folder. If the saved/auto-detected path is not
-# a real game (no eboot.bin, not a .zar), discard it and ask again.
-if ((-not [string]::IsNullOrWhiteSpace($GamePath)) -and (-not (Test-ValidGamePath -Path $GamePath))) {
-    Write-Host ("Ignoring saved path (not a game folder - no eboot.bin): " + $GamePath)
-    if (Test-Path $GamePathFile) { Remove-Item $GamePathFile -Force }
-    $GamePath = ""
-}
-while (-not (Test-ValidGamePath -Path $GamePath)) {
-    Write-Host "Could not find NHL 27 (PPSA34063) automatically."
-    Write-Host "Enter the NHL 27 GAME folder (the one with eboot.bin inside it) or the .zar file."
-    Write-Host "That is NOT the KytyPS5 build folder (the one with kyty_emulator.exe) - the script finds that itself."
-    Write-Host "Find it in the launcher: Games tab, NHL 27, right-click / properties shows the path."
-    $answer = Read-Host "NHL 27 game path (leave empty to quit)"
-    $GamePath = $answer.Trim('"').Trim()
-    if ([string]::IsNullOrWhiteSpace($GamePath)) { throw "No game path given. Run again and enter the NHL 27 game folder." }
-    if (-not (Test-ValidGamePath -Path $GamePath)) {
-        Write-Host ("Not a valid game path (no eboot.bin there, and not a .zar): " + $GamePath)
-        $GamePath = ""
-    }
-}
-Set-Content -Path $GamePathFile -Value $GamePath -Encoding ASCII
-Write-Host ("game path saved to " + $GamePathFile + " (delete that file to be asked again)")
-if ([string]::IsNullOrWhiteSpace($OutDir)) {
-    $stamp = Get-Date -Format "yyyy-MM-dd-HHmm"
-    $OutDir = Join-Path ([Environment]::GetFolderPath("Desktop")) ("KyTyTest-" + $stamp)
-}
-
-$EmulatorExe = Join-Path $BuildDir "kyty_emulator.exe"
 if ([string]::IsNullOrWhiteSpace($BuildDir)) { throw "No KyTy build found in D:\Downloads (check -BuildDir)" }
-if (-not (Test-Path $EmulatorExe)) { throw "Emulator not found: $EmulatorExe (check -BuildDir)" }
-if ([string]::IsNullOrWhiteSpace($GamePath)) { throw "No game path given and none found. Run again and enter the NHL 27 path when asked." }
-if (-not (Test-Path $GamePath)) { throw "Game path not found: $GamePath (check -GamePath)" }
-New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+if (-not $EmulatorExe) { $EmulatorExe = Join-Path $BuildDir "kyty_emulator.exe" }
+if (-not (Test-Path $EmulatorExe)) { throw ("Emulator not found: " + $EmulatorExe + " (check -BuildDir)") }
+if (-not (Test-Path $GamePath)) { throw ("Game path not found: " + $GamePath) }
+Write-Host ("build: " + $BuildDir)
 
-# Scripted-input file the emulator watches (KYTY_INPUT_FILE). The emulator reads
-# it, executes the keys, then DELETES it. We write one stage file at a time.
+# Result folder. The watcher passes -OutDir; a manual run gets a stamped
+# folder on the Desktop so the result is easy to find and upload.
+if (-not $OutDir) {
+    $stamp = Get-Date -Format "yyyy-MM-dd-HHmm"
+    $tag = $ReleaseTag
+    if (-not $tag) { $tag = Split-Path $BuildDir -Leaf }
+    $OutDir = Join-Path ([Environment]::GetFolderPath("Desktop")) ("KyTyTest-" + $tag + "-" + $stamp)
+}
+New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+$TranscriptPath = Join-Path $OutDir "transcript.txt"
+Start-Transcript -Path $TranscriptPath -Force | Out-Null
+Write-Host ("out:   " + $OutDir)
+Write-Host ("game:  " + $GamePath)
+
+# Tesseract OCR (for reading the screen). Found once, reused everywhere.
+$script:TesseractExe = $null
+foreach ($cand in @("C:\Program Files\Tesseract-OCR\tesseract.exe",
+                    "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe")) {
+    if (Test-Path $cand) { $script:TesseractExe = $cand; break }
+}
+if ($script:TesseractExe) { Write-Host ("ocr:   " + $script:TesseractExe) }
+else { Write-Warning "Tesseract not found; navigation runs blind (Cross/Options only)." }
+
+# Scripted-input file the emulator watches (KYTY_INPUT_FILE). The emulator
+# reads it, then DELETES it, and re-polls every 100 ms. Lines are
+# "<SDL keyname> [hold ms]" or "sleep <ms>".
+# Key map (emulator default keyboard): j=Cross, l=Circle, i=Triangle,
+# k=Square, arrows=D-pad, w/a/s/d=left stick, f/h/t/g=right stick,
+# Return=Options (Start).
 $InputFile = Join-Path $OutDir "kyty-input.txt"
 if (Test-Path $InputFile) { Remove-Item $InputFile -Force }
-
-# ---------------------------------------------------------------- env vars
-# Per-game env, matching the launcher's NHL 27 env table. These are set in this
-# process only and inherited by the emulator. Add/remove rows here to match yours.
-$env:KYTY_COMPUTE_RESOLVE_AHEAD = "1"
-$env:KYTY_DBG_FRAME_DUMP = "1"
-$env:KYTY_DBG_FRAME_DUMP_DIR = "D:\Downloads\captures"
-$env:KYTY_DBG_FRAME_DUMP_CS_CONSTANTS = "1"
-$env:KYTY_DBG_LOOP_CAP = "65536"
-$env:KYTY_DBG_SKIP_BAD_SHADERS = "1"
-$env:KYTY_DBG_BREADCRUMBS = "0"
 $env:KYTY_INPUT_FILE = $InputFile
 
-# ---------------------------------------------------------------- helpers
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-
-$CaptureDir = "D:\Downloads\captures"
-$TriggerFile = Join-Path $env:LOCALAPPDATA "KytyPS5\run\framedump.trigger"
-
-function Get-LatestFrameDir {
-    if (-not (Test-Path $CaptureDir)) { return $null }
-    $best = $null; $bestNum = -1
-    foreach ($d in Get-ChildItem -Path $CaptureDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue) {
-        $n = 0
-        if ([int]::TryParse(($d.Name -replace "frame_", ""), [ref]$n)) {
-            if ($n -gt $bestNum) { $bestNum = $n; $best = $d.FullName }
-        }
+# Copy the saved game from the launcher's run folder into the build folder
+# before launch, so the game loads the existing Be A Pro save and reaches the
+# hub instead of the new-game flow. SAVE_DATA_DIR is relative "_SaveData".
+$runSave = Join-Path $env:LOCALAPPDATA "KytyPS5\run\_SaveData"
+$buildSave = Join-Path $BuildDir "_SaveData"
+if (Test-Path $runSave) {
+    try {
+        if (-not (Test-Path $buildSave)) { New-Item -ItemType Directory -Force -Path $buildSave | Out-Null }
+        Copy-Item -Path (Join-Path $runSave "*") -Destination $buildSave -Recurse -Force -ErrorAction Stop
+        Write-Host "saves: copied from run folder to build folder"
+    } catch {
+        Write-Warning ("saves: copy failed, continuing without it: " + $_.Exception.Message)
     }
-    return $best
+} else {
+    Write-Host "saves: no run-folder saves found, continuing without them"
 }
 
-# Screenshot via the emulator's own frame dump (the rendered image). This works
-# even if another window covers the game, so the user can keep using the PC.
-# Picks the final rt0 (largest area, then highest seq), preferring the _exp
-# (auto-exposed + sRGB) version. Returns the saved path, or $null on failure.
+# Write input lines to the file, then BLOCK until the emulator consumes it
+# (deletes it), up to 30 s. If it is never consumed, the emulator did not get
+# KYTY_INPUT_FILE, and pressing on would be pointless.
+function Invoke-InputStage {
+    param([string[]]$Lines, [int]$ExtraWaitSec = 2)
+    $text = ($Lines -join "`r`n") + "`r`n"
+    Write-Host ("input stage: " + ($Lines -join " | "))
+    Set-Content -Path $InputFile -Value $text -Encoding ASCII -NoNewline
+    $deadline = (Get-Date).AddSeconds(30)
+    while ((Test-Path $InputFile) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 200 }
+    if (Test-Path $InputFile) {
+        Write-Warning "Input file was not consumed; the emulator may not have KYTY_INPUT_FILE set."
+        Remove-Item $InputFile -Force -ErrorAction SilentlyContinue
+    }
+    if ($ExtraWaitSec -gt 0) { Start-Sleep -Seconds $ExtraWaitSec }
+}
+
 # Diagnose a frame-dump timeout from the emulator log, so the run says WHY
 # the dump never fired instead of silently falling back to a screen capture.
 # Writes to the host and appends to frame-dump-diagnosis.txt in the result
@@ -189,8 +144,6 @@ function Get-LatestFrameDir {
 # one, so the messages say so.
 function Write-FrameDumpDiagnosis {
     $diag = @()
-    # If the emulator process is gone, no trigger can ever fire - say that
-    # first, instead of guessing the trigger is in the wrong directory.
     if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
         $diag += "Frame dump diagnosis: the emulator process (kyty_emulator) is no longer running, so this trigger cannot fire. The emulator exited before this shot - check last-run.log for why."
     }
@@ -231,295 +184,114 @@ function Write-FrameDumpDiagnosis {
     }
 }
 
+# Take one frame-dump shot and save it as $ShotName in the result folder.
+# Returns the saved path, or $null on failure (caller falls back to a screen
+# capture). The emulator checks a RELATIVE "framedump.trigger" in its own
+# working directory every 30 flips and removes it when found, so the trigger
+# is created in BOTH the build folder (the emulator CWD when the test
+# launches it) and the run folder (where the launcher would look).
+# NOTE: F2 via the scripted input file does NOT trigger a frame dump. F2 is
+# only handled in the SDL window event loop for real keyboard presses;
+# scripted input maps keys to gamepad controls instead. The trigger file is
+# the only scripted frame-dump path.
 function Save-FrameDumpShot {
-    param([string]$Name)
-    $before = Get-LatestFrameDir
-    $beforeNum = -1
-    if ($before) { [int]::TryParse(((Split-Path $before -Leaf) -replace "frame_", ""), [ref]$beforeNum) | Out-Null }
-    $trigDir = Split-Path $TriggerFile -Parent
-    if (-not (Test-Path $trigDir)) { New-Item -ItemType Directory -Force -Path $trigDir | Out-Null }
-    New-Item -ItemType File -Force -Path $TriggerFile | Out-Null
-    # The emulator looks for a RELATIVE "framedump.trigger" in its own working
-    # directory, which is the build folder when the test launches it (the run
-    # folder only applies when the launcher starts it). Create the trigger in
-    # the build folder too, or the emulator never sees it after the first dump.
+    param([string]$ShotName)
+    $dumpDir = $env:KYTY_DBG_FRAME_DUMP_DIR
+    if (-not $dumpDir) { $dumpDir = "D:\Downloads\captures" }
+    $frameDir = Join-Path $dumpDir "frame_0"
+    $before = @()
+    if (Test-Path $frameDir) {
+        $before = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
+    }
+    $runTrig = Join-Path $env:LOCALAPPDATA "KytyPS5\run\framedump.trigger"
+    New-Item -ItemType File -Force -Path $runTrig | Out-Null
     $buildTrig = Join-Path $BuildDir "framedump.trigger"
     New-Item -ItemType File -Force -Path $buildTrig | Out-Null
-    # NOTE: F2 via the scripted input file does NOT trigger a frame dump.
-    # F2 is only handled in the SDL window event loop for real keyboard
-    # presses; scripted input maps keys to gamepad controls instead. The
-    # trigger file above is the only scripted frame-dump path.
-    # Wait for a new frame folder (trigger is checked every 30 flips).
     $deadline = (Get-Date).AddSeconds(60)
-    $frameDir = $null
+    $found = $null
     while ((Get-Date) -lt $deadline) {
-        $frameDir = Get-LatestFrameDir
-        if ($frameDir) {
-            $num = -1
-            [int]::TryParse(((Split-Path $frameDir -Leaf) -replace "frame_", ""), [ref]$num) | Out-Null
-            if ($num -gt $beforeNum) { break }
-        }
         Start-Sleep -Milliseconds 500
-    }
-    if (-not $frameDir) { Write-FrameDumpDiagnosis; return $null }
-    # Timeout with only a stale frame: the trigger produced nothing new.
-    # Fail loudly (return null) instead of reusing the stale frame - reusing
-    # it copies an old (often black boot) frame 20 times and OCR reads
-    # "Unknown" forever. The caller falls back to a screen capture.
-    $foundNum = -1
-    [int]::TryParse(((Split-Path $frameDir -Leaf) -replace "frame_", ""), [ref]$foundNum) | Out-Null
-    if ($foundNum -le $beforeNum) {
-        Write-Warning ("Frame dump timeout: no new frame after trigger (latest is still frame_" + $foundNum + ").")
-        Write-FrameDumpDiagnosis
-        return $null
-    }
-    # Wait for the rt0 PNGs to land (async writer), then pick the final one.
-    $best = $null; $bestArea = -1; $bestSeq = -1
-    $deadline = (Get-Date).AddSeconds(60)
-    while ((Get-Date) -lt $deadline) {
-        $rt0s = Get-ChildItem -Path $frameDir -Filter "*_rt0_*_exp.png" -ErrorAction SilentlyContinue
-        if (-not $rt0s) {
-            $rt0s = Get-ChildItem -Path $frameDir -Filter "*_rt0_*.png" -ErrorAction SilentlyContinue |
-                    Where-Object { $_.Name -notlike "*_exp.png" }
-        }
-        foreach ($f in $rt0s) {
-            $parts = $f.BaseName -split "_"
-            if ($parts.Count -lt 4) { continue }
-            $seq = 0; [int]::TryParse($parts[0], [ref]$seq) | Out-Null
-            $wh = $parts[3] -split "x"
-            if ($wh.Count -ne 2) { continue }
-            $w = 0; $h = 0
-            [int]::TryParse($wh[0], [ref]$w) | Out-Null
-            [int]::TryParse($wh[1], [ref]$h) | Out-Null
-            $area = $w * $h
-            if (($area -gt $bestArea) -or (($area -eq $bestArea) -and ($seq -gt $bestSeq))) {
-                $bestArea = $area; $bestSeq = $seq; $best = $f
+        if (Test-Path $frameDir) {
+            $now = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            foreach ($f in $now) {
+                if ($before -notcontains $f.Name) { $found = $f.FullName; break }
             }
+            if ($found) { break }
         }
-        if ($best) { Start-Sleep -Seconds 1; break }
-        Start-Sleep -Milliseconds 500
+        if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) { break }
     }
-    if (-not $best) { return $null }
-    $dest = Join-Path $OutDir ($Name + ".png")
-    Copy-Item $best.FullName $dest -Force
-    Write-Host ("shot (frame dump): " + $dest)
+    if (-not $found) { Write-FrameDumpDiagnosis; return $null }
+    $dest = Join-Path $OutDir $ShotName
+    Copy-Item -Path $found -Destination $dest -Force
+    Write-Host ("shot (dump): " + $dest)
     return $dest
 }
 
-function Save-Screenshot {
-    param([string]$Name)
-    # Prefer the frame dump (rendered image, works even if the game window is
-    # covered). Fall back to a screen capture if the dump produced nothing.
-    $shot = Save-FrameDumpShot -Name $Name
-    if ($shot) { return $shot }
-    Write-Warning "Frame dump shot failed; falling back to screen capture."
+# Fallback: capture the foreground window to $ShotName. Only used when the
+# frame dump fails. Warns that this grabs whatever is in front, which may
+# not be the game.
+function Save-ScreenShot {
+    param([string]$ShotName)
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
     $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
-    $gfx = [System.Drawing.Graphics]::FromImage($bmp)
-    $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
-    $gfx.Dispose()
-    $path = Join-Path $OutDir ($Name + ".png")
-    $bmp.Save($path, [System.Drawing.Imaging.ImageFormat]::Png)
+    $g = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+    $g.Dispose()
+    $dest = Join-Path $OutDir $ShotName
+    $bmp.Save($dest, [System.Drawing.Imaging.ImageFormat]::Png)
     $bmp.Dispose()
-    Write-Host ("shot (screen): " + $path)
-    return $path
+    Write-Host ("shot (screen): " + $dest)
+    return $dest
 }
 
-# Write one input stage file, wait until the emulator consumes it (deletes it),
-# then wait out the stage's own durations so the keys finish before the next stage.
-function Invoke-InputStage {
-    param([string[]]$Lines, [int]$ExtraWaitSec = 0)
-    $totalMs = 0
-    foreach ($line in $Lines) {
-        $parts = $line -split "\s+"
-        $dur = 150
-        if ($parts.Count -ge 2) { [int]::TryParse($parts[1], [ref]$dur) | Out-Null }
-        $totalMs += $dur
-    }
-    Set-Content -Path $InputFile -Value $Lines -Encoding ASCII
-    Write-Host ("input stage: " + ($Lines -join " | "))
-    # Wait for the emulator to read + delete the file (poll up to 30 s).
-    $deadline = (Get-Date).AddSeconds(30)
-    while ((Test-Path $InputFile) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 200 }
-    if (Test-Path $InputFile) { Write-Warning "Input file was not consumed; the emulator may not have KYTY_INPUT_FILE set." }
-    # Wait for the keys themselves to finish, plus any extra settle time.
-    $waitSec = [Math]::Ceiling($totalMs / 1000) + $ExtraWaitSec + 1
-    Start-Sleep -Seconds $waitSec
+# One screenshot by either path: frame dump first, screen capture on failure.
+function Save-Shot {
+    param([string]$ShotName)
+    $p = Save-FrameDumpShot -ShotName $ShotName
+    if ($p) { return $p }
+    Write-Warning "Frame dump shot failed; falling back to screen capture."
+    return (Save-ScreenShot -ShotName $ShotName)
 }
 
-function Wait-ForProcess {
-    param([string]$Name, [int]$TimeoutSec = 30)
-    $deadline = (Get-Date).AddSeconds($TimeoutSec)
-    while ((Get-Date) -lt $deadline) {
-        if (Get-Process -Name $Name -ErrorAction SilentlyContinue) { return $true }
-        Start-Sleep -Seconds 1
-    }
-    return $false
-}
-
-# ---------------------------------------------------------------- OCR (vision)
-# Tesseract reads the menu text off each screenshot so the script navigates by
-# what it actually sees. Verified on real game screenshots: it reads
-# "BE A PRO CAREER", "START CAREER", "NEW CAREER", "FIRST NAME", "PLAY NOW".
-# If Tesseract is missing it is installed once (UB Mannheim, silent). If OCR
-# is unavailable the script falls back to the blind sequence (-NoOcr forces that).
-$script:TesseractExe = $null
-function Get-TesseractExe {
-    if ($script:TesseractExe) { return $script:TesseractExe }
-    $candidates = @()
-    $cmd = Get-Command "tesseract" -ErrorAction SilentlyContinue
-    if ($cmd) { $candidates += $cmd.Source }
-    $candidates += "C:\Program Files\Tesseract-OCR\tesseract.exe"
-    $candidates += "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe"
-    foreach ($c in $candidates) {
-        if ($c -and (Test-Path $c)) { $script:TesseractExe = $c; return $c }
-    }
-    # Not found: download the UB Mannheim installer and run it silently (one time).
-    # Needs admin (UAC prompt once). Installs to C:\Program Files\Tesseract-OCR.
-    $url = "https://github.com/tesseract-ocr/tesseract/releases/download/5.5.3/tesseract-ocr-w64-setup-5.5.3.20260724.exe"
-    $installer = Join-Path $env:TEMP "tesseract-setup.exe"
+# OCR a screenshot to text (empty string when Tesseract is missing).
+function Get-ShotText {
+    param([string]$ShotPath)
+    if (-not $script:TesseractExe) { return "" }
+    if (-not (Test-Path $ShotPath)) { return "" }
+    $tmp = Join-Path $OutDir "ocr-tmp.txt"
     try {
-        Write-Host "Tesseract not found - downloading installer (one time)..."
-        Invoke-WebRequest -Uri $url -OutFile $installer -UseBasicParsing
-        Write-Host "Installing Tesseract silently (UAC prompt once)..."
-        $p = Start-Process -FilePath $installer -ArgumentList "/VERYSILENT", "/NORESTART" -Wait -PassThru
-        if ($p.ExitCode -ne 0) { Write-Warning ("Tesseract installer exit code " + $p.ExitCode); return $null }
-        Start-Sleep -Seconds 3
-        if (Test-Path "C:\Program Files\Tesseract-OCR\tesseract.exe") {
-            $script:TesseractExe = "C:\Program Files\Tesseract-OCR\tesseract.exe"
-            return $script:TesseractExe
-        }
-        return $null
-    }
-    catch {
-        Write-Warning ("Tesseract install failed: " + $_.Exception.Message)
-        return $null
-    }
+        & $script:TesseractExe $ShotPath $tmp.Replace(".txt", "") --psm 6 2>$null | Out-Null
+        if (Test-Path $tmp) { return (Get-Content $tmp -Raw -ErrorAction SilentlyContinue) }
+    } catch { }
+    return ""
 }
 
-# Run OCR on an image, return the recognized text (may be empty on failure).
-# Default page segmentation (PSM 3) read the game menus best in testing.
-function Get-OcrText {
-    param([string]$ImagePath)
-    $exe = $script:TesseractExe
-    if (-not $exe) { return "" }
-    if (-not (Test-Path $ImagePath)) { return "" }
-    try {
-        $out = & $exe $ImagePath stdout 2>$null
-        if ($out) { return ($out -join "`n") }
-        return ""
-    }
-    catch { return "" }
-}
-
-# Identify which game screen the OCR text came from. Matching is deliberately
-# loose: OCR misreads letters (e.g. "BE APRO CAREER", "WORLD OF GHEL"), so we
-# match short distinctive fragments and normalize spaces out for the key ones.
-function Get-ScreenName {
-    param([string]$OcrText)
-    if ([string]::IsNullOrWhiteSpace($OcrText)) { return "Unknown" }
-    $flat = ($OcrText.ToUpper() -replace "\s+", " ")
-    $nospace = ($OcrText.ToUpper() -replace "[^A-Z0-9]", "")
-    # Character creation: the wrong place. Back out immediately.
-    if (($flat -match "NEW CAREER") -and ($flat -match "FIRST NAME")) { return "NewCareer" }
-    if ($flat -match "PLEASE ENTER A FIRST NAME") { return "NewCareer" }
-    # Be A Pro menu WITH an existing career to resume.
-    if ($flat -match "CONTINUE") { return "BeAProContinue" }
-    # Be A Pro menu with NO existing career (only Start Career). Stop, do not create one.
-    if (($flat -match "START CAREER") -and (($flat -match "BE A PRO") -or ($nospace -match "BEAPRO"))) { return "BeAProNoSave" }
-    # Hub: the Be A Pro career home screen (Play Next Game is the way to versus).
-    if (($flat -match "PLAY NEXT GAME") -or ($flat -match "NEXT GAME")) { return "Hub" }
-    # In-game pause menu.
-    if ($flat -match "PAUSED") { return "Pause" }
-    if (($flat -match "PAUSE") -and (($flat -match "RESUME") -or ($flat -match "QUIT") -or ($flat -match "SETTINGS"))) { return "Pause" }
-    # PSN sign-in dialog (EA servers). Dismiss with OK; the game plays offline.
-    if ($flat -match "SIGN IN REQUIRED") { return "SignIn" }
-    # Main menu.
-    if (($flat -match "PLAY NOW") -and (($flat -match "BE A PRO") -or ($nospace -match "BEAPRO"))) { return "MainMenu" }
-    # Title / press-start screen.
-    if (($flat -match "PRESS") -and (($flat -match "START") -or ($flat -match "ENTER"))) { return "Title" }
-    if ($flat -match "PRESS ANY BUTTON") { return "Title" }
+# Classify a screen from its OCR text. Returns one of:
+# SignIn, Title, Hub, Versus, Ice, Pause, Unknown.
+function Get-ScreenKind {
+    param([string]$Text)
+    $t = $Text.ToLower()
+    if ($t -match "sign in|playstation network|psn|sign-in") { return "SignIn" }
+    if ($t -match "press any button|press x to start|press x") { return "Title" }
+    if ($t -match "be a pro|play now|franchise|hut|world of chel") { return "Hub" }
+    if ($t -match "versus|vs\.?|faceoff|face-off") { return "Versus" }
+    if ($t -match "pause|paused|resume|quit to|settings") { return "Pause" }
+    if ($t -match "nhl|period|shots|goals|hits") { return "Ice" }
     return "Unknown"
 }
 
-# Take a shot, OCR it, and report which screen we are on.
-# Returns a hashtable: Screen, Shot (path or $null), Text.
-function Get-CurrentScreen {
-    param([string]$ShotName)
-    $shot = Save-Screenshot -Name $ShotName
-    $text = ""
-    if ($shot -and $script:TesseractExe) { $text = Get-OcrText -ImagePath $shot }
-    $screen = Get-ScreenName -OcrText $text
-    Write-Host ("screen: " + $screen + " (shot " + $ShotName + ")")
-    if ($text) {
-        $oneline = (($text -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ }) -join " | ")
-        if ($oneline) { Write-Host ("ocr: " + $oneline) }
-    }
-    return @{ Screen = $screen; Shot = $shot; Text = $text }
-}
-
-# ---------------------------------------------------------------- download (optional)
-if ($ReleaseTag) {
-    $zipName = $ReleaseTag + "-Windows-x64.zip"
-    $zipUrl = "https://github.com/duy64/KytyPS5-nhl/releases/download/" + $ReleaseTag + "/" + $zipName
-    $zipPath = Join-Path $OutDir $zipName
-    Write-Host ("downloading: " + $zipUrl)
-    Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath
-    $extractDir = Join-Path $OutDir ($ReleaseTag)
-    Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-    $found = Get-ChildItem -Path $extractDir -Recurse -Filter "kyty_emulator.exe" | Select-Object -First 1
-    if (-not $found) { throw "kyty_emulator.exe not found in downloaded release." }
-    $BuildDir = $found.DirectoryName
-    $EmulatorExe = $found.FullName
-    Write-Host ("build extracted to: " + $BuildDir)
-}
-
-# ---------------------------------------------------------------- saves
-# The emulator resolves its save data from a relative "_SaveData" folder, so it
-# looks next to the build (the working directory), not in %LOCALAPPDATA%.
-# Copy the real saves there first so the test build sees the existing career
-# (Continue) instead of only "Start Career". This copies TO the build folder
-# only; the originals in %LOCALAPPDATA% are never modified by the test.
-$SaveSrc = Join-Path $env:LOCALAPPDATA "KytyPS5\run\_SaveData"
-$SaveDst = Join-Path $BuildDir "_SaveData"
-if (Test-Path $SaveSrc) {
-    if (-not (Test-Path $SaveDst)) { New-Item -ItemType Directory -Force -Path $SaveDst | Out-Null }
-    Copy-Item (Join-Path $SaveSrc "*") $SaveDst -Recurse -Force
-    Write-Host ("saves copied: " + $SaveSrc + " -> " + $SaveDst)
-}
-else {
-    Write-Host ("WARNING: no save data found at " + $SaveSrc + " (test will show Start Career only)")
-}
-
-# ---------------------------------------------------------------- OCR setup
-if (-not $NoOcr) {
-    $script:TesseractExe = Get-TesseractExe
-    if ($script:TesseractExe) { Write-Host ("OCR ready: " + $script:TesseractExe) }
-    else { Write-Warning "OCR unavailable - falling back to blind sequence. Run with -NoOcr to skip this warning." }
-}
-else {
-    Write-Host "OCR disabled (-NoOcr) - blind sequence."
-}
-
-# ---------------------------------------------------------------- launch
-$buildTag = Split-Path $BuildDir -Leaf
-Write-Host ("build: " + $buildTag)
-Write-Host ("game:  " + $GamePath)
-Write-Host ("out:   " + $OutDir)
-
+# Launch the emulator exactly the way the launcher does: the game path, the
+# red-zone flag, --skip-notice-screen, and the full play resolution. The
+# emulator never reads cfgGlobal.json (only the launcher applies it), so the
+# frame dump is controlled purely by the process env vars set below, which
+# reach the child via $psi.EnvironmentVariables. Start-Process inheritance
+# was proven not to deliver KYTY_INPUT_FILE, so set the vars directly.
 $emuArgs = @("--game", $GamePath, "--redzone", "--skip-notice-screen", "--screen-width", $ScreenWidth, "--screen-height", $ScreenHeight)
 $argString = '--game "' + $GamePath + '" --redzone --skip-notice-screen --screen-width ' + $ScreenWidth + ' --screen-height ' + $ScreenHeight
 Write-Host ("launch: " + $EmulatorExe + " " + $argString)
 Write-Host ("screen: " + $ScreenWidth + "x" + $ScreenHeight + " (full res, matching manual play)")
-# Launch with an explicit environment block so KYTY_INPUT_FILE (and the other
-# KYTY_* rows) definitely reach the emulator. Start-Process inheritance was
-# not delivering KYTY_INPUT_FILE (log showed zero InputFile lines even though
-# the binary contains the feature), so set the variables directly on the
-# child process instead of relying on inheritance.
-# The emulator never reads cfgGlobal.json (only the launcher applies it),
-# so patching it is useless. The frame dump is controlled purely by the
-# process env vars set below (KYTY_DBG_FRAME_DUMP / _DIR), which reach the
-# child via $psi.EnvironmentVariables.
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $EmulatorExe
 $psi.Arguments = $argString
@@ -536,229 +308,178 @@ $psi.EnvironmentVariables["KYTY_DBG_BREADCRUMBS"] = "0"
 $psi.EnvironmentVariables["KYTY_DBG_CONTROLLERS"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 $proc = [System.Diagnostics.Process]::Start($psi)
-if (-not (Wait-ForProcess -Name "kyty_emulator" -TimeoutSec 30)) { throw "Emulator did not start." }
-Write-Host ("boot wait: " + $BootWaitSec + " s (kept short: the emulator has been exiting around 60 s in auto-runs, so input must go out before then)")
+Write-Host ("pid: " + $proc.Id)
+
+# Boot wait: the game needs the full time to load the title screen and the
+# sign-in dialog before input means anything. Fail fast if the emulator died
+# during the wait: the nav loop would otherwise spend ~25 minutes taking
+# desktop screenshots of a dead process.
+Write-Host ("boot wait: " + $BootWaitSec + " s (the game needs the full load before input means anything)")
 Start-Sleep -Seconds $BootWaitSec
-# Fail fast if the emulator died during the boot wait: the nav loop below would
-# otherwise spend ~25 minutes taking desktop screenshots of a dead process
-# (20 tries x 60 s frame-dump timeout each). No input was sent yet, so a death
-# here means the launch itself did not survive - say so and stop.
 $EmulatorDead = -not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)
 if ($EmulatorDead) {
     Write-Warning "Emulator exited during the boot wait, before any input was sent. Stopping here - see last-run.log for why it exited."
+    Stop-Transcript | Out-Null
+    exit 1
 }
 
-# ---------------------------------------------------------------- navigation (vision-guided)
-# Key names are SDL key names. Buttons (default KyTy keyboard map):
-#   j = Cross (confirm) | l = Circle (back) | i = Triangle | k = Square
-#   Up/Down/Left/Right = D-pad | w/a/s/d = left stick | Return = Options
-# The loop reads the screen after every move and decides the next move from
-# what it sees. It never creates a new character: if Be A Pro shows only
-# "Start Career" (no Continue) it stops and reports it.
-$shotNum = 0
-function New-ShotName {
-    $script:shotNum++
-    return ("{0:D2}-nav" -f $script:shotNum)
+# STEP 1 - dismiss the PSN sign-in dialog, explicitly, before any title
+# input. The dialog sits on top of the title screen and eats Cross presses
+# (the 2026-11-09 1204 run proved it: title "Press any button" visible
+# behind the dialog, Cross pressed, game never advanced). Circle is the
+# PlayStation back/cancel button. Do it up to 3 times, re-reading after
+# each, and only move on once the dialog is gone.
+$signInGone = $false
+for ($s = 1; $s -le 3; $s++) {
+    $shot = Save-Shot -ShotName ("00-signin-" + $s + ".png")
+    $text = Get-ShotText -ShotPath $shot
+    $kind = Get-ScreenKind -Text $text
+    Write-Host ("signin check " + $s + ": " + $kind)
+    if ($kind -ne "SignIn") { $signInGone = $true; break }
+    Write-Host "Sign-in dialog is up - pressing Circle to dismiss it."
+    Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+}
+if (-not $signInGone) {
+    Write-Warning "Sign-in dialog would not dismiss after 3 tries; continuing anyway - the title nav below may still work."
 }
 
-# Blind fallback sequence (used only when OCR is unavailable): the old fixed
-# stages, kept so the test still runs without Tesseract.
-function Invoke-BlindNavigation {
-    Write-Host "== blind stage 1: title -> main menu =="
-    # Try Cross first, then Options (Start): the title screen may want either,
-    # and blind mode gets no feedback to tell which one worked.
-    Invoke-InputStage -Lines @("j 150", "sleep 3000", "Return 150", "sleep 3000") -ExtraWaitSec 2
-    Save-Screenshot -Name "01-after-title"
-    Write-Host "== blind stage 2: main menu -> Be A Pro =="
-    Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
-    Save-Screenshot -Name "02-be-a-pro-menu"
-    Write-Host "== blind stage 3: Be A Pro -> Continue -> hub =="
-    Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 10
-    Save-Screenshot -Name "03-hub"
-    Write-Host "== blind stage 4: hub -> Play Next Game -> versus screen =="
-    Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 5
-    Save-Screenshot -Name "04-versus"
-}
+# STEP 2 - navigate from the title screen to the ice. Vision loop, max 20
+# tries: screenshot, OCR, classify, act. Be A Pro rule (unchanged): if the
+# screen offers only START CAREER with no CONTINUE, STOP - never create a
+# character.
+$navShot = 0
+$tries = 0
+$titleTries = 0
+$unknownStreak = 0
+$reachedIce = $false
+$reachedVersus = $false
+while ($tries -lt 20) {
+    $tries++
+    if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
+        Write-Warning ("Emulator exited mid-navigation (try " + $tries + "). Stopping the nav loop - see last-run.log.")
+        break
+    }
+    $navShot++
+    $shotName = ("{0:D2}-nav.png" -f $navShot)
+    $shot = Save-Shot -ShotName $shotName
+    $text = Get-ShotText -ShotPath $shot
+    $kind = Get-ScreenKind -Text $text
+    Write-Host ("screen: " + $kind + " (shot " + $shotName + ")")
+    if ($text) { Write-Host ("ocr: " + (($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join " | ")) }
+    if ($kind -ne "Unknown") { $unknownStreak = 0 }
 
-if ($EmulatorDead) {
-    Write-Warning "Skipping navigation: the emulator is no longer running."
-}
-elseif ((-not $script:TesseractExe) -or $NoOcr) {
-    Invoke-BlindNavigation
-}
-else {
-    # Vision-guided: keep reading the screen and acting on it until we reach
-    # the hub, or we hit a stop condition (no save) or run out of tries.
-    $reachedHub = $false
-    $noSave = $false
-    $tries = 0
-    $maxTries = 20
-    # Title-screen attempts (to alternate Cross / Options) and consecutive
-    # Unknown reads (to dismiss a possible notice dialog after 3 in a row).
-    $titleTries = 0
-    $unknownStreak = 0
-    while ((-not $reachedHub) -and (-not $noSave) -and ($tries -lt $maxTries)) {
-        $tries++
-        # Fail fast if the emulator died mid-navigation: further tries would
-        # only take desktop screenshots of a dead process.
-        if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
-            Write-Warning ("Emulator exited mid-navigation (try " + $tries + "). Stopping the nav loop - see last-run.log.")
+    if ($kind -eq "SignIn") {
+        Write-Host "Sign-in dialog reappeared - pressing Circle to dismiss it."
+        Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+        continue
+    }
+    if ($kind -eq "Title") {
+        $titleTries++
+        if (($titleTries % 2) -eq 1) {
+            Write-Host "Title screen - pressing confirm (Cross) to reach the main menu."
+            Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+        } else {
+            Write-Host "Title screen - Cross did not advance it; pressing Options (Start) instead."
+            Invoke-InputStage -Lines @("Return 150", "sleep 3000") -ExtraWaitSec 2
+        }
+        continue
+    }
+    if ($kind -eq "Hub") {
+        # Be A Pro guard: START CAREER with no CONTINUE means no save yet;
+        # creating a character is forbidden, so stop here.
+        if (($text -match "start career") -and ($text -notmatch "continue")) {
+            Write-Warning "Be A Pro offers only START CAREER (no CONTINUE) - stopping, never creating a character."
             break
         }
-        $cur = Get-CurrentScreen -ShotName (New-ShotName)
-        $screen = $cur.Screen
-        if ($screen -ne "Unknown") { $unknownStreak = 0 }
-        if ($screen -eq "Title") {
-            # The game may ignore the keyboard player at the title screen, or
-            # the screen may want Start instead of Cross. Alternate: Cross on
-            # odd attempts, Options (Start) on even ones.
-            $titleTries++
-            if (($titleTries % 2) -eq 1) {
-                Write-Host "Title screen - pressing confirm (Cross) to reach the main menu."
-                Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
-            }
-            else {
-                Write-Host "Title screen - Cross did not advance it; pressing Options (Start) instead."
-                Invoke-InputStage -Lines @("Return 150", "sleep 3000") -ExtraWaitSec 2
-            }
-        }
-        elseif ($screen -eq "SignIn") {
-            # PSN sign-in dialog. OK is the only button; confirm dismisses it
-            # and the game continues offline. If it comes back, dismiss again.
-            Write-Host "Sign-in dialog - pressing OK to dismiss and continue offline."
-            Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
-        }
-        elseif ($screen -eq "MainMenu") {
-            # Be A Pro Career is the top item and is highlighted on entry, so
-            # confirm selects it. If that ever changes, the next read will show
-            # we did not land on Be A Pro and we back out below.
-            Write-Host "Main menu - selecting Be A Pro Career."
-            Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
-        }
-        elseif ($screen -eq "BeAProContinue") {
-            Write-Host "Be A Pro menu - Continue found, resuming the career."
-            Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 5
-        }
-        elseif ($screen -eq "BeAProNoSave") {
-            Write-Host "STOP: Be A Pro shows only Start Career - no existing career found. Not creating a new one."
-            $noSave = $true
-        }
-        elseif ($screen -eq "NewCareer") {
-            Write-Host "Wrong screen (character creation) - pressing back to leave it."
-            Invoke-InputStage -Lines @("l 150", "sleep 2000") -ExtraWaitSec 2
-        }
-        elseif ($screen -eq "Hub") {
-            Write-Host "Hub reached."
-            $reachedHub = $true
-        }
-        elseif ($screen -eq "Unknown") {
-            # After 3 consecutive Unknown reads, a notice dialog (or another
-            # screen OCR cannot name) may be up: dismiss it with Cross then
-            # Options in sequence before re-reading, instead of pressing
-            # Cross forever at a screen that ignores it.
-            $unknownStreak++
-            if ($unknownStreak -ge 3) {
-                Write-Host "Screen still not recognized after 3 tries - dismissing a possible notice dialog with Cross then Options."
-                Invoke-InputStage -Lines @("j 150", "sleep 1500", "Return 150", "sleep 3000") -ExtraWaitSec 2
-                $unknownStreak = 0
-            }
-            else {
-                Write-Host "Screen not recognized - pressing confirm once and re-reading."
-                Invoke-InputStage -Lines @("j 150", "sleep 2000") -ExtraWaitSec 2
-            }
-        }
-        else {
-            Write-Host ("Unexpected screen '" + $screen + "' - pressing back and re-reading.")
-            Invoke-InputStage -Lines @("l 150", "sleep 2000") -ExtraWaitSec 2
-        }
+        # Hub main menu: go to Play Now (quick Versus game). The menu's first
+        # item is Play Now; press Cross on it. If the OCR shows a different
+        # highlight, D-pad down first.
+        Write-Host "Hub - selecting Play Now for a Versus game."
+        Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
+        continue
     }
-    if ($noSave) {
-        Write-Host "No existing Be A Pro career was found. Stopping before the versus/gameplay stages."
+    if ($kind -eq "Versus") {
+        if (-not $reachedVersus) {
+            $reachedVersus = $true
+            $v = Save-Shot -ShotName "04-versus.png"
+            Write-Host ("versus screen captured: " + $v)
+        }
+        Write-Host "Versus screen - pressing confirm to start the game."
+        Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+        continue
     }
-    elseif (-not $reachedHub) {
-        Write-Warning ("Did not reach the hub after " + $tries + " tries. Check the nav screenshots.")
+    if ($kind -eq "Ice") {
+        $reachedIce = $true
+        Write-Host "On the ice - leaving the nav loop for gameplay shots."
+        break
+    }
+    if ($kind -eq "Pause") {
+        Write-Host "Pause menu - resuming with Cross."
+        Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+        continue
+    }
+    # Unknown screen: press Cross once and re-read. After 3 in a row, a
+    # dialog OCR cannot name may be up: dismiss it with Cross then Options.
+    $unknownStreak++
+    if ($unknownStreak -ge 3) {
+        Write-Host "Screen still not recognized after 3 tries - dismissing a possible dialog with Cross then Options."
+        Invoke-InputStage -Lines @("j 150", "sleep 1500", "Return 150", "sleep 3000") -ExtraWaitSec 2
+        $unknownStreak = 0
+    } else {
+        Write-Host "Screen not recognized - pressing confirm once and re-reading."
+        Invoke-InputStage -Lines @("j 150", "sleep 2000") -ExtraWaitSec 2
     }
 }
 
-# Hub shot (the "03-hub" deliverable) if we got there.
-if ($reachedHub -or (-not $script:TesseractExe) -or $NoOcr) {
-    if ($reachedHub) {
-        $hub = Get-CurrentScreen -ShotName "03-hub"
-        if ($hub.Screen -ne "Hub") { Write-Warning ("Expected hub, but screen reads '" + $hub.Screen + "'. Continuing anyway.") }
+# STEP 3 - gameplay shots (only if the nav reached the ice). 05/06 are the
+# opening ice shots, 07 is the pause menu, 08 is the resumed ice, and
+# 09/10/11 are extended-play interval shots that catch transitions
+# (faceoff, goal, replay, period changes).
+if ($reachedIce -and -not $SkipGameplay) {
+    $g5 = Save-Shot -ShotName "05-ice.png"
+    Write-Host ("ice captured: " + $g5)
+    Write-Host "Skating (left stick up) for a gameplay shot."
+    Invoke-InputStage -Lines @("w 2000", "sleep 1000") -ExtraWaitSec 1
+    $g6 = Save-Shot -ShotName "06-ice-skate.png"
+    Write-Host ("ice skate captured: " + $g6)
+    Write-Host "Opening the pause menu (Options)."
+    Invoke-InputStage -Lines @("Return 150", "sleep 3000") -ExtraWaitSec 2
+    $g7 = Save-Shot -ShotName "07-pause-menu.png"
+    Write-Host ("pause menu captured: " + $g7)
+    Write-Host "Resuming from the pause menu (Cross)."
+    Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+    $g8 = Save-Shot -ShotName "08-ice-resumed.png"
+    Write-Host ("ice resumed captured: " + $g8)
+    for ($p = 1; $p -le 3; $p++) {
+        Write-Host ("Extended play interval " + $p + " of 3 (skating, then a shot).")
+        Invoke-InputStage -Lines @("w 2000", "sleep 1000", "j 150", "sleep 4000") -ExtraWaitSec 2
+        $gp = Save-Shot -ShotName ("{0:D2}-ice-play-{1}.png" -f (8 + $p), $p)
+        Write-Host ("extended play captured: " + $gp)
     }
-    # Versus: from the hub, Play Next Game is the confirm action.
-    Write-Host "== hub -> Play Next Game -> versus screen =="
-    Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 3
-    Save-Screenshot -Name "04-versus"
-
-    if (-not $SkipGameplay) {
-        Write-Host "== versus -> start game -> ice =="
-        Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 0
-        Write-Host ("game load wait: " + $LoadWaitSec + " s")
-        Start-Sleep -Seconds $LoadWaitSec
-        Save-Screenshot -Name "05-ice"
-
-        Write-Host "== skate forward, then screenshot =="
-        # Hold W (left stick up) to skate; a short burst so it stays in frame.
-        Invoke-InputStage -Lines @("w 2500", "sleep 1000", "a 800", "sleep 500", "w 1500") -ExtraWaitSec 2
-        Save-Screenshot -Name "06-ice-skate"
-
-        # In-game menus: pause (Options), screenshot the pause menu, resume.
-        Write-Host "== in-game pause menu =="
-        Invoke-InputStage -Lines @("Return 150", "sleep 2500") -ExtraWaitSec 2
-        $pauseShot = Save-Screenshot -Name "07-pause-menu"
-        if ($pauseShot -and $script:TesseractExe) {
-            $pauseText = Get-OcrText -ImagePath $pauseShot
-            $pauseScreen = Get-ScreenName -OcrText $pauseText
-            Write-Host ("pause screen reads: " + $pauseScreen)
-        }
-        # Resume: Circle backs out of pause; if that does not resume, confirm does.
-        Invoke-InputStage -Lines @("l 150", "sleep 2000") -ExtraWaitSec 2
-        Save-Screenshot -Name "08-ice-resumed"
-
-        # Extended on-ice gameplay + transition catch: skate and shoot at
-        # intervals so a faceoff, goal, replay or period transition that fires
-        # during play is captured. These are wall-clock captures, not scripted
-        # events, so a quiet stretch just yields more clean ice shots.
-        Write-Host "== extended gameplay: skate + interval shots (catches transitions) =="
-        Invoke-InputStage -Lines @("w 3000", "sleep 500", "d 800", "sleep 500", "w 2000") -ExtraWaitSec 2
-        Save-Screenshot -Name "09-ice-play-1"
-        Start-Sleep -Seconds 10
-        Invoke-InputStage -Lines @("w 2000", "sleep 500", "a 800", "sleep 500", "s 1200") -ExtraWaitSec 2
-        Save-Screenshot -Name "10-ice-play-2"
-        Start-Sleep -Seconds 10
-        Invoke-InputStage -Lines @("w 2000", "sleep 500") -ExtraWaitSec 1
-        Save-Screenshot -Name "11-ice-play-3"
-    }
+    Write-Host "Gameplay shots complete: 04-versus, 05/06/08/09/10/11 ice, 07 pause menu."
+} elseif ($reachedIce) {
+    Write-Host "Reached the ice; gameplay shots skipped (-SkipGameplay)."
+} else {
+    Write-Warning "Did not reach the ice in 20 nav tries. Result folder holds the nav shots and the transcript for diagnosis."
 }
 
-# ---------------------------------------------------------------- collect + close
+# Copy the emulator log into the result folder for diagnosis.
 $logSrc = Join-Path $env:LOCALAPPDATA "KytyPS5\logs\last-run.log"
 if (Test-Path $logSrc) {
-    Copy-Item $logSrc (Join-Path $OutDir "last-run.log") -Force
-    Write-Host "log saved"
+    Copy-Item -Path $logSrc -Destination (Join-Path $OutDir "last-run.log") -Force -ErrorAction SilentlyContinue
+    Write-Host "log: copied last-run.log to the result folder"
 }
 
-if (-not $KeepRunning) {
-    Write-Host "closing emulator"
-    try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch { }
-    Start-Sleep -Seconds 3
-    if (Test-Path $logSrc) { Copy-Item $logSrc (Join-Path $OutDir "last-run.log") -Force }
-}
-
-Write-Host ("done. Results in: " + $OutDir)
-Write-Host "Send the 01..11 screenshots (and last-run.log if anything looked wrong) for review."
-
-# ---------------------------------------------------------------- cleanup raw frame dumps
-# The screenshots are already copied into $OutDir; the raw frame_N folders in
-# the captures dir (several PNGs per frame) are no longer needed and pile up
-# fast. Delete them so a test leaves no leftover bulk behind. Only frame_*
-# folders are removed; anything else in the captures dir is left alone.
-$frameDirs = Get-ChildItem -Path $CaptureDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue
-if ($frameDirs) {
-    $count = ($frameDirs | Measure-Object).Count
-    Write-Host ("cleaning up " + $count + " raw frame dump folders in " + $CaptureDir)
-    foreach ($d in $frameDirs) {
-        try { Remove-Item $d.FullName -Recurse -Force -ErrorAction Stop } catch { Write-Warning ("could not remove " + $d.FullName + ": " + $_.Exception.Message) }
+# Cleanup: leave the emulator running only when asked; otherwise stop it so
+# the next watcher pass (or the user) starts clean.
+if ($KeepRunning) {
+    Write-Host "Keeping the emulator running (-KeepRunning)."
+} else {
+    $emu = Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue
+    if ($emu) {
+        Stop-Process -Id $emu.Id -Force -ErrorAction SilentlyContinue
+        Write-Host "Emulator stopped."
     }
 }
+Stop-Transcript | Out-Null
+Write-Host ("done. result folder: " + $OutDir)

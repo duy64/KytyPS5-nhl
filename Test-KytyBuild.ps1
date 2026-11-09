@@ -9,10 +9,10 @@
 #    Cross presses were already being eaten by the dialog. The 2026-11-09
 #    1204 run proved the dialog sits on top of the title screen ("Press any
 #    button" visible behind it) and the test never got past it.
-#  - Launch matches manual play: 1280x720 for speed (the sign-in dialog
-#    was the real blocker, not the resolution; if 720p stalls, the watcher
-#    re-tests at 4K). --skip-notice-screen, exactly as the launcher passes
-#    it.
+#  - Launch matches manual play: 3840x2160. 720p was tried and does not
+#    stick - the emulator/game still comes up at 3840x2160 even when the
+#    script passes 1280x720, so 4K is what the test actually runs at.
+#    --skip-notice-screen, exactly as the launcher passes it.
 #  - 90 s boot wait (v2 cut it to 45 s; the game needs the full time to load
 #    the title screen and the sign-in dialog before input means anything).
 #  - Everything else kept is proven: the frame-dump trigger file in BOTH the
@@ -24,7 +24,7 @@
 #   powershell -NoProfile -ExecutionPolicy Bypass -File Test-KytyBuild.ps1
 #   [-GamePath "D:\Downloads\ps5 games\PPSA34063-app0"]
 #   [-OutDir "C:\Users\duy84\Desktop\KyTyTest-..."] [-ReleaseTag "..."]
-#   [-BootWaitSec 90] [-ScreenWidth 1280] [-ScreenHeight 720]
+#   [-BootWaitSec 90] [-ScreenWidth 3840] [-ScreenHeight 2160]
 #   [-KeepRunning] [-SkipGameplay] [-NoOcr]
 
 param(
@@ -35,8 +35,8 @@ param(
     [string]$ReleaseTag = "",
     [int]$BootWaitSec = 90,
     [int]$LoadWaitSec = 60,
-    [int]$ScreenWidth = 1280,
-    [int]$ScreenHeight = 720,
+    [int]$ScreenWidth = 3840,
+    [int]$ScreenHeight = 2160,
     [switch]$KeepRunning,
     [switch]$SkipGameplay,
     [switch]$NoOcr
@@ -292,7 +292,7 @@ function Get-ScreenKind {
 $emuArgs = @("--game", $GamePath, "--redzone", "--skip-notice-screen", "--screen-width", $ScreenWidth, "--screen-height", $ScreenHeight)
 $argString = '--game "' + $GamePath + '" --redzone --skip-notice-screen --screen-width ' + $ScreenWidth + ' --screen-height ' + $ScreenHeight
 Write-Host ("launch: " + $EmulatorExe + " " + $argString)
-Write-Host ("screen: " + $ScreenWidth + "x" + $ScreenHeight + " (low res for speed)")
+Write-Host ("screen: " + $ScreenWidth + "x" + $ScreenHeight + " (full res, matching manual play)")
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $EmulatorExe
 $psi.Arguments = $argString

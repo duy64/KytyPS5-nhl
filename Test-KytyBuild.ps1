@@ -23,7 +23,7 @@
 # Usage (defaults suit the watcher; the bat file runs it with no args):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File Test-KytyBuild.ps1
 #   [-GamePath "D:\Downloads\ps5 games\PPSA34063-app0"]
-#   [-OutDir "C:\Users\duy84\Desktop\KyTyTest-..."] [-ReleaseTag "..."]
+#   [-OutDir "D:\Downloads\KyTyTest-..."] [-ReleaseTag "..."]
 #   [-BootWaitSec 90] [-ScreenWidth 3840] [-ScreenHeight 2160]
 #   [-KeepRunning] [-SkipGameplay] [-NoOcr]
 
@@ -53,7 +53,10 @@ if (Test-Path $captureDir) {
     Get-ChildItem -Path $captureDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | ForEach-Object {
         Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
     }
-    Write-Host "captures: cleared old frame dumps"
+    Get-ChildItem -Path $captureDir -Directory -Filter "KyTyTest-*" -ErrorAction SilentlyContinue | ForEach-Object {
+        Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Write-Host "captures: cleared old frame dumps and shot folders"
 }
 
 # Build: auto-detects the newest KyTyPS5 build folder under D:\Downloads
@@ -84,12 +87,12 @@ if (-not (Test-Path $GamePath)) { throw ("Game path not found: " + $GamePath) }
 Write-Host ("build: " + $BuildDir)
 
 # Result folder. The watcher passes -OutDir; a manual run gets a stamped
-# folder on the Desktop so the result is easy to find and upload.
+# folder in D:\Downloads (same place as the builds and captures).
 if (-not $OutDir) {
     $stamp = Get-Date -Format "yyyy-MM-dd-HHmm"
     $tag = $ReleaseTag
     if (-not $tag) { $tag = Split-Path $BuildDir -Leaf }
-    $OutDir = Join-Path ([Environment]::GetFolderPath("Desktop")) ("KyTyTest-" + $tag + "-" + $stamp)
+    $OutDir = Join-Path "D:\Downloads" ("KyTyTest-" + $tag + "-" + $stamp)
 }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $TranscriptPath = Join-Path $OutDir "transcript.txt"
@@ -260,12 +263,21 @@ function Save-ScreenShot {
 }
 
 # One screenshot by either path: frame dump first, screen capture on failure.
+# Also copies the shot into D:\Downloads\captures\<run-folder>\ so the
+# screenshots sit next to the frame dumps.
 function Save-Shot {
     param([string]$ShotName)
     $p = Save-FrameDumpShot -ShotName $ShotName
-    if ($p) { return $p }
-    Write-Warning "Frame dump shot failed; falling back to screen capture."
-    return (Save-ScreenShot -ShotName $ShotName)
+    if (-not $p) {
+        Write-Warning "Frame dump shot failed; falling back to screen capture."
+        $p = Save-ScreenShot -ShotName $ShotName
+    }
+    if ($p) {
+        $shotsDir = Join-Path "D:\Downloads\captures" (Split-Path $OutDir -Leaf)
+        New-Item -ItemType Directory -Force -Path $shotsDir | Out-Null
+        Copy-Item -Path $p -Destination (Join-Path $shotsDir $ShotName) -Force -ErrorAction SilentlyContinue
+    }
+    return $p
 }
 
 # OCR a screenshot to text (empty string when Tesseract is missing).

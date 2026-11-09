@@ -23,7 +23,7 @@
 # Usage (defaults suit the watcher; the bat file runs it with no args):
 #   powershell -NoProfile -ExecutionPolicy Bypass -File Test-KytyBuild.ps1
 #   [-GamePath "D:\Downloads\ps5 games\PPSA34063-app0"]
-#   [-OutDir "D:\Downloads\KyTyTest-..."] [-ReleaseTag "..."]
+#   [-OutDir "D:\Downloads\captures\KyTyTest-..."] [-ReleaseTag "..."]
 #   [-BootWaitSec 90] [-ScreenWidth 3840] [-ScreenHeight 2160]
 #   [-KeepRunning] [-SkipGameplay] [-NoOcr]
 
@@ -87,12 +87,13 @@ if (-not (Test-Path $GamePath)) { throw ("Game path not found: " + $GamePath) }
 Write-Host ("build: " + $BuildDir)
 
 # Result folder. The watcher passes -OutDir; a manual run gets a stamped
-# folder in D:\Downloads (same place as the builds and captures).
+# folder inside D:\Downloads\captures, next to the frame dumps, so all
+# test output lives in one place.
 if (-not $OutDir) {
     $stamp = Get-Date -Format "yyyy-MM-dd-HHmm"
     $tag = $ReleaseTag
     if (-not $tag) { $tag = Split-Path $BuildDir -Leaf }
-    $OutDir = Join-Path "D:\Downloads" ("KyTyTest-" + $tag + "-" + $stamp)
+    $OutDir = Join-Path "D:\Downloads\captures" ("KyTyTest-" + $tag + "-" + $stamp)
 }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $TranscriptPath = Join-Path $OutDir "transcript.txt"
@@ -263,21 +264,12 @@ function Save-ScreenShot {
 }
 
 # One screenshot by either path: frame dump first, screen capture on failure.
-# Also copies the shot into D:\Downloads\captures\<run-folder>\ so the
-# screenshots sit next to the frame dumps.
 function Save-Shot {
     param([string]$ShotName)
     $p = Save-FrameDumpShot -ShotName $ShotName
-    if (-not $p) {
-        Write-Warning "Frame dump shot failed; falling back to screen capture."
-        $p = Save-ScreenShot -ShotName $ShotName
-    }
-    if ($p) {
-        $shotsDir = Join-Path "D:\Downloads\captures" (Split-Path $OutDir -Leaf)
-        New-Item -ItemType Directory -Force -Path $shotsDir | Out-Null
-        Copy-Item -Path $p -Destination (Join-Path $shotsDir $ShotName) -Force -ErrorAction SilentlyContinue
-    }
-    return $p
+    if ($p) { return $p }
+    Write-Warning "Frame dump shot failed; falling back to screen capture."
+    return (Save-ScreenShot -ShotName $ShotName)
 }
 
 # OCR a screenshot to text (empty string when Tesseract is missing).

@@ -24,7 +24,7 @@ param(
     [string]$GamePath = "",
     [string]$OutDir = "",
     [string]$ReleaseTag = "",
-    [int]$BootWaitSec = 90,
+    [int]$BootWaitSec = 45,
     [int]$LoadWaitSec = 60,
     [int]$ScreenWidth = 1280,
     [int]$ScreenHeight = 720,
@@ -537,7 +537,7 @@ $psi.EnvironmentVariables["KYTY_DBG_CONTROLLERS"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 $proc = [System.Diagnostics.Process]::Start($psi)
 if (-not (Wait-ForProcess -Name "kyty_emulator" -TimeoutSec 30)) { throw "Emulator did not start." }
-Write-Host ("boot wait: " + $BootWaitSec + " s (first run of a new build compiles shaders - slow)")
+Write-Host ("boot wait: " + $BootWaitSec + " s (kept short: the emulator has been exiting around 60 s in auto-runs, so input must go out before then)")
 Start-Sleep -Seconds $BootWaitSec
 # Fail fast if the emulator died during the boot wait: the nav loop below would
 # otherwise spend ~25 minutes taking desktop screenshots of a dead process

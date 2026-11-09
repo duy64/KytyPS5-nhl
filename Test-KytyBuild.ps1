@@ -472,6 +472,29 @@ Write-Host ("screen: " + $ScreenWidth + "x" + $ScreenHeight + " (low res for spe
 # not delivering KYTY_INPUT_FILE (log showed zero InputFile lines even though
 # the binary contains the feature), so set the variables directly on the
 # child process instead of relying on inheritance.
+# The build's cfgGlobal.json sets KYTY_DBG_FRAME_DUMP=0, and the config file
+# outranks the process environment, so the frame dump stays disabled even
+# though the test sets KYTY_DBG_FRAME_DUMP=1 in the child env. That is why
+# every shot fell back to a screen capture (which grabbed the PowerShell
+# window instead of the game) and OCR read "Unknown" forever. Patch the
+# build's cfgGlobal.json to enable the frame dump before launching.
+$cfgPath = Join-Path $BuildDir "cfgGlobal.json"
+if (Test-Path $cfgPath) {
+    try {
+        $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        if (-not $cfg.emu) { $cfg | Add-Member -NotePropertyName "emu" -NotePropertyValue ([PSCustomObject]@{}) }
+        if (-not $cfg.emu.env) { $cfg.emu | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{}) }
+        $cfg.emu.env.KYTY_DBG_FRAME_DUMP = "1"
+        $cfg.emu.env.KYTY_DBG_FRAME_DUMP_DIR = $CaptureDir
+        $cfg.emu.env.KYTY_DBG_FRAME_DUMP_CS_CONSTANTS = "1"
+        $cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgPath -Encoding UTF8
+        Write-Host "cfgGlobal.json patched: frame dump enabled."
+    } catch {
+        Write-Warning ("could not patch cfgGlobal.json: " + $_.Exception.Message)
+    }
+} else {
+    Write-Warning "cfgGlobal.json not found in build dir; frame dump may stay disabled."
+}
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $EmulatorExe
 $psi.Arguments = $argString

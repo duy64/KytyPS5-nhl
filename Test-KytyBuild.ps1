@@ -204,7 +204,7 @@ function Save-FrameDumpShot {
     }
     if (-not $frameDir) { return $null }
     # Timeout with only a stale frame: the trigger produced nothing new.
-    # Fail loudly (return null) instead of reusing the stale frame — reusing
+    # Fail loudly (return null) instead of reusing the stale frame - reusing
     # it copies an old (often black boot) frame 20 times and OCR reads
     # "Unknown" forever. The caller falls back to a screen capture.
     $foundNum = -1

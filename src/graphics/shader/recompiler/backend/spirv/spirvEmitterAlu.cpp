@@ -88,12 +88,25 @@ uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t value) {
 	// Drop 13 mantissa bits and rebias the exponent; finite overflow saturates to max half.
 	const auto truncated = Binary(state, spv::OpShiftRightLogical, TypeU32(state), abs,
 	                              ConstantU32(state, 13));
-	const auto normal = EmitUMin32(
-	    state, Binary(state, spv::OpISub, TypeU32(state), truncated, ConstantU32(state, 0x1c000u)),
-	    ConstantU32(state, 0x7bffu));
+	const auto unclamped = Binary(state, spv::OpISub, TypeU32(state), truncated,
+	                              ConstantU32(state, 0x1c000u));
+	const auto normal = EmitUMin32(state, unclamped, ConstantU32(state, 0x7bffu));
+	// ea94 only: values that would saturate to max half (0x7bff = +/-65504) are garbage
+	// pixels (st1 shows exactly +/-65504, sampled by the versus consumer draw). A float
+	// that overflows half range here is not a legitimate colour/depth, it is a stale or
+	// overflowed compute result in the menu where the scene buffer is empty. Return 0
+	// (black) instead of max half so it renders invisible rather than as bright fragments.
+	// Other shaders keep the plain saturating conversion.
+	const auto normal_ea94 =
+	    (state.program.shader_hash == 0xea94f09b2981eb43ULL)
+	        ? Select(state, TypeU32(state),
+	                 EmitCompareU32Constant(state, spv::OpUGreaterThan, unclamped,
+	                                        ConstantU32(state, 0x7bffu)),
+	                 ConstantU32(state, 0), normal)
+	        : normal;
 	const auto finite = Select(state, TypeU32(state),
 	                           EmitCompareU32Constant(state, spv::OpULessThan, abs, 0x38800000u),
-	                           sub, normal);
+	                           sub, normal_ea94);
 	const auto nan = EmitOrU32(state, EmitAndConstant(state, truncated, 0x03ffu),
 	                           ConstantU32(state, 0x7e00u));
 	const auto special = Select(state, TypeU32(state),
@@ -486,6 +499,19 @@ static uint32_t FlushInputDenorm(EmitterState& state, uint32_t value) {
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = FlushInputDenorm(state, arg0);
+	// ea94 only: a zero divisor yields 0 instead of infinity. FlushInputDenorm turns a
+	// denormal input into signed zero, so without this guard 1/0 is +inf, which a running
+	// max (ea94's st2) then propagates to the whole output, corrupting the versus screen
+	// in the menu where the scene buffer (buf[11]) is empty. Scoped to ea94 because the
+	// broad guard (all shaders) gave players snow: a player shader depends on 1/0 being
+	// infinity. Other shaders keep the plain 1/x.
+	if (state.program.shader_hash == 0xea94f09b2981eb43ULL) {
+		const auto is_zero = Binary(state, spv::OpFOrdEqual, TypeBool(state), source,
+		                            ConstantF32(state, 0));
+		const auto reciprocal =
+		    Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
+		return Select(state, TypeF32(state), is_zero, ConstantF32(state, 0), reciprocal);
+	}
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 

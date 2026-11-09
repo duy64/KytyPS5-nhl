@@ -196,16 +196,10 @@ function Save-FrameDumpShot {
     # the build folder too, or the emulator never sees it after the first dump.
     $buildTrig = Join-Path $BuildDir "framedump.trigger"
     New-Item -ItemType File -Force -Path $buildTrig | Out-Null
-    # Also send F2 via the scripted input file: F2 calls FrameDump::Request()
-    # directly, bypassing the trigger-file working-directory issue entirely.
-    # Belt and suspenders - if the trigger file is missed, F2 still fires.
-    # Write it directly (no wait): Invoke-InputStage blocks up to 30s for
-    # consumption, and a pending navigation input must not be overwritten.
-    # Only write F2 when no input file is pending, so a navigation key is
-    # never lost.
-    if (-not (Test-Path $InputFile)) {
-        Set-Content -Path $InputFile -Value @("F2") -Encoding ASCII
-    }
+    # NOTE: F2 via the scripted input file does NOT trigger a frame dump.
+    # F2 is only handled in the SDL window event loop for real keyboard
+    # presses; scripted input maps keys to gamepad controls instead. The
+    # trigger file above is the only scripted frame-dump path.
     # Wait for a new frame folder (trigger is checked every 30 flips).
     $deadline = (Get-Date).AddSeconds(60)
     $frameDir = $null
@@ -472,29 +466,10 @@ Write-Host ("screen: " + $ScreenWidth + "x" + $ScreenHeight + " (low res for spe
 # not delivering KYTY_INPUT_FILE (log showed zero InputFile lines even though
 # the binary contains the feature), so set the variables directly on the
 # child process instead of relying on inheritance.
-# The build's cfgGlobal.json sets KYTY_DBG_FRAME_DUMP=0, and the config file
-# outranks the process environment, so the frame dump stays disabled even
-# though the test sets KYTY_DBG_FRAME_DUMP=1 in the child env. That is why
-# every shot fell back to a screen capture (which grabbed the PowerShell
-# window instead of the game) and OCR read "Unknown" forever. Patch the
-# build's cfgGlobal.json to enable the frame dump before launching.
-$cfgPath = Join-Path $BuildDir "cfgGlobal.json"
-if (Test-Path $cfgPath) {
-    try {
-        $cfg = Get-Content $cfgPath -Raw -Encoding UTF8 | ConvertFrom-Json
-        if (-not $cfg.emu) { $cfg | Add-Member -NotePropertyName "emu" -NotePropertyValue ([PSCustomObject]@{}) }
-        if (-not $cfg.emu.env) { $cfg.emu | Add-Member -NotePropertyName "env" -NotePropertyValue ([PSCustomObject]@{}) }
-        $cfg.emu.env | Add-Member -NotePropertyName "KYTY_DBG_FRAME_DUMP" -NotePropertyValue "1" -Force
-        $cfg.emu.env | Add-Member -NotePropertyName "KYTY_DBG_FRAME_DUMP_DIR" -NotePropertyValue $CaptureDir -Force
-        $cfg.emu.env | Add-Member -NotePropertyName "KYTY_DBG_FRAME_DUMP_CS_CONSTANTS" -NotePropertyValue "1" -Force
-        $cfg | ConvertTo-Json -Depth 10 | Set-Content $cfgPath -Encoding UTF8
-        Write-Host "cfgGlobal.json patched: frame dump enabled."
-    } catch {
-        Write-Warning ("could not patch cfgGlobal.json: " + $_.Exception.Message)
-    }
-} else {
-    Write-Warning "cfgGlobal.json not found in build dir; frame dump may stay disabled."
-}
+# The emulator never reads cfgGlobal.json (only the launcher applies it),
+# so patching it is useless. The frame dump is controlled purely by the
+# process env vars set below (KYTY_DBG_FRAME_DUMP / _DIR), which reach the
+# child via $psi.EnvironmentVariables.
 $psi = New-Object System.Diagnostics.ProcessStartInfo
 $psi.FileName = $EmulatorExe
 $psi.Arguments = $argString
@@ -508,6 +483,7 @@ $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_CS_CONSTANTS"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_LOOP_CAP"] = "65536"
 $psi.EnvironmentVariables["KYTY_DBG_SKIP_BAD_SHADERS"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_BREADCRUMBS"] = "0"
+$psi.EnvironmentVariables["KYTY_DBG_CONTROLLERS"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 $proc = [System.Diagnostics.Process]::Start($psi)
 if (-not (Wait-ForProcess -Name "kyty_emulator" -TimeoutSec 30)) { throw "Emulator did not start." }

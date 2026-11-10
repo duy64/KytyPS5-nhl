@@ -1,16 +1,17 @@
-# Test-KytyBuild.ps1 - v11 (2026-11-10)
+# Test-KytyBuild.ps1 - v12 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v11 adds the classifier fix the 1536 atlas run proved with a screenshot:
-# shot 234-nav.png IS the versus screen (PLAY NOW SELECT TEAM / VERSUS /
-# VS / SELECT SIDES) yet v9/v10 classified it Hub, because Get-ScreenKind
-# checked Hub ("play now") before Versus. The highlight theory alone does
-# not explain it: the game sat at Versus while the loop pressed Down+Cross
-# on it ~240 times. Versus is now checked FIRST, on "select team" /
-# "select sides" / "versus" / faceoff. v10's D-pad Down and 60-shot global
-# cap ride along unchanged.
+# v12 changes the target: the versus screen that matters is the BE A PRO
+# one, not Play Now. The user's corruption (teal/reddish strips, garbled
+# blocks, missing logos) is in Be A Pro versus; v9-v11 all navigated to
+# Play Now versus (SELECT TEAM), a different screen. The Hub action now
+# takes the Be A Pro route: on the main menu Cross alone (BE A PRO CAREER
+# is the default highlight) instead of Down+Cross to PLAY NOW, then on
+# the Be A Pro hub Cross on PLAY NEXT GAME. The "never create a character"
+# guard stays: if Be A Pro offers only START CAREER with no CONTINUE, the
+# run stops rather than creating a character.
 #
 # v10 fixes the stuck-versus run (2026-11-10 16:28, #142 delta, v9). The
 # emulator sat at the Play Now versus screen at a healthy 47 fps while the
@@ -630,19 +631,18 @@ while ($step -lt $roadmap.Count) {
             $navFailed = $true
             break
         }
-        # Two different Hub screens, and Cross alone picks the wrong one:
-        # the main menu highlights BE A PRO CAREER first, so Cross there
-        # opens Be A Pro instead of Play Now. The Be A Pro hub highlights
-        # PLAY NEXT GAME, so Cross is right there. Tell them apart by the
-        # OCR text. Menu navigation uses D-pad Down ("Down"), not the left
-        # stick - the menu may ignore the stick, which left the highlight
-        # unmoved and ping-ponged Hub <-> Versus for 245 shots (v9 atlas).
+        # Two different Hub screens. The Be A Pro hub highlights PLAY NEXT
+        # GAME, so Cross is right there. The main menu highlights BE A PRO
+        # CAREER first, so Cross alone opens Be A Pro - that is the route
+        # we want (v12): the versus screen that matters is the Be A Pro
+        # one, not Play Now. Do NOT press Down to PLAY NOW. Tell the two
+        # Hub screens apart by the OCR text.
         if ($text -match "play next game") {
             Write-Host "Be A Pro hub - selecting PLAY NEXT GAME for the Versus screen."
             Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
         } else {
-            Write-Host "Main menu - moving down to PLAY NOW, then confirming."
-            Invoke-InputStage -Lines @("Down 150", "sleep 1500", "j 150", "sleep 4000") -ExtraWaitSec 2
+            Write-Host "Main menu - selecting BE A PRO CAREER (default highlight) for the Be A Pro Versus screen."
+            Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
         }
         $step++
         continue

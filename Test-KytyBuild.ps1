@@ -1,16 +1,20 @@
-# Test-KytyBuild.ps1 - v5 (2026-11-10)
+# Test-KytyBuild.ps1 - v6 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v5 adds -AtlasCapture: a short versus-only run for the atlas-dump build
-# (#139, 4b197fb). It sets KYTY_DBG_FRAME_DUMP_SAMPLED=1, navigates to the
-# versus screen, triggers a frame dump there (the trigger file, same as F2
-# - the sampled .bin files are written by any capture, F2 or trigger), then
-# copies every *_smp_*.bin from the frame folders into the result folder
-# and stops. No gameplay phase. The .bin files are the raw BC bytes of every
-# sampled BC texture, so they tell bad upload data apart from bad sampling.
-# Use it with -BuildDir pointing at the atlas-dump build folder.
+# v6 fixes the atlas run that missed versus (2026-11-10 14:48, #139):
+#  - Save-FrameDumpShot now prefers the _rt0_ color PNG. It used to take
+#    the first new PNG in frame_0, which can be a depth image (6144x6144)
+#    or a storage image - OCR on a depth map reads garbage, so every nav
+#    shot came back Unknown and the run never saw Versus.
+#  - Get-ScreenKind Hub now matches "play next game" (the Be A Pro hub).
+#    The run booted straight into the Be A Pro save hub, and the old Hub
+#    pattern missed it, so the screen fell through to Ice on the bare
+#    "nhl" in the window title bar of screen captures.
+#  - Get-ScreenKind SignIn now also matches the EA servers dialog
+#    ("ea servers", "unable-to-connect"), which eats inputs like the PSN
+#    dialog does.
 #
 # What is different from the v2 script (and why v2 never got past the title):
 #  - The PSN sign-in dialog is handled FIRST, explicitly, before any title
@@ -244,17 +248,26 @@ function Save-FrameDumpShot {
     New-Item -ItemType File -Force -Path $buildTrig | Out-Null
     $deadline = (Get-Date).AddSeconds(60)
     $found = $null
+    $fallback = $null
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         if (Test-Path $frameDir) {
             $now = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
             foreach ($f in $now) {
-                if ($before -notcontains $f.Name) { $found = $f.FullName; break }
+                if ($before -notcontains $f.Name) {
+                    # Prefer the _rt0_ color image: the first new PNG can be
+                    # a depth image (6144x6144) or a storage image, and OCR
+                    # on a depth map reads garbage. Keep the first new PNG
+                    # as a fallback in case no rt0 appears.
+                    if (-not $fallback) { $fallback = $f.FullName }
+                    if ($f.Name -match "_rt0_") { $found = $f.FullName; break }
+                }
             }
             if ($found) { break }
         }
         if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) { break }
     }
+    if (-not $found) { $found = $fallback }
     if (-not $found) { Write-FrameDumpDiagnosis; return $null }
     $dest = Join-Path $OutDir $ShotName
     Copy-Item -Path $found -Destination $dest -Force
@@ -343,9 +356,9 @@ function Get-ShotText {
 function Get-ScreenKind {
     param([string]$Text)
     $t = $Text.ToLower()
-    if ($t -match "sign in|playstation network|psn|sign-in") { return "SignIn" }
+    if ($t -match "sign in|playstation network|psn|sign-in|ea servers|unable-to-connect") { return "SignIn" }
     if ($t -match "press any button|press x to start|press x") { return "Title" }
-    if ($t -match "be a pro|play now|franchise|hut|world of chel") { return "Hub" }
+    if ($t -match "be a pro|play now|play next game|franchise|hut|world of chel") { return "Hub" }
     if ($t -match "versus|vs\.?|faceoff|face-off") { return "Versus" }
     if ($t -match "pause|paused|resume|quit to|settings") { return "Pause" }
     if ($t -match "nhl|period|shots|goals|hits") { return "Ice" }

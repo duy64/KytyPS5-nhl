@@ -1,4 +1,4 @@
-# Test-KytyBuild.ps1 - v13 (2026-11-10)
+# Test-KytyBuild.ps1 - v14 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
@@ -11,6 +11,16 @@
 # folder - so every run leaves a safe copy that rides to Drive with the
 # results. If anything ever goes wrong, restore that folder to
 # %LOCALAPPDATA%\KyTyPS5\run\_SaveData.
+#
+# v14 stops the nav loop from giving up while the Be A Pro hub is still
+# loading. The 2026-11-10 1651 (#142 delta) and 1706 (#139 atlas) runs
+# both died at the Versus stop after 8 tries without ever seeing versus:
+# the hub load runs at 2-12 fps and takes ~90 s, and every Unknown
+# loading-screen wait consumed a try, so the cap fired just as the hub
+# appeared (1706 shot 11 shows the hub fading in, fps back to 53).
+# A try is now consumed only by a RECOGNIZED screen - a loading screen
+# waits without consuming one. The 60-shot global cap is still the
+# backstop for a genuinely stuck load.
 #
 # v10 fixes the stuck-versus run (2026-11-10 16:28, #142 delta, v9). The
 # emulator sat at the Play Now versus screen at a healthy 47 fps while the
@@ -519,8 +529,11 @@ if (-not $signInGone) {
 #  - A LATER stop than expected (the game advanced on its own): jump to it.
 #  - An EARLIER stop than expected (the game went back): go back to it.
 #  - A screen that matches no stop: wait and re-read.
-# Each stop gets 8 tries. If a stop cannot be reached, the run fails with
-# the stop name and the last screen seen, instead of wandering. Be A Pro
+# Each stop gets 8 tries, counted only on RECOGNIZED screens (v14): an
+# Unknown loading screen waits and re-reads without consuming a try, or
+# the cap fires mid-load as it did in the 1651/1706 runs. If a stop
+# cannot be reached, the run fails with the stop name and the last screen
+# seen, instead of wandering. Be A Pro
 # rule (unchanged): if the screen offers only START CAREER with no
 # CONTINUE, STOP - never create a character.
 $roadmap = @("Title", "Hub", "Versus", "Ice")
@@ -539,7 +552,6 @@ $navFailed = $false
 # 20); past that, fail naming the stop it stuck on.
 $maxNavShots = 60
 while ($step -lt $roadmap.Count) {
-    $stepTries++
     if ($navShot -ge $maxNavShots) {
         Write-Warning ("Roadmap exceeded " + $maxNavShots + " nav shots at stop '" + $roadmap[$step] + "'. Stopping - see the nav shots and transcript for the last screen seen.")
         $navFailed = $true
@@ -602,6 +614,10 @@ while ($step -lt $roadmap.Count) {
         continue
     }
     $unknownStreak = 0
+    # Only a recognized screen consumes a try (v14): an Unknown loading
+    # screen above already continued without reaching this line, so a
+    # slow hub load no longer burns the 8-try budget on waits.
+    $stepTries++
 
     # Where does this screen sit on the roadmap? Ahead means the game
     # advanced on its own (jump forward); behind means it went back.

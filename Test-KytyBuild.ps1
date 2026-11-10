@@ -1,25 +1,26 @@
-# Test-KytyBuild.ps1 - v7 (2026-11-10)
+# Test-KytyBuild.ps1 - v8 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v7 fixes the second atlas miss (2026-11-10 14:58, #139, v6). Root cause,
-# proven from the transcript + last-run.log: the frame dump fired ONCE.
-# All 14 nav shots were PNGs from that single capture, appearing gradually
-# as the 300-image download progressed, so every shot showed the same early
-# moment (the dark player showcase screen, no text, OCR Unknown) and the
-# trigger never produced a second capture - the emulator swallows triggers
-# while it is still downloading a capture's images. The EA "SIGN IN
-# REQUIRED" dialog then ate the nav loop, and Circle does not dismiss it.
-#  - Nav shots and the sign-in check now use screen capture, not the frame
-#    dump. Screen captures are instant and always current. The frame dump
-#    is used ONLY for the versus capture (the one that writes the sampled
-#    .bin files), after a quiescence wait so the emulator is not
-#    mid-download when the trigger fires.
-#  - Unknown screens: wait 4 s and re-shot first (loading screens change
-#    on their own); Cross only on the second Unknown in a row.
-#  - SignIn in the nav loop alternates Cross / Circle: the EA servers
-#    dialog needs Cross (acknowledge), the PSN dialog needs Circle (back).
+# v8 fixes the third atlas miss (2026-11-10 15:10, #139, v7). The v7 run
+# reached the ice without ever seeing Versus, and the user closed the
+# window early - two bugs, both from the 1510 screenshots:
+#  - Hub pressed Cross without checking the highlight. Shot 03 was the
+#    MAIN menu with BE A PRO CAREER highlighted, not PLAY NOW, so Cross
+#    opened Be A Pro instead of Play Now. The Hub handler now reads the
+#    OCR text: "play next game" means the Be A Pro hub (Cross directly);
+#    "play now" without it means the main menu (D-pad Down once to PLAY
+#    NOW, then Cross).
+#  - Ice matched the bare word "nhl", which is in the window title bar of
+#    every screen capture, so a dark loading screen (shot 04) was read as
+#    Ice and the nav loop quit early. Ice now needs real HUD text:
+#    "period|shots|goals|hits". A dark screen with no text is Unknown,
+#    which waits and re-shots.
+#  - STEP 1 sign-in now alternates Circle / Cross like the nav loop: the
+#    EA servers dialog needs Cross, the PSN dialog needs Circle. Circle
+#    alone failed 3 times in the 1510 run; Cross dismissed it in the nav
+#    loop.
 #
 # What is different from the v2 script (and why v2 never got past the title):
 #  - The PSN sign-in dialog is handled FIRST, explicitly, before any title
@@ -396,7 +397,11 @@ function Get-ScreenKind {
     if ($t -match "be a pro|play now|play next game|franchise|hut|world of chel") { return "Hub" }
     if ($t -match "versus|vs\.?|faceoff|face-off") { return "Versus" }
     if ($t -match "pause|paused|resume|quit to|settings") { return "Pause" }
-    if ($t -match "nhl|period|shots|goals|hits") { return "Ice" }
+    # Ice needs real HUD text. The bare word "nhl" is in the window title
+    # bar of every screen capture, so it matched dark loading screens and
+    # quit the nav loop early (v7 atlas run, shot 04). Frame dumps have no
+    # title bar, but the scoreboard words match real ice either way.
+    if ($t -match "period|shots|goals|hits") { return "Ice" }
     return "Unknown"
 }
 
@@ -459,8 +464,16 @@ for ($s = 1; $s -le 3; $s++) {
     $kind = Get-ScreenKind -Text $text
     Write-Host ("signin check " + $s + ": " + $kind)
     if ($kind -ne "SignIn") { $signInGone = $true; break }
-    Write-Host "Sign-in dialog is up - pressing Circle to dismiss it."
-    Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+    # Alternate Circle / Cross: the PSN dialog needs Circle (back), the EA
+    # servers dialog needs Cross (acknowledge). Circle alone failed 3
+    # times on the EA dialog in the v7 atlas run.
+    if (($s % 2) -eq 1) {
+        Write-Host "Sign-in dialog is up - pressing Circle to dismiss it."
+        Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+    } else {
+        Write-Host "Sign-in dialog still up - pressing Cross to acknowledge it."
+        Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+    }
 }
 if (-not $signInGone) {
     Write-Warning "Sign-in dialog would not dismiss after 3 tries; continuing anyway - the title nav below may still work."
@@ -524,11 +537,18 @@ while ($tries -lt 20) {
             Write-Warning "Be A Pro offers only START CAREER (no CONTINUE) - stopping, never creating a character."
             break
         }
-        # Hub main menu: go to Play Now (quick Versus game). The menu's first
-        # item is Play Now; press Cross on it. If the OCR shows a different
-        # highlight, D-pad down first.
-        Write-Host "Hub - selecting Play Now for a Versus game."
-        Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
+        # Two different Hub screens, and Cross alone picks the wrong one:
+        # the main menu highlights BE A PRO CAREER first, so Cross there
+        # opens Be A Pro instead of Play Now (v7 atlas run, shot 03). The
+        # Be A Pro hub highlights PLAY NEXT GAME, so Cross is right there.
+        # Tell them apart by the OCR text.
+        if ($text -match "play next game") {
+            Write-Host "Be A Pro hub - selecting PLAY NEXT GAME for the Versus screen."
+            Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
+        } else {
+            Write-Host "Main menu - moving down to PLAY NOW, then confirming."
+            Invoke-InputStage -Lines @("s 150", "sleep 1500", "j 150", "sleep 4000") -ExtraWaitSec 2
+        }
         continue
     }
     if ($kind -eq "Versus") {

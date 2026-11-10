@@ -1,20 +1,25 @@
-# Test-KytyBuild.ps1 - v6 (2026-11-10)
+# Test-KytyBuild.ps1 - v7 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v6 fixes the atlas run that missed versus (2026-11-10 14:48, #139):
-#  - Save-FrameDumpShot now prefers the _rt0_ color PNG. It used to take
-#    the first new PNG in frame_0, which can be a depth image (6144x6144)
-#    or a storage image - OCR on a depth map reads garbage, so every nav
-#    shot came back Unknown and the run never saw Versus.
-#  - Get-ScreenKind Hub now matches "play next game" (the Be A Pro hub).
-#    The run booted straight into the Be A Pro save hub, and the old Hub
-#    pattern missed it, so the screen fell through to Ice on the bare
-#    "nhl" in the window title bar of screen captures.
-#  - Get-ScreenKind SignIn now also matches the EA servers dialog
-#    ("ea servers", "unable-to-connect"), which eats inputs like the PSN
-#    dialog does.
+# v7 fixes the second atlas miss (2026-11-10 14:58, #139, v6). Root cause,
+# proven from the transcript + last-run.log: the frame dump fired ONCE.
+# All 14 nav shots were PNGs from that single capture, appearing gradually
+# as the 300-image download progressed, so every shot showed the same early
+# moment (the dark player showcase screen, no text, OCR Unknown) and the
+# trigger never produced a second capture - the emulator swallows triggers
+# while it is still downloading a capture's images. The EA "SIGN IN
+# REQUIRED" dialog then ate the nav loop, and Circle does not dismiss it.
+#  - Nav shots and the sign-in check now use screen capture, not the frame
+#    dump. Screen captures are instant and always current. The frame dump
+#    is used ONLY for the versus capture (the one that writes the sampled
+#    .bin files), after a quiescence wait so the emulator is not
+#    mid-download when the trigger fires.
+#  - Unknown screens: wait 4 s and re-shot first (loading screens change
+#    on their own); Cross only on the second Unknown in a row.
+#  - SignIn in the nav loop alternates Cross / Circle: the EA servers
+#    dialog needs Cross (acknowledge), the PSN dialog needs Circle (back).
 #
 # What is different from the v2 script (and why v2 never got past the title):
 #  - The PSN sign-in dialog is handled FIRST, explicitly, before any title
@@ -275,6 +280,36 @@ function Save-FrameDumpShot {
     return $dest
 }
 
+# Wait until the frame-dump download is finished: no new PNG has appeared
+# in frame_0 for 10 seconds, or 120 seconds have passed. A capture writes
+# 300 images over minutes; a trigger fired while that download is still
+# running is swallowed and produces no new capture (proven by the v6 atlas
+# run, where 14 nav shots were all PNGs from the first capture). Call this
+# before the one frame dump that matters (the versus capture).
+function Wait-FrameDumpQuiescent {
+    $dumpDir = $env:KYTY_DBG_FRAME_DUMP_DIR
+    if (-not $dumpDir) { $dumpDir = "D:\Downloads\captures" }
+    $frameDir = Join-Path $dumpDir "frame_0"
+    $deadline = (Get-Date).AddSeconds(120)
+    $lastCount = -1
+    $quietSince = Get-Date
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds 5
+        $count = 0
+        if (Test-Path $frameDir) {
+            $count = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue).Count
+        }
+        if ($count -ne $lastCount) {
+            $lastCount = $count
+            $quietSince = Get-Date
+        } elseif (((Get-Date) - $quietSince).TotalSeconds -ge 10) {
+            Write-Host ("frame dump quiescent: " + $count + " PNGs in frame_0, none new for 10 s.")
+            return
+        }
+    }
+    Write-Warning "Frame dump did not go quiescent in 120 s; proceeding anyway."
+}
+
 # Fallback: capture the foreground window to $ShotName. Only used when the
 # frame dump fails. Warns that this grabs whatever is in front, which may
 # not be the game.
@@ -419,7 +454,7 @@ if ($EmulatorDead) {
 # each, and only move on once the dialog is gone.
 $signInGone = $false
 for ($s = 1; $s -le 3; $s++) {
-    $shot = Save-Shot -ShotName ("00-signin-" + $s + ".png")
+    $shot = Save-ScreenShot -ShotName ("00-signin-" + $s + ".png")
     $text = Get-ShotText -ShotPath $shot
     $kind = Get-ScreenKind -Text $text
     Write-Host ("signin check " + $s + ": " + $kind)
@@ -438,6 +473,7 @@ if (-not $signInGone) {
 $navShot = 0
 $tries = 0
 $titleTries = 0
+$signInTries = 0
 $unknownStreak = 0
 $reachedIce = $false
 $reachedVersus = $false
@@ -449,7 +485,7 @@ while ($tries -lt 20) {
     }
     $navShot++
     $shotName = ("{0:D2}-nav.png" -f $navShot)
-    $shot = Save-Shot -ShotName $shotName
+    $shot = Save-ScreenShot -ShotName $shotName
     $text = Get-ShotText -ShotPath $shot
     $kind = Get-ScreenKind -Text $text
     Write-Host ("screen: " + $kind + " (shot " + $shotName + ")")
@@ -457,8 +493,17 @@ while ($tries -lt 20) {
     if ($kind -ne "Unknown") { $unknownStreak = 0 }
 
     if ($kind -eq "SignIn") {
-        Write-Host "Sign-in dialog reappeared - pressing Circle to dismiss it."
-        Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+        $signInTries++
+        # Alternate Cross / Circle: the EA servers dialog needs Cross
+        # (acknowledge), the PSN dialog needs Circle (back). Circle alone
+        # failed 3 times on the EA dialog in the v6 atlas run.
+        if (($signInTries % 2) -eq 1) {
+            Write-Host "Sign-in dialog reappeared - pressing Cross to acknowledge it."
+            Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+        } else {
+            Write-Host "Sign-in dialog still up - pressing Circle to dismiss it."
+            Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+        }
         continue
     }
     if ($kind -eq "Title") {
@@ -489,6 +534,10 @@ while ($tries -lt 20) {
     if ($kind -eq "Versus") {
         if (-not $reachedVersus) {
             $reachedVersus = $true
+            # The versus capture is the one frame dump that matters (it
+            # writes the sampled .bin files). Wait for any earlier capture
+            # to finish downloading first, or the trigger is swallowed.
+            Wait-FrameDumpQuiescent
             $v = Save-Shot -ShotName "04-versus.png"
             Write-Host ("versus screen captured: " + $v)
             if ($AtlasCapture) {
@@ -517,10 +566,15 @@ while ($tries -lt 20) {
         Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
         continue
     }
-    # Unknown screen: press Cross once and re-read. After 3 in a row, a
-    # dialog OCR cannot name may be up: dismiss it with Cross then Options.
+    # Unknown screen: wait first - a loading screen (dark player showcase,
+    # no text) changes on its own, and pressing Cross blindly on it does
+    # nothing. Cross only on the second Unknown in a row; after 3, a dialog
+    # OCR cannot name may be up: dismiss it with Cross then Options.
     $unknownStreak++
-    if ($unknownStreak -ge 3) {
+    if ($unknownStreak -eq 1) {
+        Write-Host "Screen not recognized - waiting 4 s and re-reading (may be a loading screen)."
+        Start-Sleep -Seconds 4
+    } elseif ($unknownStreak -ge 3) {
         Write-Host "Screen still not recognized after 3 tries - dismissing a possible dialog with Cross then Options."
         Invoke-InputStage -Lines @("j 150", "sleep 1500", "Return 150", "sleep 3000") -ExtraWaitSec 2
         $unknownStreak = 0
@@ -536,24 +590,24 @@ while ($tries -lt 20) {
 # (faceoff, goal, replay, period changes). Skipped for -AtlasCapture
 # (the run already stopped at the versus screen).
 if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
-    $g5 = Save-Shot -ShotName "05-ice.png"
+    $g5 = Save-ScreenShot -ShotName "05-ice.png"
     Write-Host ("ice captured: " + $g5)
     Write-Host "Skating (left stick up) for a gameplay shot."
     Invoke-InputStage -Lines @("w 2000", "sleep 1000") -ExtraWaitSec 1
-    $g6 = Save-Shot -ShotName "06-ice-skate.png"
+    $g6 = Save-ScreenShot -ShotName "06-ice-skate.png"
     Write-Host ("ice skate captured: " + $g6)
     Write-Host "Opening the pause menu (Options)."
     Invoke-InputStage -Lines @("Return 150", "sleep 3000") -ExtraWaitSec 2
-    $g7 = Save-Shot -ShotName "07-pause-menu.png"
+    $g7 = Save-ScreenShot -ShotName "07-pause-menu.png"
     Write-Host ("pause menu captured: " + $g7)
     Write-Host "Resuming from the pause menu (Cross)."
     Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
-    $g8 = Save-Shot -ShotName "08-ice-resumed.png"
+    $g8 = Save-ScreenShot -ShotName "08-ice-resumed.png"
     Write-Host ("ice resumed captured: " + $g8)
     for ($p = 1; $p -le 3; $p++) {
         Write-Host ("Extended play interval " + $p + " of 3 (skating, then a shot).")
         Invoke-InputStage -Lines @("w 2000", "sleep 1000", "j 150", "sleep 4000") -ExtraWaitSec 2
-        $gp = Save-Shot -ShotName ("{0:D2}-ice-play-{1}.png" -f (8 + $p), $p)
+        $gp = Save-ScreenShot -ShotName ("{0:D2}-ice-play-{1}.png" -f (8 + $p), $p)
         Write-Host ("extended play captured: " + $gp)
     }
     Write-Host "Gameplay shots complete: 04-versus, 05/06/08/09/10/11 ice, 07 pause menu."

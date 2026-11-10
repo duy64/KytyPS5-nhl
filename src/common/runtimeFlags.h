@@ -26,7 +26,7 @@ struct FlagSet {
  bool srt_cfg_tape = true;
  bool srt_cfg_schedule = false;
  bool pm4_event_clean = true;
- bool pm4_write_data_fast = false;
+ bool pm4_write_data_fast = true;
  bool shader_clean_reads = false;
  bool srt_scalar_batch = false;
  bool resource_hash_filter = false;
@@ -47,13 +47,13 @@ struct FlagSet {
  bool guest_sync = true;
  bool guest_barrier_dedup = true;
  bool dispatch_args_guard = true;
- bool long_buffer_gc_age = false;
+ bool long_buffer_gc_age = true;
  bool rt_decode_memo = true;
  bool bda_batch = true;
- bool readback_queue = false;
- bool direct_eop_interrupts = false;
+ bool readback_queue = true;
+ bool direct_eop_interrupts = true;
  bool fault_coalesce = true;
- bool sparse_buffer_gc = false;
+ bool sparse_buffer_gc = true;
  bool write_cover_skip = false;
  bool aged_writeback = false;
  bool compute_resolve_ahead = false;

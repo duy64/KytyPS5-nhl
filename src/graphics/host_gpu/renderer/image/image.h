@@ -163,6 +163,8 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// A large linear image: the guest reads it back as soon as a label says it is drawn.
+	bool             download_still = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;

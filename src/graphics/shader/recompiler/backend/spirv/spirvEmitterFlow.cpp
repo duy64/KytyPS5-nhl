@@ -696,7 +696,7 @@ void EmitDataCacheInvalidate(EmitterState& state) {
 	// RDNA2 GL0/GL1 invalidation makes vector memory visible without a workgroup rendezvous.
 	state.builder.AddFunction(
 	    spv::OpMemoryBarrier, ConstantU32(state, spv::ScopeDevice),
-	    ConstantU32(state, spv::MemorySemanticsAcquireMask | spv::MemorySemanticsUniformMemoryMask |
+	    ConstantU32(state, spv::MemorySemanticsAcquireReleaseMask | spv::MemorySemanticsUniformMemoryMask |
 	                          spv::MemorySemanticsImageMemoryMask));
 }
 
@@ -717,6 +717,9 @@ void EmitBarrier(EmitterState& state) {
 	                                    : spv::MemorySemanticsAcquireReleaseMask | memory;
 	state.builder.AddFunction(spv::OpControlBarrier, ConstantU32(state, spv::ScopeWorkgroup),
 	                          ConstantU32(state, memory_scope), ConstantU32(state, semantics));
+	if (state.program.info.workgroup_buffer_sync) {
+		EmitDataCacheInvalidate(state);
+	}
 }
 
 uint32_t EmitLaneId(EmitterState& state) {

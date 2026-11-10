@@ -397,9 +397,21 @@ void LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	ConstantPropagationPass(program.blocks, program.wave_size);
 	RemoveIdentities(program);
 	EliminateDeadCode(program.blocks);
-	// Patch constant stores whose EXEC selects were not stripped would land in control points.
-	EXIT_NOT_IMPLEMENTED(options.stage == ShaderType::TessellationControl &&
-	                     tess.patch_size != 0u && patches == 0u);
+	// Experimental (NHL 27 v3): a tessellation-control shader that declares patch
+	// constants but yields zero counted patch accesses used to abort here. That
+	// crash blocked Be A Pro mode, so downgrade it to a loud warning and continue
+	// lowering instead. Trade-off, not a correctness fix: a patch store whose
+	// EXEC select was not stripped may still land in a control point, or TES
+	// patch inputs may be left unset, so watch tessellated surfaces in Be A Pro
+	// for visual errors. Rendering is not claimed correct in this case.
+	if (options.stage == ShaderType::TessellationControl && tess.patch_size != 0u &&
+	    patches == 0u) {
+		LOGF("WARNING: HS declares patch constants but no patch accesses were counted; "
+		     "continuing instead of aborting (experimental): patch_size=%u hs_stride=%u "
+		     "output_control_points=%u reads=%u writes=%u factors=%u patches=%u\n",
+		     tess.patch_size, tess.hs_stride, tess.output_control_points, reads, writes,
+		     factors, patches);
+	}
 	LOGF("%s tessellation lowering: reads=%u writes=%u factors=%u patches=%u\n",
 	     options.stage == ShaderType::Local                 ? "LS"
 	     : options.stage == ShaderType::TessellationControl ? "HS"

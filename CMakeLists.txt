@@ -1009,7 +1009,11 @@ elseif (KYTY_CLANG_CL AND KYTY_PGO STREQUAL "use")
 		message(FATAL_ERROR "KYTY_PGO=use needs KYTY_PGO_PROFILE=<merged .profdata>")
 	endif()
 	if (NOT CMAKE_CXX_COMPILER_VERSION VERSION_EQUAL KYTY_PGO_PROFILE_COMPILER)
-		message(WARNING "KYTY_PGO=use ignored: the profile was recorded with clang "
+		# Fail loudly instead of warning: a warning scrolls past and the build
+		# silently loses PGO, so a mismatched compiler must stop configure.
+		# Set KYTY_PGO_PROFILE_COMPILER to this compiler's version to proceed
+		# anyway, or record a fresh profile with KYTY_PGO=generate.
+		message(FATAL_ERROR "KYTY_PGO=use refused: the profile was recorded with clang "
 			"${KYTY_PGO_PROFILE_COMPILER}, this is ${CMAKE_CXX_COMPILER_VERSION}")
 	else()
 		# The hash changes every command line when the profile changes, so compiler caches

@@ -14,12 +14,15 @@
 #include <bit>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -105,6 +108,25 @@ std::vector<BufPending>  g_bufpending;
 std::string              g_buflog;
 std::set<std::pair<uint64_t, uint32_t>> g_seen_vol; // (address, draw seq)
 std::set<std::string>    g_seen_buf;
+
+struct CaptureJob {
+	std::vector<Pending>     pending;
+	std::vector<BufPending>  bufpending;
+	std::string              draws;
+	std::string              buflog;
+	std::string              dir;
+	uint32_t                 seq = 0;
+	uint32_t                 images = 0;
+	size_t                   bufreq_leftover = 0;
+};
+
+std::queue<CaptureJob>       g_jobs;
+std::mutex                   g_job_mutex;
+std::condition_variable      g_job_cv;
+std::thread                  g_worker;
+std::atomic<bool>            g_worker_stop {false};
+std::atomic<bool>            g_worker_started {false};
+std::atomic<bool>            g_worker_stopped {false};
 
 // KYTY_DBG_FRAME_DUMP_BUF_PS=<hex ps hash>[,...]|all selects the draws whose buffers/volumes are dumped.
 // Default: the NHL 27 tiled deferred lighting pixel shaders.
@@ -296,6 +318,10 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash,
 void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t, const char* label,
                     uint32_t seq);
 
+void EnsureWorker();
+void ProcessJob(CaptureJob& job);
+void WorkerLoop();
+
 // Records the GPU->host copies of the queued buffers and volumes. cmd must be outside a render pass.
 void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
 	if (g_bufreq.empty() && g_volreq.empty()) return;
@@ -346,16 +372,16 @@ void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
 
 std::string Hex(uint64_t v);
 
-void ProcessBuffers() {
-	for (auto& p : g_bufpending) {
+void ProcessBuffers(std::vector<BufPending>& bufpending, std::string& buflog, const std::string& dir) {
+	for (auto& p : bufpending) {
 		char line[512];
 		std::snprintf(line, sizeof(line), "== buffer %s of #%05u guest addr=0x%" PRIx64 " (dumped %" PRIu64 " bytes) ==\n",
 		              p.req.label.c_str(), p.req.seq, p.req.addr, p.req.size);
-		g_buflog += line;
+		buflog += line;
 		if (p.mapped != nullptr) {
 			vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
 			const auto* d = static_cast<const uint8_t*>(p.mapped);
-			g_buflog += WordsText(d, static_cast<size_t>(std::min<uint64_t>(p.req.size, 256)));
+			buflog += WordsText(d, static_cast<size_t>(std::min<uint64_t>(p.req.size, 256)));
 			{
 				size_t nz = 0;
 				const size_t nd = static_cast<size_t>(p.req.size / 4);
@@ -364,23 +390,23 @@ void ProcessBuffers() {
 					std::memcpy(&w, d + k * 4, 4);
 					nz += w != 0;
 				}
-				g_buflog += "    nonzero dwords: " + std::to_string(nz) + " / " + std::to_string(nd) + "\n";
+				buflog += "    nonzero dwords: " + std::to_string(nz) + " / " + std::to_string(nd) + "\n";
 			}
 			if (p.req.size <=(4ull << 20)) {
-				std::snprintf(line, sizeof(line), "%s/buf_%05u_%s_%s.bin", g_dir.c_str(), p.req.seq,
+				std::snprintf(line, sizeof(line), "%s/buf_%05u_%s_%s.bin", dir.c_str(), p.req.seq,
 				              p.req.label.c_str(), Hex(p.req.addr).c_str());
 				if (FILE* f = std::fopen(line, "wb")) {
 					std::fwrite(d, 1, static_cast<size_t>(p.req.size), f);
 					std::fclose(f);
-					g_buflog += std::string("    full dump -> ") + std::filesystem::path(line).filename().string() + "\n";
+					buflog += std::string("    full dump -> ") + std::filesystem::path(line).filename().string() + "\n";
 				}
 			} else {
-				g_buflog += "    (>=64KB: only the first 64KB copied, first 256 bytes shown)\n";
+				buflog += "    (>=64KB: only the first 64KB copied, first 256 bytes shown)\n";
 			}
 		}
 		vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
 	}
-	g_bufpending.clear();
+	bufpending.clear();
 }
 
 const char* TypeName(Prospero::ImageType t) {
@@ -688,7 +714,7 @@ std::string Hex(uint64_t v) {
 }
 
 // 3D volume: per-channel min/max/mean/nonzero over all voxels, a few voxel samples, z-slice PNGs.
-void ProcessVolume(Pending& p) {
+void ProcessVolume(Pending& p, const std::string& dir, std::string& log) {
 	const auto&    t   = p.target;
 	const uint32_t bpp = BytesPerPixel(t.format);
 	const size_t   sl  = static_cast<size_t>(t.w) * t.h * bpp;
@@ -703,7 +729,7 @@ void ProcessVolume(Pending& p) {
 			nz += w != 0;
 		}
 		char path[640];
-		std::snprintf(path, sizeof(path), "%s/img3d_%u_%u_%s.bin", g_dir.c_str(), p.seq, t.slot, Hex(t.addr).c_str());
+		std::snprintf(path, sizeof(path), "%s/img3d_%u_%u_%s.bin", dir.c_str(), p.seq, t.slot, Hex(t.addr).c_str());
 		std::string fname = "(write failed)";
 		if (FILE* f = std::fopen(path, "wb")) {
 			std::fwrite(d, 1, static_cast<size_t>(p.size), f);
@@ -721,10 +747,10 @@ void ProcessVolume(Pending& p) {
 			std::snprintf(wb, sizeof(wb), " %08x", w);
 			line += wb;
 		}
-		g_buflog += line + " -> " + fname + "\n";
+		log += line + " -> " + fname + "\n";
 	}
 	char base[512];
-	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%ux%u_%s", g_dir.c_str(), p.seq, p.label.c_str(),
+	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%ux%u_%s", dir.c_str(), p.seq, p.label.c_str(),
 	              Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str());
 	char line[1024];
 	double   sum[4] = {0, 0, 0, 0};
@@ -737,7 +763,7 @@ void ProcessVolume(Pending& p) {
 		if (!slices[z].ok) {
 			std::snprintf(line, sizeof(line), "VOL seq=%u addr=0x%s %ux%ux%u fmt=%s UNSUPPORTED\n", p.seq,
 			              Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str());
-			g_log += line;
+			log += line;
 			return;
 		}
 		const auto& d = slices[z];
@@ -767,14 +793,14 @@ void ProcessVolume(Pending& p) {
 	              mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], sum[0] / static_cast<double>(total),
 	              sum[1] / static_cast<double>(total), sum[2] / static_cast<double>(total),
 	              sum[3] / static_cast<double>(total));
-	g_log += line;
+	log += line;
 	const uint32_t cx = t.w / 2, cy = t.h / 2, cz = t.slices / 2;
 	const uint32_t probes[5][3] = {{0, 0, 0}, {cx, cy, cz}, {cx, cy, 0}, {t.w - 1, t.h - 1, t.slices - 1}, {cx / 2, cy / 2, cz / 2}};
 	for (const auto& pr : probes) {
 		std::snprintf(line, sizeof(line), "    voxel(%u,%u,%u) = %g %g %g %g\n", pr[0], pr[1], pr[2],
 		              at(pr[0], pr[1], pr[2], 0), at(pr[0], pr[1], pr[2], 1), at(pr[0], pr[1], pr[2], 2),
 		              at(pr[0], pr[1], pr[2], 3));
-		g_log += line;
+		log += line;
 	}
 	float scale = 1.0f;
 	{
@@ -790,10 +816,10 @@ void ProcessVolume(Pending& p) {
 		});
 		files += " " + std::filesystem::path(f).filename().string();
 	}
-	g_log += "    slices (auto-exposed, p99 lum scale " + std::to_string(scale) + "):" + files + "\n";
+	log += "    slices (auto-exposed, p99 lum scale " + std::to_string(scale) + "):" + files + "\n";
 }
 
-void ProcessOne(Pending& p) {
+void ProcessOne(Pending& p, const std::string& dir, std::string& log) {
 	if (p.mapped == nullptr) return;
 	vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
 	const auto& t = p.target;
@@ -803,33 +829,33 @@ void ProcessOne(Pending& p) {
 	}();
 	if (raw_enabled) {
 		char path[640];
-		std::snprintf(path, sizeof(path), "%s/%05u_%s_%s_%ux%ux%u_%s.raw", g_dir.c_str(),
+		std::snprintf(path, sizeof(path), "%s/%05u_%s_%s_%ux%ux%u_%s.raw", dir.c_str(),
 		    p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, t.slices,
 		    vk::to_string(t.format).c_str());
 		if (FILE* output = std::fopen(path, "wb")) {
 			const auto written = std::fwrite(p.mapped, 1, static_cast<size_t>(p.size), output);
 			std::fclose(output);
-			g_log += "RAW seq=" + std::to_string(p.seq) + " bytes=" + std::to_string(written) +
+			log += "RAW seq=" + std::to_string(p.seq) + " bytes=" + std::to_string(written) +
 			    " expected=" + std::to_string(p.size) + " mip=" + std::to_string(t.mip) +
 			    " layer=" + std::to_string(t.layer) + " -> " +
 			    std::filesystem::path(path).filename().string() + "\n";
 		} else {
-			g_log += "RAW seq=" + std::to_string(p.seq) + " file_open_failed\n";
+			log += "RAW seq=" + std::to_string(p.seq) + " file_open_failed\n";
 		}
 	}
 	if (t.slices > 1) {
-		ProcessVolume(p);
+		ProcessVolume(p, dir, log);
 		return;
 	}	Decoded d = Decode(t, static_cast<const uint8_t*>(p.mapped));
 	char base[512];
-	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%u_%s", g_dir.c_str(), p.seq, p.label.c_str(),
+	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%u_%s", dir.c_str(), p.seq, p.label.c_str(),
 	              Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
 	const std::string b = base;
 	char line[768];
 	if (!d.ok) {
 		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s UNSUPPORTED (not decoded)\n",
 		              p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
-		g_log += line;
+		log += line;
 		return;
 	}
 	// Stats over the used channels.
@@ -913,7 +939,7 @@ void ProcessOne(Pending& p) {
 	std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s min=%g max=%g ->%s\n", p.seq,
 	              p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str(), mn, mx,
 	              files.c_str());
-	g_log += line;
+	log += line;
 }
 
 void BarrierImage(const CommandRecorder& cmd, const Target& t, vk::ImageLayout from, vk::ImageLayout to,
@@ -1066,7 +1092,7 @@ void BeginCapture(CommandBuffer& buffer) {
 	buffer.EndRendering();
 	std::error_code ec;
 	const char* root_env = std::getenv("KYTY_DBG_FRAME_DUMP_DIR");
-	const std::string root = (root_env != nullptr && *root_env != '\0') ? root_env : "F:/emuf/captures";
+	const std::string root = (root_env != nullptr && *root_env != '\0') ? root_env : "captures";
 	for (;; g_frame++) {
 		const auto p = std::filesystem::path(root) / ("frame_" + std::to_string(g_frame));
 		if (!std::filesystem::exists(p, ec)) {
@@ -1101,45 +1127,121 @@ void FinishCapture(CommandBuffer& buffer) {
 	buffer.GetContext().GetCommandScheduler().FlushAndWait();
 	g_active.store(false, std::memory_order_relaxed);
 	g_capturing = false;
-	std::string draws = g_log;
+	CaptureJob job;
+	job.pending = std::move(g_pending);
+	job.bufpending = std::move(g_bufpending);
+	job.draws = std::move(g_log);
+	job.buflog = std::move(g_buflog);
+	job.dir = g_dir;
+	job.seq = g_seq;
+	job.images = static_cast<uint32_t>(job.pending.size());
+	job.bufreq_leftover = g_bufreq.size();
 	g_log.clear();
-	const uint32_t n = static_cast<uint32_t>(g_pending.size());
-	for (auto& p : g_pending) {
-		ProcessOne(p);
+	g_pending.clear();
+	g_bufpending.clear();
+	g_buflog.clear();
+	g_bufreq.clear();
+	g_targets.clear();
+	g_pending_bytes = 0;
+	g_images = 0;
+	EnsureWorker();
+	const uint32_t n_images = job.images;
+	const std::string dir = job.dir;
+	{
+		std::lock_guard lock(g_job_mutex);
+		g_jobs.push(std::move(job));
+		if (g_jobs.size() > 2) {
+			std::printf("NHL27FRAMEDUMP: warning: %zu downloads queued (oldest still running)\n",
+			            g_jobs.size());
+		}
+	}
+	g_job_cv.notify_one();
+	std::printf("NHL27FRAMEDUMP: frame captured, %u images queued for download -> %s\n",
+	            n_images, dir.c_str());
+	std::fflush(stdout);
+}
+
+void EnsureWorker() {
+	if (g_worker_started.exchange(true)) return;
+	g_worker = std::thread(WorkerLoop);
+}
+
+void ProcessJob(CaptureJob& job) {
+	std::string log;
+	for (size_t i = 0; i < job.pending.size(); i++) {
+		if (g_worker_stop.load()) {
+			for (size_t j = i; j < job.pending.size(); j++) {
+				auto& p = job.pending[j];
+				vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
+			}
+			for (auto& b : job.bufpending) {
+				vmaDestroyBuffer(b.graphics->allocator, static_cast<VkBuffer>(b.buffer), b.alloc);
+			}
+			job.pending.clear();
+			job.bufpending.clear();
+			std::printf("NHL27FRAMEDUMP: download abandoned (game exiting) -> %s\n", job.dir.c_str());
+			std::fflush(stdout);
+			return;
+		}
+		auto& p = job.pending[i];
+		ProcessOne(p, job.dir, log);
 		vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
 	}
-	g_pending.clear();
-	g_targets.clear();
-	ProcessBuffers();
-	if (!g_bufreq.empty()) {
-		g_buflog += "NOTE: " + std::to_string(g_bufreq.size()) + " buffer requests were never flushed\n";
+	job.pending.clear();
+	ProcessBuffers(job.bufpending, job.buflog, job.dir);
+	if (job.bufreq_leftover != 0) {
+		job.buflog += "NOTE: " + std::to_string(job.bufreq_leftover) +
+		               " buffer requests were never flushed\n";
 	}
-	g_bufreq.clear();
-	if (!g_buflog.empty()) {
-		if (FILE* f = std::fopen((g_dir + "/buffers.txt").c_str(), "wb")) {
-			std::fwrite(g_buflog.data(), 1, g_buflog.size(), f);
+	if (!job.buflog.empty()) {
+		if (FILE* f = std::fopen((job.dir + "/buffers.txt").c_str(), "wb")) {
+			std::fwrite(job.buflog.data(), 1, job.buflog.size(), f);
 			std::fclose(f);
 		}
-		g_buflog.clear();
 	}
 	std::string out = "# KytyPS5 frame dump (KYTY_DBG_FRAME_DUMP). Sequence = draw/dispatch order in the frame.\n"
 	                  "# Image files are named <seq>_<rt<slot>|depth|st<slot>>_<guest addr>_<WxH>_<vk format>.png\n"
 	                  "# HDR formats: <name>.png = clamped 0..1 (linear), <name>_exp.png = auto-exposed (p99 luminance) + sRGB.\n\n";
-	out += draws;
+	out += job.draws;
 	out += "\n# ---- images ----\n";
-	out += g_log;
-	if (FILE* f = std::fopen((g_dir + "/frame.txt").c_str(), "wb")) {
+	out += log;
+	if (FILE* f = std::fopen((job.dir + "/frame.txt").c_str(), "wb")) {
 		std::fwrite(out.data(), 1, out.size(), f);
 		std::fclose(f);
 	} else {
-		std::printf("NHL27FRAMEDUMP: cannot write %s/frame.txt: errno %d\n", g_dir.c_str(), errno);
+		std::printf("NHL27FRAMEDUMP: cannot write %s/frame.txt: errno %d\n", job.dir.c_str(), errno);
 	}
-	std::printf("NHL27FRAMEDUMP: done, %u draws/dispatches, %u images -> %s\n", g_seq, n, g_dir.c_str());
+	std::printf("NHL27FRAMEDUMP: done, %u draws/dispatches, %u images -> %s\n", job.seq, job.images,
+	            job.dir.c_str());
 	std::fflush(stdout);
-	g_log.clear();
+}
+
+void WorkerLoop() {
+	for (;;) {
+		CaptureJob job;
+		{
+			std::unique_lock lock(g_job_mutex);
+			g_job_cv.wait(lock, [] { return !g_jobs.empty() || g_worker_stop.load(); });
+			if (g_jobs.empty()) return;
+			job = std::move(g_jobs.front());
+			g_jobs.pop();
+		}
+		ProcessJob(job);
+	}
 }
 
 } // namespace
+
+void Shutdown() {
+	if (!g_worker_started.load()) return;
+	if (g_worker_stopped.exchange(true)) return;
+	{
+		std::lock_guard lock(g_job_mutex);
+		g_worker_stop.store(true);
+	}
+	g_job_cv.notify_one();
+	if (g_worker.joinable()) g_worker.join();
+}
 
 bool Enabled() noexcept {
 	static const bool enabled = [] {

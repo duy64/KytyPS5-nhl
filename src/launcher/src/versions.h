@@ -18,6 +18,7 @@ struct ReleaseInfo
 	std::string zip_url;  // the ...-Windows-x64.zip asset
 	std::string api_url;  // the same asset through the API (takes the token: private repos)
 	uint64_t    zip_size = 0;
+	std::string published; // published_at from GitHub, e.g. 2026-11-04T20:12:53Z; breaks same-day date ties
 };
 
 // An emulator build on disk.
@@ -75,5 +76,12 @@ using ProgressFn = std::function<void(uint64_t done, uint64_t total)>;
 std::string install_release(const ReleaseInfo& r, const std::string& versions_dir, const ProgressFn& progress, std::string* error,
                             const std::atomic<bool>* cancel = nullptr);
 
+
+// Downloads the release zip and unpacks it into versions_dir/<folder>/.kyty-update-pending/payload,
+// the staging layout kyty_updater --install expects: the updater swaps those files into the folder
+// after the launcher exits, which is the only way to update the build the launcher itself runs from
+// (Windows cannot replace a running program). Returns the payload path, or "" with *error set.
+std::string stage_release_for_updater(const ReleaseInfo& r, const std::string& versions_dir, const ProgressFn& progress, std::string* error,
+							const std::atomic<bool>* cancel = nullptr);
 
 } // namespace kyty_launcher

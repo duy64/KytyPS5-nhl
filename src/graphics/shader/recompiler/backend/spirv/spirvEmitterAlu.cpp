@@ -486,6 +486,28 @@ static uint32_t FlushInputDenorm(EmitterState& state, uint32_t value) {
 
 uint32_t EmitFPRecip32(EmitterState& state, uint32_t arg0) {
 	const auto source = FlushInputDenorm(state, arg0);
+	// ea94 only: clamp a zero/tiny divisor to the smallest normal float (sign-preserving)
+	// so 1/x is a large FINITE value instead of +inf. In the menu ea94's scene buffer
+	// (buf[11]) is empty, so the divisor is ~0; +inf then poisons st2 through a running
+	// max and corrupts the versus background. Returning 0 (the earlier guard) is not an
+	// option: the reciprocal result is load-bearing downstream and 0 breaks the game
+	// (players disappear, auto-test stalls). A large finite value keeps the running max
+	// finite without blanking the output. Other shaders keep the plain 1/x.
+	if (state.program.shader_hash == 0xea94f09b2981eb43ULL) {
+		// Smallest normal f32 magnitude: bits 0x00800000 = 1.17549435e-38.
+		const auto bits = EmitBitcastF32ToU32(state, source);
+		const auto magnitude = EmitAndConstant(state, bits, 0x7fffffffu);
+		const auto is_tiny = EmitCompareU32Constant(state, spv::OpULessThan, magnitude,
+		                                            0x00800000u);
+		const auto clamped_bits = Select(
+		    state, TypeU32(state), is_tiny,
+		    EmitOrU32(state, EmitAndConstant(state, bits, 0x80000000u),
+		              ConstantU32(state, 0x00800000u)),
+		    bits);
+		const auto clamped = EmitBitcastU32ToF32(state, clamped_bits);
+		return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u),
+		              clamped);
+	}
 	return Binary(state, spv::OpFDiv, TypeF32(state), ConstantF32(state, 0x3f800000u), source);
 }
 

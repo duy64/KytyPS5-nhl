@@ -29,6 +29,26 @@ bool WaitForMask(uint64_t expected) {
 
 int main() {
 	using namespace Common::Experiments;
+	// Every experiment bit must have a unique value: six names shared bits
+	// 38-43 with other names before the 2026-10-27 fix, so setting one
+	// silently flipped the other. kAllBits lives in experiments.h (which also
+	// static_asserts this at compile time); bump kExpectedBitCount when a bit
+	// is added, and add it to kAllBits, or this test fails.
+	constexpr size_t kExpectedBitCount = 58;
+	if (sizeof(kAllBits) / sizeof(*kAllBits) != kExpectedBitCount) {
+		std::fprintf(stderr, "kAllBits has %zu entries, expected %zu: a bit was added to the enum without updating it\n",
+		             sizeof(kAllBits) / sizeof(*kAllBits), kExpectedBitCount);
+		return 1;
+	}
+	for (size_t i = 0; i < sizeof(kAllBits) / sizeof(*kAllBits); ++i) {
+		for (size_t j = i + 1; j < sizeof(kAllBits) / sizeof(*kAllBits); ++j) {
+			if (kAllBits[i] == kAllBits[j]) {
+				std::fprintf(stderr, "Experiment bits %zu and %zu share value %llu\n", i, j,
+				             static_cast<unsigned long long>(kAllBits[i]));
+				return 1;
+			}
+		}
+	}
 	const auto file = std::filesystem::temp_directory_path() /
 	                  ("kyty-experiments-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
 	SetEnvironment("KYTY_EXPERIMENT_FILE", file.string().c_str());

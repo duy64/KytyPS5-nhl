@@ -373,6 +373,10 @@ static std::vector<ReleaseInfo> FetchFromGitHub(const std::string& repo, HttpVal
 						r.date = pub->second.s.substr(0, 10);
 					}
 				}
+				if (auto pub = rel.o.find("published_at"); pub != rel.o.end())
+				{
+					r.published = pub->second.s;
+				}
 				r.folder = repo == kDefaultRepo ? r.tag : repo.substr(repo.find('/') + 1) + "-" + r.tag;
 				out.push_back(r);
 			}
@@ -382,8 +386,12 @@ static std::vector<ReleaseInfo> FetchFromGitHub(const std::string& repo, HttpVal
 			break;
 		}
 	}
-	// The API orders by creation; sort by tag date so the newest build is first.
-	std::stable_sort(out.begin(), out.end(), [](const ReleaseInfo& a, const ReleaseInfo& b) { return a.date > b.date; });
+	// Sort by tag date so the newest build is first; same-day builds tie on the date, so break
+		// the tie by publish time (newest first) — the API's order does not put the newest
+		// same-day build first.
+	std::stable_sort(out.begin(), out.end(), [](const ReleaseInfo& a, const ReleaseInfo& b) {
+		return a.date != b.date ? a.date > b.date : a.published > b.published;
+	});
 	return out;
 }
 
@@ -447,7 +455,7 @@ bool LoadCache(const fs::path& file, CachedReleases& c)
 	while (std::getline(f, line))
 	{
 		auto parts = SplitTabs(line);
-		if (parts.size() != 7)
+		if (parts.size() != 7 && parts.size() != 8)
 		{
 			return false;
 		}
@@ -459,6 +467,7 @@ bool LoadCache(const fs::path& file, CachedReleases& c)
 		r.zip_url  = parts[4];
 		r.api_url  = parts[5];
 		r.zip_size = std::strtoull(parts[6].c_str(), nullptr, 10);
+		r.published = parts.size() == 8 ? parts[7] : std::string();
 		c.list.push_back(std::move(r));
 	}
 	return !c.list.empty();
@@ -476,7 +485,7 @@ void SaveCache(const fs::path& file, const CachedReleases& c)
 		f << "etag\t" << c.etag << "\n" << "fetched\t" << c.fetched << "\n";
 		for (const auto& r: c.list)
 		{
-			f << r.tag << '\t' << r.folder << '\t' << r.date << '\t' << r.codename << '\t' << r.zip_url << '\t' << r.api_url << '\t' << r.zip_size << "\n";
+			f << r.tag << '\t' << r.folder << '\t' << r.date << '\t' << r.codename << '\t' << r.zip_url << '\t' << r.api_url << '\t' << r.zip_size << '\t' << r.published << "\n";
 		}
 		if (!f)
 		{
@@ -819,6 +828,82 @@ std::string install_release(const ReleaseInfo& r, const std::string& versions_di
 #endif
 	return exe;
 }
+
+std::string stage_release_for_updater(const ReleaseInfo& r, const std::string& versions_dir, const ProgressFn& progress, std::string* error,
+				const std::atomic<bool>* cancel)
+{
+	std::error_code ec;
+	const fs::path root = utf8_path(versions_dir);
+	const std::string name = r.folder.empty()? r.tag: r.folder;
+	const fs::path dir = root / utf8_path(name);
+	// The updater's cleanup expects the staging folder inside the installation, named.kyty-update-*,
+	// with the build in a `payload` folder.
+	const fs::path staging = dir / utf8_path(".kyty-update-pending");
+	const fs::path payload = staging / utf8_path("payload");
+	auto cancelled = [&] { return cancel!= nullptr && cancel->load();};
+
+	fs::remove_all(staging, ec);
+	fs::create_directories(payload, ec);
+	if (ec)
+{
+		*error = "Could not create " + path_utf8(payload);
+		return {};
+}
+	auto fail = [&](const std::string& why) {
+		*error = why;
+		fs::remove_all(staging, ec);
+		return std::string();
+	};
+
+	fs::path zip = payload / (std::string("download") + kArchiveExt);
+{
+		std::ofstream f(zip, std::ios::binary | std::ios::trunc);
+		uint64_t total = r.zip_size;
+		uint64_t done = 0;
+		std::string http_error;
+		bool via_api = false;
+		bool ok = f && GetReleaseFile(
+			r,
+			[&](const char* p, size_t n)
+{
+				if (cancelled())
+{
+					return false;
+}
+				f.write(p, static_cast<std::streamsize>(n));
+				done += n;
+				progress(done, total);
+				return static_cast<bool>(f);
+},
+			&total, &http_error, std::string(), nullptr, &via_api);
+		f.close();
+		if (!ok)
+{
+			return fail(cancelled()? "Cancelled": http_error.empty()? "Could not write " + path_utf8(zip): http_error);
+}
+}
+	if (cancelled())
+{
+		return fail("Cancelled");
+}
+	std::string unzip_error;
+	if (!Unzip(zip, payload, &unzip_error))
+{
+		return fail(unzip_error);
+}
+	fs::remove(zip, ec);
+{
+		// Which release the staged build is, for the installed check and the date after the swap.
+		std::ofstream marker(payload / "release.txt", std::ios::trunc);
+		marker << r.tag << "\n";
+}
+	if (FindExe(payload).empty())
+{
+		return fail(std::string("No ") + kExeName + " in the release archive");
+}
+	return path_utf8(payload);
+}
+
 
 namespace {
 

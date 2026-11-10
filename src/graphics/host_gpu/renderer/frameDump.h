@@ -39,6 +39,9 @@ extern std::atomic<bool> g_active;
 // F2 in the game window: capture the next complete guest frame.
 void Request();
 
+// Stops the FrameDump worker thread, abandoning any in-flight download. No-op if never started.
+void Shutdown();
+
 // Writes 8-bit RGB pixels (rows top to bottom) to a PNG file.
 bool WriteRgbPng(const std::string& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgb);
 

@@ -1,7 +1,6 @@
 name: Build and Release KytyPS5
 
 on:
-  # Manual builds from nhl27-eadb only (no push/PR triggers).
   workflow_dispatch:
 
 concurrency:
@@ -25,7 +24,7 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}-f2dump" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Build KytyPS5 (Windows)
@@ -92,7 +91,11 @@ jobs:
             -DCMAKE_C_COMPILER=clang-cl ^
             -DCMAKE_CXX_COMPILER=clang-cl ^
             -DCMAKE_C_COMPILER_LAUNCHER=sccache ^
-            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache
+            -DCMAKE_CXX_COMPILER_LAUNCHER=sccache ^
+            -DKYTY_ARCH_AVX2=ON ^
+            -DKYTY_PGO=use ^
+            -DKYTY_PGO_PROFILE=%CD%/tools/pgo/nhl27-clang19.profdata ^
+            -DKYTY_PGO_PROFILE_COMPILER=19.1.5
 
       - name: Build
         shell: cmd
@@ -408,7 +411,7 @@ jobs:
     name: Release KytyPS5
     if: >-
       always() &&
-      github.event_name == 'workflow_dispatch' &&
+      (github.event_name == 'workflow_dispatch' || github.event_name == 'push') &&
       needs.linux.result == 'success'
     needs: [metadata, windows, macos, linux]
     runs-on: ubuntu-latest

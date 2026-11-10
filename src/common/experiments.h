@@ -32,9 +32,9 @@ enum Bit : uint64_t {
 	CpBackingReads     = 1u << 4u, // KYTY_CP_BACKING_READS (default on; command-processor reads of read-protected pages go through the execution thread and the backing store instead of faulting; was SrtJit, now env-only KYTY_SRT_JIT)
 	FaultPageDirect    = 1u << 5u, // KYTY_FAULT_PAGE_DIRECT (default on; direct SRT reads and read-ahead checks of pages that faulted before use the backing)
 	WideWriteDownloads = 1u << 6u, // KYTY_WIDE_WRITE_DOWNLOADS (default on; a guest store into a GPU-written page downloads the GPU-written bytes of its 64 KiB window at once; was FalseShareReads, now env-only KYTY_FALSE_SHARE_READS)
-	ProgramLockSplit   = uint64_t {1} << 38u, // KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock)
-	FillPatterns       = uint64_t {1} << 39u, // KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback)
-	UnmapBufferWait    = uint64_t {1} << 40u, // KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU)
+	ProgramLockSplit   = uint64_t {1} << 38u, // KYTY_PROGRAM_LOCK_SPLIT (default off; the resolve thread walks shader tables without holding the program lock; was aliased to AbPending on this bit before the 2026-10-27 fix)
+	FillPatterns       = uint64_t {1} << 39u, // KYTY_FILL_PATTERNS (default off; a proven compute fill of a repeating 2-4 word pattern is remembered like a uniform fill, so color-clear decoding needs no readback; was aliased to ExecBranches on this bit before the 2026-10-27 fix, so it ran in every default build despite this comment)
+	UnmapBufferWait    = uint64_t {1} << 40u, // KYTY_UNMAP_BUFFER_WAIT (default off; an unmap of GPU-written buffer bytes waits only for their writers, not for the whole GPU; was aliased to ExecBranchMemory on this bit before the 2026-10-27 fix, so it ran in every default build despite this comment)
 	SrtBatchReads      = 1u << 7u, // KYTY_SRT_BATCH_READS (default on; also read by the program cache)
 	DirectSrtReads     = 1u << 10u, // KYTY_DIRECT_SRT_READS (default on; SRT reads without the IR walk)
 	GpuConditionsBothPaths = 1u << 13u, // KYTY_GPU_CONDITIONS_BOTH_PATHS (default on; a resource walk takes both paths of a branch on GPU-written bytes instead of waiting for them; was ClockWaitAhead, now env-only)
@@ -47,35 +47,36 @@ enum Bit : uint64_t {
 	ImageLookupHint    = 1u << 12u, // KYTY_IMAGE_LOOKUP_HINT (default on; skip the region scan for known images)
 	WideFaultWindows     = 1u << 15u, // KYTY_WIDE_FAULT_WINDOWS (default on; a CPU write fault releases KYTY_FAULT_COALESCE_PAGES pages, else 4; was AdaptiveResourceMemo)
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (default on; strict evaluator reuses direct SRT words)
-	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (no consumer: the GPU pipeline's recording thread submits)
-	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (default off; CPU stores next to few GPU-written bytes do not wait)
+	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (default off; SubmitSplitRefresh in graphicsRun.cpp reads it to pick the submit-split thresholds; the recording thread still submits)
+	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (default on; CPU stores next to few GPU-written bytes do not wait)
 	NativeFp16           = 1u << 23u, // KYTY_NATIVE_FP16 (default off; f16vec2 math for packed f16 ops, needs shaderFloat16)
-	FaultPageReads       = 1u << 24u, // KYTY_FAULT_PAGE_READS (default off; SRT reads of pages that faulted before use the backing)
-	GpuColorClear        = 1u << 26u, // KYTY_GPU_COLOR_CLEAR (default off; fast-clear checks of GPU-written metadata on the GPU)
+	FaultPageReads       = 1u << 24u, // KYTY_FAULT_PAGE_READS (default on; SRT reads of pages that faulted before use the backing)
+	GpuColorClear        = 1u << 26u, // KYTY_GPU_COLOR_CLEAR (default on; fast-clear checks of GPU-written metadata on the GPU)
 	ExecSelects          = 1u << 25u, // KYTY_EXEC_SELECTS (default off; drop EXEC-mask selects nobody observes, part of shader keys)
 	PooledBdaBuffers     = 1u << 27u, // KYTY_POOLED_BDA_BUFFERS (default off; small device-address buffers share VMA blocks)
-	AsyncGuestReads      = 1u << 28u, // KYTY_ASYNC_GUEST_READS (default off; a guest thread waits for its own readback)
-	BdaDirtyRegions      = 1u << 29u, // KYTY_BDA_DIRTY_REGIONS (default off; BDA preparation syncs only CPU-written regions)
+	AsyncGuestReads      = 1u << 28u, // KYTY_ASYNC_GUEST_READS (default on; a guest thread waits for its own readback)
+	BdaDirtyRegions      = 1u << 29u, // KYTY_BDA_DIRTY_REGIONS (default on; BDA preparation syncs only CPU-written regions)
 	LdsLaneSlots         = 1u << 30u, // KYTY_LDS_LANE_SLOTS (default on; per-lane LDS slots of non-compute stages as a small array, part of shader keys)
 	ProtectSharedLock    = uint64_t {1} << 32u, // KYTY_PROTECT_SHARED_LOCK (default off; page-tracking protections of different pages run in parallel)
 	ClockWaitPredict     = uint64_t {1} << 33u, // KYTY_CLOCK_WAIT_PREDICT (default off; WAIT_REG_MEM on a pending clock write need not wait for it)
 	FalseShareAnyThread  = uint64_t {1} << 34u, // KYTY_FALSE_SHARE_ANY_THREAD (default on; CP and guest reads of clean bytes on GPU-dirty pages use the backing)
 	CpCleanRegReads      = uint64_t {1} << 35u, // KYTY_CP_CLEAN_REG_READS (default off; the command processor reads clean indirect register tables from the backing)
 	CpSkipIdleSpin       = uint64_t {1} << 36u, // KYTY_CP_SKIP_IDLE_SPIN (default off; work queued while the command processor waited for the execution thread starts at once, not after a 2 ms spin)
-	ExecBranches         = uint64_t {1} << 39u, // KYTY_EXEC_BRANCHES (default on; runs of lane-wise instructions under one partial EXEC run in a divergent branch instead of selecting each written VGPR per lane; part of shader keys)
-	ExecBranchMemory     = uint64_t {1} << 40u, // KYTY_EXEC_BRANCH_MEMORY (default on; ExecBranches runs also take memory operations under their EXEC; part of shader keys)
-	DispatchResolver     = uint64_t {1} << 41u, // KYTY_DISPATCH_RESOLVER (default off; a second resolve thread resolves dispatches ahead while the first resolves draws)
-	BdaLoadGroups        = uint64_t {1} << 42u, // KYTY_BDA_LOAD_GROUPS (default off; consecutive DWORD loads through an address share one page lookup; part of shader keys)
-	DrawResolver         = uint64_t {1} << 43u, // KYTY_DRAW_RESOLVER (default on since 2026-10-22; earlier off for 2 guest job-thread crashes in 8 boots, since fixed causes; a second resolve thread resolves about half of the draws ahead, by shader addresses)
+	ExecBranches         = uint64_t {1} << 53u, // KYTY_EXEC_BRANCHES (default on; runs of lane-wise instructions under one partial EXEC run in a divergent branch instead of selecting each written VGPR per lane; part of shader keys; moved from bit 39 in the 2026-10-27 collision fix, was aliased to FillPatterns)
+	ExecBranchMemory     = uint64_t {1} << 54u, // KYTY_EXEC_BRANCH_MEMORY (default on; ExecBranches runs also take memory operations under their EXEC; part of shader keys; moved from bit 40 in the 2026-10-27 collision fix, was aliased to UnmapBufferWait)
+	DispatchResolver     = uint64_t {1} << 41u, // KYTY_DISPATCH_RESOLVER (default off; a second resolve thread resolves dispatches ahead while the first resolves draws; was aliased to DirectGpuReads on this bit before the 2026-10-27 fix)
+	BdaLoadGroups        = uint64_t {1} << 42u, // KYTY_BDA_LOAD_GROUPS (default off; consecutive DWORD loads through an address share one page lookup; part of shader keys; was aliased to AsyncReadback on this bit before the 2026-10-27 fix)
+	DrawResolver         = uint64_t {1} << 43u, // KYTY_DRAW_RESOLVER (default on since 2026-10-22; earlier off for 2 guest job-thread crashes in 8 boots, since fixed causes; a second resolve thread resolves about half of the draws ahead, by shader addresses; was aliased to SpeculateStrict on this bit before the 2026-10-27 fix)
 	SpeculateDirtyReads  = uint64_t {1} << 37u, // KYTY_SPECULATE_DIRTY_READS (default off; shader-table reads of GPU-written bytes the GPU keeps rewriting unchanged use the backing, checked later)
-	DirectGpuReads       = uint64_t {1} << 41u, // KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup)
-	AsyncReadback        = uint64_t {1} << 42u, // KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread)
-	SpeculateStrict      = uint64_t {1} << 43u, // KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once)
+	DirectGpuReads       = uint64_t {1} << 55u, // KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup; moved from bit 41 in the 2026-10-27 collision fix, was aliased to DispatchResolver)
+	AsyncReadback        = uint64_t {1} << 56u, // KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread; moved from bit 42 in the 2026-10-27 collision fix, was aliased to BdaLoadGroups)
+	SpeculateStrict      = uint64_t {1} << 57u, // KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once; moved from bit 43 in the 2026-10-27 collision fix, was aliased to DrawResolver)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 	// A/B only, like AbLegacy, for the changes made after it was taken (AbLegacy also turns off
 	// the earlier changes it still selects).
-	AbPending = uint64_t {1} << 38u,
+	// Moved from bit 38 in the 2026-10-27 collision fix (was aliased to ProgramLockSplit).
+	AbPending = uint64_t {1} << 52u,
 	// More A/B-only bits, so that one boot can compare several pending changes (KytyPS5-toolsbmulti.sh).
 	AbPending2 = uint64_t {1} << 44u,
 	AbPending3 = uint64_t {1} << 45u,
@@ -96,6 +97,41 @@ enum Bit : uint64_t {
 	// 16-bit lanes as halves of an f16vec2 instead of masking them out of U32s; part of shader keys.
 	F16LaneViews = uint64_t {1} << 51u,
 };
+
+// Every Bit value must be unique. Six names shared bits 38-43 with other names
+// (ProgramLockSplit/AbPending, FillPatterns/ExecBranches, UnmapBufferWait/
+// ExecBranchMemory, DispatchResolver/DirectGpuReads, BdaLoadGroups/AsyncReadback,
+// DrawResolver/SpeculateStrict), so setting one silently flipped the other —
+// FillPatterns and UnmapBufferWait ran in every default build although their
+// comments said "default off". The second name of each pair moved to bits 52-57
+// in the 2026-10-27 fix. Add every new bit to kAllBits as well as to the enum:
+// the static_assert below fails the build if two names share a bit again, and
+// tests/ExperimentsTests.cpp checks the same list (including its size) at
+// runtime, so adding a bit without updating the list fails the test.
+inline constexpr Bit kAllBits[] = {
+	EarlySubmitWriters, SkipRedundantBinds, ReadbackCompute, CpuCopyForward,
+	RobustLoads, FusedMad, CpBackingReads, FaultPageDirect, WideWriteDownloads,
+	ProgramLockSplit, FillPatterns, UnmapBufferWait, SrtBatchReads, DirectSrtReads,
+	GpuConditionsBothPaths, ComputeUnlocked, AheadUnlocked, BackingLookupCache,
+	DispatchAhead, BackingReadMru, NativeMinMax, ImageLookupHint, WideFaultWindows,
+	CleanFromDirect, AsyncSubmit, LazySharedWrites, NativeFp16, FaultPageReads,
+	GpuColorClear, ExecSelects, PooledBdaBuffers, AsyncGuestReads, BdaDirtyRegions,
+	LdsLaneSlots, ProtectSharedLock, ClockWaitPredict, FalseShareAnyThread,
+	CpCleanRegReads, CpSkipIdleSpin, ExecBranches, ExecBranchMemory,
+	DispatchResolver, BdaLoadGroups, DrawResolver, SpeculateDirtyReads,
+	DirectGpuReads, AsyncReadback, SpeculateStrict, AbLegacy, AbPending,
+	AbPending2, AbPending3, AbPending4, GuestOffStageCores, GuestOffCopyCore,
+	GuestOffCpCores, ExecBranchContinue, F16LaneViews,
+};
+inline constexpr bool AllBitValuesUnique() {
+	for (size_t i = 0; i < sizeof(kAllBits) / sizeof(*kAllBits); ++i) {
+		for (size_t j = i + 1; j < sizeof(kAllBits) / sizeof(*kAllBits); ++j) {
+			if (kAllBits[i] == kAllBits[j]) return false;
+		}
+	}
+	return true;
+}
+static_assert(AllBitValuesUnique(), "experiment Bit values must be unique: two names share a bit");
 
 namespace Detail {
 // The live mask; bit 63 stays set until the first use reads the environment. Enabled() runs

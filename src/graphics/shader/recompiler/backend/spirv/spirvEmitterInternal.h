@@ -636,6 +636,28 @@ uint32_t EmitValueOrZeroIfCondition(EmitterState& state, uint32_t condition, Fn&
 template <typename Fn>
 uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind kind, Fn&& desired) {
 	const auto scope     = kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
+// Synced compute shaders build cross-workgroup structures through this
+	// compare-exchange loop. Relaxed atomics order nothing across workgroups, so give
+	// the load acquire semantics and the exchange acquire-release for the memory this
+	// resource lives in.
+	const auto memory = [&] {
+		switch (kind) {
+			case IR::ResourceKind::Lds:
+				return state.lds_storage_class == spv::StorageClassStorageBuffer
+					           ? spv::MemorySemanticsUniformMemoryMask
+					           : spv::MemorySemanticsWorkgroupMemoryMask;
+			case IR::ResourceKind::Image: return spv::MemorySemanticsImageMemoryMask;
+			default: return spv::MemorySemanticsUniformMemoryMask;
+		}
+	}();
+	const auto acquire_release =
+	    state.program.info.workgroup_buffer_sync
+	        ? spv::MemorySemanticsAcquireReleaseMask | memory
+	        : spv::MemorySemanticsMaskNone;
+	// The failed-compare semantics must not include Release.
+	const auto acquire = state.program.info.workgroup_buffer_sync
+	                         ? spv::MemorySemanticsAcquireMask | memory
+	                         : spv::MemorySemanticsMaskNone;
 	const auto preheader = state.builder.AllocateId();
 	const auto header    = state.builder.AllocateId();
 	const auto cont      = state.builder.AllocateId();
@@ -647,7 +669,7 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitLabel(state, preheader);
 	state.builder.AddFunction(spv::OpAtomicLoad, TypeU32(state), initial, pointer,
 	                          ConstantU32(state, scope),
-	                          ConstantU32(state, spv::MemorySemanticsMaskNone));
+	                          ConstantU32(state, acquire));
 	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, header);
 	state.builder.AddFunction(spv::OpPhi, TypeU32(state), observed, initial, preheader, exchanged,
@@ -655,8 +677,8 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	const auto next = desired(observed);
 	state.builder.AddFunction(spv::OpAtomicCompareExchange, TypeU32(state), exchanged, pointer,
 	                          ConstantU32(state, scope),
-	                          ConstantU32(state, spv::MemorySemanticsMaskNone),
-	                          ConstantU32(state, spv::MemorySemanticsMaskNone), next, observed);
+	                          ConstantU32(state, acquire_release),
+	                          ConstantU32(state, acquire), next, observed);
 	const auto success = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), success, exchanged, observed);
 	state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);

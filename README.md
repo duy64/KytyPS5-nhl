@@ -1,32 +1,37 @@
 # KytyPS5-nhl
 
-A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused on getting **EA Sports NHL 27** (PPSA34063, v01.003.001) running well. NHL 26 is untested on this fork. The working branch is `cold`.
+A private working fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5) focused on getting **EA Sports NHL 27**
+(PPSA34063, v01.003.001) and **NHL 26** (PPSA26785) running well. The working branch is `nhl26`.
 
 > [!IMPORTANT]
 > Not affiliated with Sony Interactive Entertainment, PlayStation or Electronic Arts. No game files or
 > system software are distributed. Use only game files you have obtained legally.
 
-## Build lines
-- `-main`: clean playable build for daily play
-- `-texcopy`: test build with the partial-overlap copy fix (v3); crash fix real, ice-glitch rate about the same as main
-- `-launchupd`: launcher fix for updating the build you are running
-- `-tailfix`: parked Nov 1 — tail-safe kill-switch diagnostic for the one-time black-crowd event (Be A Pro team-select crash on that line unresolved)
-- `-ringbuf`: in flight — ring-buffer frame recorder (press F2 after a glitch to dump the ring)
-- `-depthcol`: in flight — depth-as-color copy test for the ice glitch
-Retired Nov 1: the tester diagnostic lines (-crumb, -modlist, -texdiag, -texfix, -texmerge, -readback, -rebind) — their releases were deleted and no tester builds are made from this fork anymore; -indirect was cancelled and never released.
+## Status (2026-10-10)
 
-*Development on this fork is AI-assisted; all changes are reviewed and tested in-game by the maintainer before release.*
+| | NHL 27 | NHL 26 |
+|---|---|---|
+| Boots to menus | Yes | Yes |
+| Franchise / Play Now menus | Yes | Yes |
+| Loads into a match | Yes | Yes (slow) |
+| Player / scene lighting | **Fixed** (front-face encoding) | **Fixed** (same fix) |
+| Commentary audio | Working (Opus multistream fix); some lines still garbled | – |
+| Save / profile | Working | – |
 
-## Status (2026-11-01)
+## Performance
 
-| | NHL 27 |
-|---|---|
-| Boots to menus | Yes |
-| Franchise / Play Now menus | Yes |
-| Loads into a match | Yes |
-| Player / scene lighting | **Fixed** (front-face encoding) |
-| Commentary audio | Working (Opus multistream fix); some lines still garbled |
-| Save / profile | Working |
+FPS ranges in normal play mode (no profiler or debug logging), measured after the lighting fix.
+
+| Scene | RX 6800 XT, Ryzen 5 5600 32 GB DDR4-3200| RX 9060 XT, Ryzen 5 9600x|
+|---|---|---|
+| Main menu (game caps at 30) | 26-30| 30 |
+| Franchise menus (game caps at 30) | 30 | 30 |
+| Team select | 18-26 | ? |
+| In match | 12-19 | 22-28 |
+| Free skate | 34-39 | 49-56 |
+
+Fps is mainly limited by CPU-side per-draw preparation (descriptor/resource setup). Newer CPU's will preform better due to
+greater single thread performance.
 
 ## Known bugs
 
@@ -37,8 +42,6 @@ Retired Nov 1: the tester diagnostic lines (-crumb, -modlist, -texdiag, -texfix,
 - **Bright pixels**
 - **Scrambled team logos**
 - **Volume normalization issues**
-- Texture glitch: garbled / pixel-matrix ice and players, usually right after goals; HUD unaffected; main baseline 6-12 glitches per game; under investigation (depth-as-color test and ring-buffer recorder in flight)
-- GPU device-loss crash: tester 1 (RTX 4080) now plays clean on RC3 (3 Be A Pro games with sims, no crash) — that is an RC3 result, not a fix in this fork; no tester builds are made from this fork anymore
 
 ## Notable fixes in this fork
 
@@ -54,23 +57,18 @@ Retired Nov 1: the tester diagnostic lines (-crumb, -modlist, -texdiag, -texfix,
   - bounded `S_SETPC` jump tables;
   - loop cap for runaway lighting loops (38 ms → 1.7 ms per draw);
   - memoized exponential recursion in resource materialization.
--     **GPU / renderer:**
-- native indirect draws;
--   read-only buffer and BDA dirty caches;
--   program resource cache;
-- D16 depth sampled as R16;
--   D32 placeholders for depth-compare null slots;
--   BC6H storage-write redirect;
--   ignored LS/ES RSRC registers.
+- **GPU / renderer:**
+  - native indirect draws;
+  - read-only buffer and BDA dirty caches;
+  - program resource cache;
+  - D16 depth sampled as R16;
+  - D32 placeholders for depth-compare null slots;
+  - BC6H storage-write redirect;
+  - ignored LS/ES RSRC registers.
 - **AMD driver crash:** Kyty's 3D detiler shader used an `OpSpecConstantOp Select` chain that crashes amdvlk.
   It is rewritten as if/return.
 - **NHL 26 boot:** `param.json` missing from dumps (use `target-param.json`), and `--redzone` to stop host exception
   dispatch from clobbering the SysV red zone.
-- Be A Pro tessellation crash fixed (abort in LowerTessellationMemory replaced by a warning)
--     sceKernelGetModuleList2 implemented (fixes the NHL 27 boot crash on some machines)
--   Six experiment-bit collisions fixed (bits 38-43 remapped to 52-57)
--   Performance defaults enabled: LONG_BUFFER_GC_AGE, PM4_WRITE_DATA_FAST, READBACK_QUEUE, DIRECT_EOP_INTERRUPTS, SPARSE_BUFFER_GC, LAZY_SHARED_WRITES, FAULT_PAGE_READS, ASYNC_GUEST_READS, GPU_COLOR_CLEAR, BDA_DIRTY_REGIONS
--   Slint launcher kept
 <table align="center">
   <tr>
     <td align="center">
@@ -184,19 +182,6 @@ Useful debug options:
 | `KYTY_DBG_FORCE_SHADOW_COMPARE=always` | Force every depth-compare sampler to "lit" (diagnostic) |
 | `KYTY_DBG_DEPTH_ALIAS=1` (+`_ADDR=`) | Log depth/texture aliasing events |
 
-### Resolution scaling
-
-Render resolution is the Frostbite 4K preset multiplied by `KYTY_NHL_RES_SCALE` (0.25–1.0). The shipped configuration sets 0.6667 (about 1440p). Set it in the launcher environment table (Advanced tab), then Save and relaunch:
-
-| `KYTY_NHL_RES_SCALE` | Internal resolution |
-|---|---|
-| 1.0 | 4K |
-| 0.6667 | About 1440p (shipped default) |
-| 0.5 | 1080p |
-| 0.3333 | 720p |
-
-A blank environment table keeps the shipped 0.6667. Values outside 0.25–1.0 are ignored. The launcher's Screen resolution setting only changes the output window, not the render resolution.
-
 ## Credits
 
 - [KytyPS5](https://github.com/KytyPS5/KytyPS5) and the original [Kyty](https://github.com/InoriRus/Kyty).
@@ -212,9 +197,15 @@ Build exactly as upstream KytyPS5: Windows with clang-cl + Ninja + Qt 6. See the
 
 ```powershell
 git submodule update --init --recursive
-cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64"
+cmake -S . -B _Build/windows -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl -DCMAKE_PREFIX_PATH="C:/Qt/6.x.x/msvc2022_64" -DKYTY_PGO=use -DKYTY_THIN_LTO=ON
 cmake --build _Build/windows --target kyty_emulator
 ```
+
+`-DKYTY_PGO=use` builds with the NHL 27 gameplay profile in `tools/pgo`
+(measured +15% in gameplay; the profile matches clang 22.1.8, and a
+mismatched compiler now fails configure instead of silently building
+without PGO). `-DKYTY_THIN_LTO=ON` adds ThinLTO (draw 3.43 -> 3.34 us).
+To build without them, drop both flags.
 
 Build the launcher and stage a runnable installation:
 

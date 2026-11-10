@@ -1,7 +1,18 @@
-# Test-KytyBuild.ps1 - v3, written from scratch (2026-11-09)
+# Test-KytyBuild.ps1 - v4 (2026-11-09)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
-# through gameplay, using OCR-guided navigation and the emulator's scripted
-# input file. No window-focus tricks.
+# through a full game of dumb gameplay, using OCR-guided navigation and the
+# emulator's scripted input file. No window-focus tricks.
+#
+# v4 adds STEP 4, a dumb full-game gameplay phase: the point is coverage,
+# not skill. A repeating varied input pattern (skate, pass, shoot, poke)
+# keeps the game progressing so the emulator collects gameplay data (logs,
+# frame dumps, crash data) through a full game, even if the play is bad.
+# The game auto-changes lines, so shift changes and powerplays happen on
+# their own - exactly the coverage the missing-players crash needs.
+# Runs up to -GameplayMinutes (default 90, a full game at real-time pace
+# with stoppages) or until the game returns to a menu. Pause is resumed,
+# Unknown is tolerated and logged, and a frame-dump data shot is taken
+# every 10 minutes. The emulator exiting (crash) ends the phase at once.
 #
 # What is different from the v2 script (and why v2 never got past the title):
 #  - The PSN sign-in dialog is handled FIRST, explicitly, before any title
@@ -25,7 +36,10 @@
 #   [-GamePath "D:\Downloads\ps5 games\PPSA34063-app0"]
 #   [-OutDir "D:\Downloads\captures\KyTyTest-..."] [-ReleaseTag "..."]
 #   [-BootWaitSec 90] [-ScreenWidth 3840] [-ScreenHeight 2160]
-#   [-KeepRunning] [-SkipGameplay] [-NoOcr]
+#   [-KeepRunning] [-SkipGameplay] [-NoOcr] [-GameplayMinutes 90]
+#   -GameplayMinutes caps the STEP 4 dumb-gameplay phase (default 90, a
+#   full game at real-time pace with stoppages; pass 30 for a shorter run).
+#   The phase ends early if the game returns to a menu.
 
 param(
     [string]$GamePath = "D:\Downloads\ps5 games\PPSA34063-app0",
@@ -39,7 +53,8 @@ param(
     [int]$ScreenHeight = 2160,
     [switch]$KeepRunning,
     [switch]$SkipGameplay,
-    [switch]$NoOcr
+    [switch]$NoOcr,
+    [int]$GameplayMinutes = 90
 )
 
 $ErrorActionPreference = "Stop"
@@ -478,6 +493,95 @@ if ($reachedIce -and -not $SkipGameplay) {
     Write-Host "Reached the ice; gameplay shots skipped (-SkipGameplay)."
 } else {
     Write-Warning "Did not reach the ice in 20 nav tries. Result folder holds the nav shots and the transcript for diagnosis."
+}
+
+# STEP 4 - dumb full-game gameplay (v4). The point is coverage, not skill:
+# keep the player moving and the game progressing so the emulator collects
+# gameplay data (logs, frame dumps, crash data) through a full game, even
+# if the play is bad. The game auto-changes lines, so shift changes and
+# powerplays happen on their own - exactly the coverage the missing-players
+# crash needs. Runs for up to $GameplayMinutes real minutes (default 90,
+# a full game at real-time pace with stoppages), or until the game ends
+# (OCR shows Hub/Versus/Title/SignIn, meaning back to a menu). Each cycle
+# sends a varied input pattern (skate, pass, shoot, poke). The screen is
+# OCR-checked every few cycles from a fast screen capture: Pause is
+# resumed with Cross, a menu means the game is over, Unknown is tolerated
+# and logged. A frame-dump data shot is taken every 10 minutes. The
+# emulator exiting (crash) ends the phase immediately.
+if ($reachedIce -and -not $SkipGameplay) {
+    $gameplayStart = Get-Date
+    $gameplayEnd = $gameplayStart.AddMinutes($GameplayMinutes)
+    $gameOver = $false
+    $cycle = 0
+    $unknownStreak = 0
+    $gameplayShotCount = 0
+    $lastDataShot = $gameplayStart
+    Write-Host ("gameplay phase: up to " + $GameplayMinutes + " min of dumb play, ends early if the game returns to a menu.")
+    while (((Get-Date) -lt $gameplayEnd) -and -not $gameOver) {
+        $cycle++
+        if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
+            Write-Warning ("Emulator exited during gameplay (cycle " + $cycle + "). Stopping the gameplay phase - see last-run.log.")
+            break
+        }
+        # Varied input pattern, rotating by cycle. Left stick (w/a/s/d)
+        # skates, Cross (j) passes and takes faceoffs, Circle (l) shoots,
+        # Square (k) poke-checks, D-pad Up changes lines. No smart play -
+        # just keep moving and keep the puck in play so the game progresses.
+        $pattern = $cycle % 6
+        if ($pattern -eq 0) {
+            $lines = @("w 1800", "sleep 300", "j 150", "sleep 500", "w 1200", "sleep 500")
+        } elseif ($pattern -eq 1) {
+            $lines = @("a 1500", "sleep 300", "l 150", "sleep 500", "w 1200", "sleep 500")
+        } elseif ($pattern -eq 2) {
+            $lines = @("d 1500", "sleep 300", "j 150", "sleep 500", "s 1200", "sleep 500")
+        } elseif ($pattern -eq 3) {
+            $lines = @("s 1500", "sleep 300", "l 150", "sleep 500", "w 1200", "sleep 500")
+        } elseif ($pattern -eq 4) {
+            $lines = @("k 150", "sleep 300", "j 150", "sleep 500", "w 1800", "sleep 500")
+        } else {
+            $lines = @("Up 150", "sleep 300", "w 2000", "sleep 300", "j 150", "sleep 500")
+        }
+        Invoke-InputStage -Lines $lines -ExtraWaitSec 1
+        # Every 6 cycles (about a minute), OCR-check the screen from a
+        # fast screen capture and react. The frame-dump data shot below is
+        # separate; this check only needs to read the screen state.
+        if (($cycle % 6) -eq 0) {
+            $checkShot = Save-ScreenShot -ShotName "12-gameplay-check.png"
+            $checkText = Get-ShotText -ShotPath $checkShot
+            $checkKind = Get-ScreenKind -Text $checkText
+            Write-Host ("gameplay check (cycle " + $cycle + "): " + $checkKind)
+            if ($checkKind -ne "Unknown") { $unknownStreak = 0 }
+            if ($checkKind -eq "Pause") {
+                Write-Host "Pause menu during gameplay - resuming with Cross."
+                Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+            } elseif (($checkKind -eq "Hub") -or ($checkKind -eq "Versus") -or ($checkKind -eq "Title") -or ($checkKind -eq "SignIn")) {
+                Write-Host ("Gameplay phase: screen is " + $checkKind + " - the game has returned to a menu, so the game is over. Ending the gameplay phase.")
+                $gameOver = $true
+            } elseif ($checkKind -eq "Unknown") {
+                $unknownStreak++
+                if ($unknownStreak -ge 5) {
+                    Write-Warning ("Gameplay screen not recognized for 5 checks in a row (cycle " + $cycle + "). The game may be in a replay, cutscene, or a state OCR cannot name. Continuing to send inputs.")
+                    $unknownStreak = 0
+                }
+            }
+            # Ice needs no action - the pattern keeps the game moving.
+        }
+        # Frame-dump data shot every 10 minutes.
+        if (((Get-Date) - $lastDataShot).TotalMinutes -ge 10) {
+            $gameplayShotCount++
+            $lastDataShot = Get-Date
+            $ds = Save-Shot -ShotName ("12-gameplay-" + $gameplayShotCount + ".png")
+            Write-Host ("gameplay data shot: " + $ds)
+        }
+        # Progress line every 30 cycles so the transcript shows the phase
+        # is alive without flooding it.
+        if (($cycle % 30) -eq 0) {
+            $elapsed = [math]::Round(((Get-Date) - $gameplayStart).TotalMinutes, 1)
+            Write-Host ("gameplay progress: cycle " + $cycle + ", " + $elapsed + " min elapsed of up to " + $GameplayMinutes + " min.")
+        }
+    }
+    $gameplayMins = [math]::Round(((Get-Date) - $gameplayStart).TotalMinutes, 1)
+    Write-Host ("gameplay phase done: " + $cycle + " cycles, " + $gameplayMins + " min, " + $gameplayShotCount + " data shots.")
 }
 
 # Copy the emulator log into the result folder for diagnosis.

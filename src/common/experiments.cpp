@@ -74,6 +74,9 @@ uint64_t EnvironmentMask() {
 	// fewer it would take time from the game's threads, so it stays off there unless asked for.
 	const unsigned cpus = std::thread::hardware_concurrency();
 	set("KYTY_DRAW_RESOLVER", DrawResolver, cpus >= 16);
+	// Default off: vertex-buffer resolve-ahead is new and unproven in play; enable with
+	// KYTY_PARALLEL_DRAWPREP=1 to test. It reuses the resolve thread, so it needs no extra core.
+	set("KYTY_PARALLEL_DRAWPREP", ParallelDrawPrep, false);
 	set("KYTY_GPU_COLOR_CLEAR", GpuColorClear, true);
 	set("KYTY_POOLED_BDA_BUFFERS", PooledBdaBuffers, false);
 	set("KYTY_ASYNC_GUEST_READS", AsyncGuestReads, true);

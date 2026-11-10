@@ -48,6 +48,10 @@ public:
 		t_resolve_base       = executed;
 		t_resolve_base_valid = true;
 	}
+	// Resolve thread: the base (last operation the execution thread finished) for the current
+	// resolution, for validity checks of work prepared ahead (see RenderExecutor::ResolveDrawAhead).
+	[[nodiscard]] static uint64_t ResolveBase() { return t_resolve_base; }
+	[[nodiscard]] static bool     ResolveBaseValid() { return t_resolve_base_valid; }
 	// Reads the backing store without faulting. Strict reads are checked the way specialization
 	// memory is read (GPU-owned bytes fail), the others as plain loads.
 	bool               Read(uint64_t address, void* data, uint64_t size, bool strict);

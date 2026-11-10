@@ -1165,6 +1165,75 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.shared_memory = {};
 	prepared.push_dwords_valid = false;
 	prepared.shader_data.clear();
+	// KYTY_DRAWPREP_DELTA (Stage 1): per-program image-binding memo, keyed by the stage's
+	// ResourceSnapshot address. It survives m_texture_descs clears: a slot whose T# words and
+	// resource are unchanged and whose guest range saw no TextureCache generation change since
+	// it was stored reuses its resolved image + description, skipping FindImage. Every hit is
+	// revalidated (words, resource, generation log, image state) and RebindImages re-validates
+	// the image again before its view is acquired, so a stale hit can only cost a re-resolve,
+	// never a wrong image. Gated by the flag (default on); KYTY_DRAWPREP_DELTA=0 restores the
+	// previous behaviour exactly. Samplers are not memoized here: NativeSampler already has a
+	// lock-free memo, so a second one would add nothing.
+	const bool delta_on = Common::RuntimeFlags::Current().drawprep_delta;
+	const bool delta_verify = delta_on && DrawPrepDeltaVerifyEnabled();
+	auto& delta_texture_cache = m_context.GetTextureCache();
+	StageBindingMemo* delta_memo = nullptr;
+	if (delta_on) {
+		delta_memo = &m_binding_memos[&snapshot];
+		if (delta_memo->images.size() != program.info.images.size()) {
+			delta_memo->images.assign(program.info.images.size(), ImageSlotMemo{});
+		}
+	}
+	const bool delta_is_compute = program.stage == ShaderType::Compute;
+	// Store a freshly resolved binding into the DELTA memo (only sampled, non-dynamic,
+	// non-heap textures with a reusable lookup; written/storage, depth, DCC/metadata,
+	// stencil and null bindings are never memoized).
+	const auto delta_store = [&](uint32_t i, const ShaderRecompiler::IR::ImageResource& resource,
+	                             const TextureBinding& binding) {
+		auto& dm = delta_memo->images[i];
+		auto& dl = FrameBreakdown::g_delta;
+		if (resource.written ||
+		    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic || resource.heap) {
+			dm.valid = false;
+			return;
+		}
+		const auto unmemoable = [&](std::atomic<uint64_t>& counter) {
+			dl.reuse_unmemoable.fetch_add(1, std::memory_order_relaxed);
+			counter.fetch_add(1, std::memory_order_relaxed);
+			if (delta_is_compute) dl.cs_unmemoable.fetch_add(1, std::memory_order_relaxed);
+			dm.valid = false;
+		};
+		if (binding.desc.info.metadata.kind == ImageMetadataKind::Dcc) {
+			unmemoable(dl.um_dcc);
+			return;
+		}
+		if (binding.desc.info.metadata.kind != ImageMetadataKind::None ||
+		    binding.desc.info.HasStencil() || binding.lookup == nullptr || !binding.image_id) {
+			unmemoable(dl.um_other);
+			return;
+		}
+		const auto* image = delta_texture_cache.m_slot_images.try_get(binding.image_id);
+		if (image == nullptr || !image->registered) {
+			unmemoable(dl.um_other);
+			return;
+		}
+		if (image->info.IsDepth() || image->depth_id) {
+			unmemoable(dl.um_depth);
+			return;
+		}
+		dm.valid = true;
+		dm.words = snapshot.images[i];
+		dm.resource_key = ImageResourceKey(resource);
+		dm.generation = delta_texture_cache.Generation();
+		const uint64_t tb = binding.desc.info.data.address;
+		const uint64_t te = binding.desc.info.data.End();
+		const uint64_t ib = image->info.data.address;
+		const uint64_t ie = image->info.data.End();
+		dm.range_begin = std::min(tb, ib);
+		dm.range_end = std::max(te, ie);
+		dm.image_id = binding.image_id;
+		dm.desc = binding.desc;
+	};
 	const bool same_program = prepared.last_program == &program &&
 	                          prepared.last_descs_generation == m_texture_descs_generation;
 	// The T#s and descriptions of the program's last draw: a stage alternates between programs,
@@ -1206,6 +1275,16 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			prepared.images[i] = {};
 			continue;
 		}
+		const bool delta_candidate =
+		    delta_on && !resource.written &&
+		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic;
+		if (delta_candidate) {
+			if (delta_is_compute) {
+				FrameBreakdown::g_delta.cs_slots.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				FrameBreakdown::g_delta.dr_slots.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		if (!resource.written &&
 		    resource.mip_mode != ShaderRecompiler::IR::ImageMipMode::Dynamic) {
 			auto* derived = image_descs[i];
@@ -1218,7 +1297,67 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 			    ReuseTextureLookup(*derived, prepared.images[i])) {
 				image_descs[i] = derived;
 				BindImage(prepared.images[i].image_id, false);
+				if (delta_candidate) delta_store(i, resource, prepared.images[i]);
 				continue;
+			}
+		}
+		// KYTY_DRAWPREP_DELTA: second-chance fast path, reached only when the lookup reuse
+		// above missed (its memo is lost whenever m_texture_descs is cleared). The per-slot
+		// memo is revalidated against the T# words, the resource, the TextureCache generation
+		// log for the slot's guest range, and the image's registration/rebind state.
+		ImageId delta_verify_id {};
+		bool delta_verify_pending = false;
+		if (delta_candidate) {
+			auto& dm = delta_memo->images[i];
+			if (dm.valid && dm.words == snapshot.images[i] &&
+			    dm.resource_key == ImageResourceKey(resource)) {
+				auto& dl = FrameBreakdown::g_delta;
+				if (delta_is_compute) dl.cs_eligible.fetch_add(1, std::memory_order_relaxed);
+				dl.reuse_eligible.fetch_add(1, std::memory_order_relaxed);
+				const uint64_t gen_now = delta_texture_cache.Generation();
+				bool gen_clean = (gen_now == dm.generation);
+				if (!gen_clean) {
+					uint64_t gen_current = gen_now;
+					const auto check = delta_texture_cache.CheckGenerationLog(
+					    dm.generation, dm.range_begin, dm.range_end, gen_current);
+					if (check == TextureCache::GenCheck::Overlap) {
+						dl.rej_gen_overlap.fetch_add(1, std::memory_order_relaxed);
+					} else if (check == TextureCache::GenCheck::Overrun) {
+						dl.rej_gen_overrun.fetch_add(1, std::memory_order_relaxed);
+					}
+					dl.gen_log_scans.fetch_add(1, std::memory_order_relaxed);
+					gen_clean = (check == TextureCache::GenCheck::Clean);
+				}
+				const auto* image = delta_texture_cache.m_slot_images.try_get(dm.image_id);
+				const bool state_ok = image != nullptr && image->registered &&
+				                      !image->binding.needs_rebind && !image->depth_id &&
+				                      !image->info.HasStencil();
+				if (gen_clean && state_ok) {
+					if (delta_is_compute) dl.cs_hits.fetch_add(1, std::memory_order_relaxed);
+					dl.reuse_hits.fetch_add(1, std::memory_order_relaxed);
+					if (delta_verify) {
+						// Verify mode: resolve fully below and compare instead of reusing.
+						delta_verify_id = dm.image_id;
+						delta_verify_pending = true;
+					} else {
+						prepared.images[i].image_id = dm.image_id;
+						prepared.images[i].image_view = nullptr;
+						prepared.images[i].desc = dm.desc;
+						prepared.images[i].layout = vk::ImageLayout::eUndefined;
+						prepared.images[i].mip_views.clear();
+						prepared.images[i].lookup = nullptr;
+						prepared.images[i].reused = false;
+						prepared.images[i].desc_serial = 0;
+						BindImage(dm.image_id, false);
+						continue;
+					}
+				} else if (!gen_clean) {
+					if (delta_is_compute) dl.cs_rej_gen.fetch_add(1, std::memory_order_relaxed);
+					dl.reuse_rej_gen.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					if (delta_is_compute) dl.cs_rej_state.fetch_add(1, std::memory_order_relaxed);
+					dl.reuse_rej_state.fetch_add(1, std::memory_order_relaxed);
+				}
 			}
 		}
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
@@ -1228,6 +1367,14 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		binding.mip_views.swap(prepared.images[i].mip_views);
 		binding.mip_views.clear();
 		prepared.images[i] = std::move(binding);
+		if (delta_verify_pending) {
+			auto& dl = FrameBreakdown::g_delta;
+			dl.verify_checks.fetch_add(1, std::memory_order_relaxed);
+			if (prepared.images[i].image_id != delta_verify_id) {
+				dl.verify_mismatch.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
+		if (delta_candidate) delta_store(i, resource, prepared.images[i]);
 	}
 	if (!same_images) {
 		last_images = snapshot.images;

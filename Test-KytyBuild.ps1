@@ -1,7 +1,16 @@
-# Test-KytyBuild.ps1 - v10 (2026-11-10)
+# Test-KytyBuild.ps1 - v11 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v11 adds the classifier fix the 1536 atlas run proved with a screenshot:
+# shot 234-nav.png IS the versus screen (PLAY NOW SELECT TEAM / VERSUS /
+# VS / SELECT SIDES) yet v9/v10 classified it Hub, because Get-ScreenKind
+# checked Hub ("play now") before Versus. The highlight theory alone does
+# not explain it: the game sat at Versus while the loop pressed Down+Cross
+# on it ~240 times. Versus is now checked FIRST, on "select team" /
+# "select sides" / "versus" / faceoff. v10's D-pad Down and 60-shot global
+# cap ride along unchanged.
 #
 # v10 fixes the stuck-versus run (2026-11-10 16:28, #142 delta, v9). The
 # emulator sat at the Play Now versus screen at a healthy 47 fps while the
@@ -387,8 +396,13 @@ function Get-ScreenKind {
     $t = $Text.ToLower()
     if ($t -match "sign in|playstation network|psn|sign-in|ea servers|unable-to-connect") { return "SignIn" }
     if ($t -match "press any button|press x to start|press x") { return "Title" }
+    # Versus FIRST: the versus screen header reads "PLAY NOW SELECT TEAM",
+    # so the Hub "play now" pattern below would swallow it (v9/v10 atlas
+    # run: shot 234-nav.png is Versus on screen yet classified Hub, and
+    # the loop pressed Down+Cross on it ~240 times). Versus markers are
+    # "select team" / "select sides" / "versus" / faceoff.
+    if ($t -match "select team|select sides|versus|faceoff|face-off") { return "Versus" }
     if ($t -match "be a pro|play now|play next game|franchise|hut|world of chel") { return "Hub" }
-    if ($t -match "versus|vs\.?|faceoff|face-off") { return "Versus" }
     if ($t -match "pause|paused|resume|quit to|settings") { return "Pause" }
     # Ice needs real HUD text. The bare word "nhl" is in the window title
     # bar of every screen capture, so it matched dark loading screens and
@@ -583,7 +597,9 @@ while ($step -lt $roadmap.Count) {
             Write-Host ("Screen is an earlier stop ('" + $kind + "') - going back to it.")
         }
         $step = $seen
-        $stepTries = 0
+        # Do NOT reset $stepTries here: v9 reset it on every jump back, so
+        # the 8-tries-per-stop cap never fired during a Hub<->Versus
+        # oscillation. The v10 global 60-shot cap stays as the backstop.
         $want = $roadmap[$step]
     }
     if ($kind -ne $want) {

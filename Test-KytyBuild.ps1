@@ -1,26 +1,20 @@
-# Test-KytyBuild.ps1 - v8 (2026-11-10)
+# Test-KytyBuild.ps1 - v9 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v8 fixes the third atlas miss (2026-11-10 15:10, #139, v7). The v7 run
-# reached the ice without ever seeing Versus, and the user closed the
-# window early - two bugs, both from the 1510 screenshots:
-#  - Hub pressed Cross without checking the highlight. Shot 03 was the
-#    MAIN menu with BE A PRO CAREER highlighted, not PLAY NOW, so Cross
-#    opened Be A Pro instead of Play Now. The Hub handler now reads the
-#    OCR text: "play next game" means the Be A Pro hub (Cross directly);
-#    "play now" without it means the main menu (D-pad Down once to PLAY
-#    NOW, then Cross).
-#  - Ice matched the bare word "nhl", which is in the window title bar of
-#    every screen capture, so a dark loading screen (shot 04) was read as
-#    Ice and the nav loop quit early. Ice now needs real HUD text:
-#    "period|shots|goals|hits". A dark screen with no text is Unknown,
-#    which waits and re-shots.
-#  - STEP 1 sign-in now alternates Circle / Cross like the nav loop: the
-#    EA servers dialog needs Cross, the PSN dialog needs Circle. Circle
-#    alone failed 3 times in the 1510 run; Cross dismissed it in the nav
-#    loop.
+# v9 gives the script a ROADMAP (user's call): a fixed route Title ->
+# Hub -> Versus -> Ice, with the script always knowing which stop it is
+# heading for. The reactive loop guessed from whatever OCR read and kept
+# getting lost - Cross on the wrong highlight, a loading screen read as
+# Ice, blind presses on screens it could not name. The roadmap only
+# accepts the screen it expects (or a known detour: sign-in dialog,
+# pause menu, loading screen); a later stop jumps forward, an earlier
+# stop goes back, anything else waits and re-reads. Each stop gets 8
+# tries, then the run fails naming the stop it stuck on. v8's fixes ride
+# along: Hub reads the highlight (Down to PLAY NOW on the main menu),
+# Ice needs HUD text (no bare "nhl"), STEP 1 sign-in alternates
+# Circle / Cross.
 #
 # What is different from the v2 script (and why v2 never got past the title):
 #  - The PSN sign-in dialog is handled FIRST, explicitly, before any title
@@ -479,21 +473,47 @@ if (-not $signInGone) {
     Write-Warning "Sign-in dialog would not dismiss after 3 tries; continuing anyway - the title nav below may still work."
 }
 
-# STEP 2 - navigate from the title screen to the ice. Vision loop, max 20
-# tries: screenshot, OCR, classify, act. Be A Pro rule (unchanged): if the
-# screen offers only START CAREER with no CONTINUE, STOP - never create a
-# character.
+# STEP 2 - roadmap navigation. The script follows a fixed route, not a
+# guess: Title -> Hub -> Versus -> Ice. It always knows which stop it is
+# heading for, and only accepts the screen it expects (or a known detour).
+# A reactive loop that presses buttons on whatever OCR reads gets lost:
+# it pressed Cross on the main menu with BE A PRO CAREER highlighted and
+# opened Be A Pro instead of Play Now (v7 atlas run), and it read a dark
+# loading screen as Ice because "nhl" sits in the title bar (v7 run).
+# The roadmap fixes both: each stop names the screen it expects and the
+# one action that advances from it. Anything else is a detour to handle,
+# not a screen to act on:
+#  - SignIn dialog (PSN or EA servers): dismiss, stay on the same stop.
+#  - Pause menu: resume, stay on the same stop.
+#  - Unknown (loading screen, no text): wait and re-read; never press a
+#    button on a screen it cannot name.
+#  - A LATER stop than expected (the game advanced on its own): jump to it.
+#  - An EARLIER stop than expected (the game went back): go back to it.
+#  - A screen that matches no stop: wait and re-read.
+# Each stop gets 8 tries. If a stop cannot be reached, the run fails with
+# the stop name and the last screen seen, instead of wandering. Be A Pro
+# rule (unchanged): if the screen offers only START CAREER with no
+# CONTINUE, STOP - never create a character.
+$roadmap = @("Title", "Hub", "Versus", "Ice")
+$step = 0
 $navShot = 0
-$tries = 0
-$titleTries = 0
 $signInTries = 0
+$stepTries = 0
 $unknownStreak = 0
+$titleTries = 0
 $reachedIce = $false
 $reachedVersus = $false
-while ($tries -lt 20) {
-    $tries++
+$navFailed = $false
+while ($step -lt $roadmap.Count) {
+    $stepTries++
+    if ($stepTries -gt 8) {
+        Write-Warning ("Roadmap stuck at stop '" + $roadmap[$step] + "' after 8 tries. Stopping - see the nav shots and transcript for the last screen seen.")
+        $navFailed = $true
+        break
+    }
     if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
-        Write-Warning ("Emulator exited mid-navigation (try " + $tries + "). Stopping the nav loop - see last-run.log.")
+        Write-Warning "Emulator exited mid-navigation. Stopping the nav loop - see last-run.log."
+        $navFailed = $true
         break
     }
     $navShot++
@@ -501,17 +521,17 @@ while ($tries -lt 20) {
     $shot = Save-ScreenShot -ShotName $shotName
     $text = Get-ShotText -ShotPath $shot
     $kind = Get-ScreenKind -Text $text
-    Write-Host ("screen: " + $kind + " (shot " + $shotName + ")")
+    $want = $roadmap[$step]
+    Write-Host ("roadmap: stop '" + $want + "' (try " + $stepTries + "), screen: " + $kind + " (shot " + $shotName + ")")
     if ($text) { Write-Host ("ocr: " + (($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join " | ")) }
-    if ($kind -ne "Unknown") { $unknownStreak = 0 }
 
+    # Known detours: handled the same at every stop, never advance the step.
     if ($kind -eq "SignIn") {
         $signInTries++
         # Alternate Cross / Circle: the EA servers dialog needs Cross
-        # (acknowledge), the PSN dialog needs Circle (back). Circle alone
-        # failed 3 times on the EA dialog in the v6 atlas run.
+        # (acknowledge), the PSN dialog needs Circle (back).
         if (($signInTries % 2) -eq 1) {
-            Write-Host "Sign-in dialog reappeared - pressing Cross to acknowledge it."
+            Write-Host "Sign-in dialog up - pressing Cross to acknowledge it."
             Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
         } else {
             Write-Host "Sign-in dialog still up - pressing Circle to dismiss it."
@@ -519,29 +539,77 @@ while ($tries -lt 20) {
         }
         continue
     }
-    if ($kind -eq "Title") {
+    if ($kind -eq "Pause") {
+        Write-Host "Pause menu - resuming with Cross."
+        Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+        continue
+    }
+    if ($kind -eq "Unknown") {
+        # A loading screen changes on its own. Wait first, press nothing.
+        # Only after 3 in a row press Cross once; after 5, Cross + Options
+        # for a possible unnamed dialog. Then re-read.
+        $unknownStreak++
+        if ($unknownStreak -le 2) {
+            Write-Host "Screen not recognized - waiting 4 s and re-reading (may be a loading screen)."
+            Start-Sleep -Seconds 4
+        } elseif ($unknownStreak -eq 3) {
+            Write-Host "Screen still not recognized - pressing confirm once and re-reading."
+            Invoke-InputStage -Lines @("j 150", "sleep 2000") -ExtraWaitSec 2
+        } else {
+            Write-Host "Screen still not recognized - dismissing a possible dialog with Cross then Options."
+            Invoke-InputStage -Lines @("j 150", "sleep 1500", "Return 150", "sleep 3000") -ExtraWaitSec 2
+            $unknownStreak = 0
+        }
+        continue
+    }
+    $unknownStreak = 0
+
+    # Where does this screen sit on the roadmap? Ahead means the game
+    # advanced on its own (jump forward); behind means it went back.
+    $seen = [Array]::IndexOf($roadmap, $kind)
+    if ($seen -ge 0 -and $seen -ne $step) {
+        if ($seen -gt $step) {
+            Write-Host ("Screen is a later stop ('" + $kind + "') - jumping forward to it.")
+        } else {
+            Write-Host ("Screen is an earlier stop ('" + $kind + "') - going back to it.")
+        }
+        $step = $seen
+        $stepTries = 0
+        $want = $roadmap[$step]
+    }
+    if ($kind -ne $want) {
+        Write-Host ("Screen '" + $kind + "' is not the stop '" + $want + "' - waiting and re-reading.")
+        Start-Sleep -Seconds 4
+        continue
+    }
+
+    # We are at the expected stop. Take its one action, then advance.
+    $stepTries = 0
+    if ($want -eq "Title") {
         $titleTries++
         if (($titleTries % 2) -eq 1) {
-            Write-Host "Title screen - pressing confirm (Cross) to reach the main menu."
+            Write-Host "Title screen - pressing Cross to reach the main menu."
             Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
         } else {
             Write-Host "Title screen - Cross did not advance it; pressing Options (Start) instead."
             Invoke-InputStage -Lines @("Return 150", "sleep 3000") -ExtraWaitSec 2
         }
+        $step++
         continue
     }
-    if ($kind -eq "Hub") {
+    if ($want -eq "Hub") {
         # Be A Pro guard: START CAREER with no CONTINUE means no save yet;
         # creating a character is forbidden, so stop here.
         if (($text -match "start career") -and ($text -notmatch "continue")) {
             Write-Warning "Be A Pro offers only START CAREER (no CONTINUE) - stopping, never creating a character."
+            $navFailed = $true
             break
         }
         # Two different Hub screens, and Cross alone picks the wrong one:
         # the main menu highlights BE A PRO CAREER first, so Cross there
-        # opens Be A Pro instead of Play Now (v7 atlas run, shot 03). The
-        # Be A Pro hub highlights PLAY NEXT GAME, so Cross is right there.
-        # Tell them apart by the OCR text.
+        # opens Be A Pro instead of Play Now. The Be A Pro hub highlights
+        # PLAY NEXT GAME, so Cross is right there. Tell them apart by the
+        # OCR text.
         if ($text -match "play next game") {
             Write-Host "Be A Pro hub - selecting PLAY NEXT GAME for the Versus screen."
             Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
@@ -549,9 +617,10 @@ while ($tries -lt 20) {
             Write-Host "Main menu - moving down to PLAY NOW, then confirming."
             Invoke-InputStage -Lines @("s 150", "sleep 1500", "j 150", "sleep 4000") -ExtraWaitSec 2
         }
+        $step++
         continue
     }
-    if ($kind -eq "Versus") {
+    if ($want -eq "Versus") {
         if (-not $reachedVersus) {
             $reachedVersus = $true
             # The versus capture is the one frame dump that matters (it
@@ -574,34 +643,18 @@ while ($tries -lt 20) {
         }
         Write-Host "Versus screen - pressing confirm to start the game."
         Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+        $step++
         continue
     }
-    if ($kind -eq "Ice") {
+    if ($want -eq "Ice") {
         $reachedIce = $true
-        Write-Host "On the ice - leaving the nav loop for gameplay shots."
-        break
-    }
-    if ($kind -eq "Pause") {
-        Write-Host "Pause menu - resuming with Cross."
-        Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+        Write-Host "On the ice - roadmap complete, leaving the nav loop for gameplay shots."
+        $step++
         continue
     }
-    # Unknown screen: wait first - a loading screen (dark player showcase,
-    # no text) changes on its own, and pressing Cross blindly on it does
-    # nothing. Cross only on the second Unknown in a row; after 3, a dialog
-    # OCR cannot name may be up: dismiss it with Cross then Options.
-    $unknownStreak++
-    if ($unknownStreak -eq 1) {
-        Write-Host "Screen not recognized - waiting 4 s and re-reading (may be a loading screen)."
-        Start-Sleep -Seconds 4
-    } elseif ($unknownStreak -ge 3) {
-        Write-Host "Screen still not recognized after 3 tries - dismissing a possible dialog with Cross then Options."
-        Invoke-InputStage -Lines @("j 150", "sleep 1500", "Return 150", "sleep 3000") -ExtraWaitSec 2
-        $unknownStreak = 0
-    } else {
-        Write-Host "Screen not recognized - pressing confirm once and re-reading."
-        Invoke-InputStage -Lines @("j 150", "sleep 2000") -ExtraWaitSec 2
-    }
+}
+if ($navFailed) {
+    Write-Warning "Navigation did not complete the roadmap. Result folder holds the nav shots and the transcript for diagnosis."
 }
 
 # STEP 3 - gameplay shots (only if the nav reached the ice). 05/06 are the

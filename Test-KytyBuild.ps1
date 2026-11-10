@@ -1,17 +1,16 @@
-# Test-KytyBuild.ps1 - v12 (2026-11-10)
+# Test-KytyBuild.ps1 - v13 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v12 changes the target: the versus screen that matters is the BE A PRO
-# one, not Play Now. The user's corruption (teal/reddish strips, garbled
-# blocks, missing logos) is in Be A Pro versus; v9-v11 all navigated to
-# Play Now versus (SELECT TEAM), a different screen. The Hub action now
-# takes the Be A Pro route: on the main menu Cross alone (BE A PRO CAREER
-# is the default highlight) instead of Down+Cross to PLAY NOW, then on
-# the Be A Pro hub Cross on PLAY NEXT GAME. The "never create a character"
-# guard stays: if Be A Pro offers only START CAREER with no CONTINUE, the
-# run stops rather than creating a character.
+# v13 backs up the real save before every run (user's call). The test
+# already plays on a copy: it copies the run-folder save into the build
+# folder's _SaveData, and the game reads/writes that copy, so the real
+# save in %LOCALAPPDATA%\KyTyPS5\run\_SaveData is not touched. v13 adds
+# a second copy - the run-folder save into save-backup in the result
+# folder - so every run leaves a safe copy that rides to Drive with the
+# results. If anything ever goes wrong, restore that folder to
+# %LOCALAPPDATA%\KyTyPS5\run\_SaveData.
 #
 # v10 fixes the stuck-versus run (2026-11-10 16:28, #142 delta, v9). The
 # emulator sat at the Play Now versus screen at a healthy 47 fps while the
@@ -166,6 +165,22 @@ if (Test-Path $runSave) {
     }
 } else {
     Write-Host "saves: no run-folder saves found, continuing without them"
+}
+
+# Back up the real save into the result folder (v13). The test plays on
+# the build-folder copy above, so the run-folder save is not touched -
+# but keep a safe copy in the result folder anyway, so every run leaves
+# a backup that rides to Drive with the results. Restore it to
+# %LOCALAPPDATA%\KyTyPS5\run\_SaveData if anything ever goes wrong.
+if (Test-Path $runSave) {
+    try {
+        $backupDir = Join-Path $OutDir "save-backup"
+        New-Item -ItemType Directory -Force -Path $backupDir | Out-Null
+        Copy-Item -Path (Join-Path $runSave "*") -Destination $backupDir -Recurse -Force -ErrorAction Stop
+        Write-Host "save backup: copied run-folder saves to save-backup in the result folder"
+    } catch {
+        Write-Warning ("save backup: copy failed, continuing: " + $_.Exception.Message)
+    }
 }
 
 # Write input lines to the file, then BLOCK until the emulator consumes it

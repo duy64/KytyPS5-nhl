@@ -1,18 +1,16 @@
-# Test-KytyBuild.ps1 - v4 (2026-11-09)
+# Test-KytyBuild.ps1 - v5 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v4 adds STEP 4, a dumb full-game gameplay phase: the point is coverage,
-# not skill. A repeating varied input pattern (skate, pass, shoot, poke)
-# keeps the game progressing so the emulator collects gameplay data (logs,
-# frame dumps, crash data) through a full game, even if the play is bad.
-# The game auto-changes lines, so shift changes and powerplays happen on
-# their own - exactly the coverage the missing-players crash needs.
-# Runs up to -GameplayMinutes (default 90, a full game at real-time pace
-# with stoppages) or until the game returns to a menu. Pause is resumed,
-# Unknown is tolerated and logged, and a frame-dump data shot is taken
-# every 10 minutes. The emulator exiting (crash) ends the phase at once.
+# v5 adds -AtlasCapture: a short versus-only run for the atlas-dump build
+# (#139, 4b197fb). It sets KYTY_DBG_FRAME_DUMP_SAMPLED=1, navigates to the
+# versus screen, triggers a frame dump there (the trigger file, same as F2
+# - the sampled .bin files are written by any capture, F2 or trigger), then
+# copies every *_smp_*.bin from the frame folders into the result folder
+# and stops. No gameplay phase. The .bin files are the raw BC bytes of every
+# sampled BC texture, so they tell bad upload data apart from bad sampling.
+# Use it with -BuildDir pointing at the atlas-dump build folder.
 #
 # What is different from the v2 script (and why v2 never got past the title):
 #  - The PSN sign-in dialog is handled FIRST, explicitly, before any title
@@ -40,6 +38,10 @@
 #   -GameplayMinutes caps the STEP 4 dumb-gameplay phase (default 90, a
 #   full game at real-time pace with stoppages; pass 30 for a shorter run).
 #   The phase ends early if the game returns to a menu.
+#   -AtlasCapture runs a short versus-only capture for the atlas-dump
+#   build: sets KYTY_DBG_FRAME_DUMP_SAMPLED=1, stops at the versus screen,
+#   dumps the sampled BC textures (*_smp_*.bin) into the result folder,
+#   then stops. No gameplay. Pass -BuildDir for the atlas-dump build.
 
 param(
     [string]$GamePath = "D:\Downloads\ps5 games\PPSA34063-app0",
@@ -54,6 +56,7 @@ param(
     [switch]$KeepRunning,
     [switch]$SkipGameplay,
     [switch]$NoOcr,
+    [switch]$AtlasCapture,
     [int]$GameplayMinutes = 90
 )
 
@@ -287,6 +290,41 @@ function Save-Shot {
     return (Save-ScreenShot -ShotName $ShotName)
 }
 
+# Collect the sampled-texture dumps (*_smp_*.bin) from every frame folder
+# into the result folder. The atlas-dump build writes them next to the
+# frame PNGs when KYTY_DBG_FRAME_DUMP_SAMPLED=1 is on; any capture (F2 or
+# the trigger file) writes them, because OnDraw queues them during a
+# capture. Waits briefly for the writes to land, then copies what is
+# there. Returns the count copied (0 when the build has no sampled dump,
+# e.g. a non-atlas build ran by mistake).
+function Save-SampledBins {
+    $dumpDir = $env:KYTY_DBG_FRAME_DUMP_DIR
+    if (-not $dumpDir) { $dumpDir = "D:\Downloads\captures" }
+    $found = @()
+    for ($w = 0; $w -lt 6; $w++) {
+        $found = @(Get-ChildItem -Path $dumpDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue |
+            ForEach-Object { Get-ChildItem -Path $_.FullName -Filter "*_smp_*.bin" -ErrorAction SilentlyContinue } |
+            Where-Object { $_ })
+        if ($found.Count -gt 0) { break }
+        Start-Sleep -Seconds 5
+    }
+    if ($found.Count -eq 0) {
+        Write-Warning "No *_smp_*.bin files found in the frame folders. The build may not be the atlas-dump build, or KYTY_DBG_FRAME_DUMP_SAMPLED was not on."
+        return 0
+    }
+    $copied = 0
+    foreach ($f in $found) {
+        try {
+            Copy-Item -Path $f.FullName -Destination (Join-Path $OutDir $f.Name) -Force -ErrorAction Stop
+            $copied++
+        } catch {
+            Write-Warning ("Could not copy sampled bin " + $f.Name + ": " + $_.Exception.Message)
+        }
+    }
+    Write-Host ("sampled bins: " + $copied + " copied to the result folder")
+    return $copied
+}
+
 # OCR a screenshot to text (empty string when Tesseract is missing).
 function Get-ShotText {
     param([string]$ShotPath)
@@ -334,6 +372,11 @@ $psi.EnvironmentVariables["KYTY_COMPUTE_RESOLVE_AHEAD"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_DIR"] = "D:\Downloads\captures"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_CS_CONSTANTS"] = "1"
+if ($AtlasCapture) {
+    # Atlas-dump build: dump every sampled BC texture as *_smp_*.bin.
+    $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_SAMPLED"] = "1"
+    Write-Host "AtlasCapture: KYTY_DBG_FRAME_DUMP_SAMPLED=1 (sampled BC texture dump on)"
+}
 $psi.EnvironmentVariables["KYTY_DBG_LOOP_CAP"] = "65536"
 $psi.EnvironmentVariables["KYTY_DBG_SKIP_BAD_SHADERS"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_BREADCRUMBS"] = "0"
@@ -435,6 +478,17 @@ while ($tries -lt 20) {
             $reachedVersus = $true
             $v = Save-Shot -ShotName "04-versus.png"
             Write-Host ("versus screen captured: " + $v)
+            if ($AtlasCapture) {
+                # Atlas capture: the versus dump already wrote the sampled
+                # .bin files; collect them, then stop. No gameplay.
+                $binCount = Save-SampledBins
+                if ($binCount -gt 0) {
+                    Write-Host ("AtlasCapture done: " + $binCount + " sampled bins in the result folder. Stopping here.")
+                } else {
+                    Write-Warning "AtlasCapture: versus captured but no sampled bins found - check the build is the atlas-dump build (#139, 4b197fb)."
+                }
+                break
+            }
         }
         Write-Host "Versus screen - pressing confirm to start the game."
         Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
@@ -466,8 +520,9 @@ while ($tries -lt 20) {
 # STEP 3 - gameplay shots (only if the nav reached the ice). 05/06 are the
 # opening ice shots, 07 is the pause menu, 08 is the resumed ice, and
 # 09/10/11 are extended-play interval shots that catch transitions
-# (faceoff, goal, replay, period changes).
-if ($reachedIce -and -not $SkipGameplay) {
+# (faceoff, goal, replay, period changes). Skipped for -AtlasCapture
+# (the run already stopped at the versus screen).
+if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $g5 = Save-Shot -ShotName "05-ice.png"
     Write-Host ("ice captured: " + $g5)
     Write-Host "Skating (left stick up) for a gameplay shot."
@@ -507,8 +562,9 @@ if ($reachedIce -and -not $SkipGameplay) {
 # OCR-checked every few cycles from a fast screen capture: Pause is
 # resumed with Cross, a menu means the game is over, Unknown is tolerated
 # and logged. A frame-dump data shot is taken every 10 minutes. The
-# emulator exiting (crash) ends the phase immediately.
-if ($reachedIce -and -not $SkipGameplay) {
+# emulator exiting (crash) ends the phase immediately. Skipped for
+# -AtlasCapture (the run already stopped at the versus screen).
+if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $gameplayStart = Get-Date
     $gameplayEnd = $gameplayStart.AddMinutes($GameplayMinutes)
     $gameOver = $false

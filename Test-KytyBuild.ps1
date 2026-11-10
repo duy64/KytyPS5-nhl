@@ -1,20 +1,19 @@
-# Test-KytyBuild.ps1 - v9 (2026-11-10)
+# Test-KytyBuild.ps1 - v10 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v9 gives the script a ROADMAP (user's call): a fixed route Title ->
-# Hub -> Versus -> Ice, with the script always knowing which stop it is
-# heading for. The reactive loop guessed from whatever OCR read and kept
-# getting lost - Cross on the wrong highlight, a loading screen read as
-# Ice, blind presses on screens it could not name. The roadmap only
-# accepts the screen it expects (or a known detour: sign-in dialog,
-# pause menu, loading screen); a later stop jumps forward, an earlier
-# stop goes back, anything else waits and re-reads. Each stop gets 8
-# tries, then the run fails naming the stop it stuck on. v8's fixes ride
-# along: Hub reads the highlight (Down to PLAY NOW on the main menu),
-# Ice needs HUD text (no bare "nhl"), STEP 1 sign-in alternates
-# Circle / Cross.
+# v10 fixes the stuck-versus run (2026-11-10 16:28, #142 delta, v9). The
+# emulator sat at the Play Now versus screen at a healthy 47 fps while the
+# script did nothing - the game was fine, the script was looping. Two
+# causes, both from the 1536 atlas run (245 nav shots to reach versus):
+#  - The Hub action used left-stick Down ("s") to move the highlight, but
+#    the menu may only answer the D-pad. The highlight never moved, Cross
+#    kept opening BE A PRO CAREER, and the roadmap ping-ponged Hub <->
+#    Versus. Menu navigation now uses D-pad Down ("Down").
+#  - The roadmap jump resets the per-stop try counter, so a stuck game
+#    ping-pongs forever and never fails. A global cap of 60 nav shots now
+#    ends the loop with the stop it stuck on, instead of running all day.
 #
 # What is different from the v2 script (and why v2 never got past the title):
 #  - The PSN sign-in dialog is handled FIRST, explicitly, before any title
@@ -504,8 +503,18 @@ $titleTries = 0
 $reachedIce = $false
 $reachedVersus = $false
 $navFailed = $false
+# Global cap: the jump resets the per-stop counter, so a stuck game can
+# ping-pong between two stops forever (245 shots in the v9 atlas run).
+# 60 nav shots is far more than a clean run needs (a good run takes under
+# 20); past that, fail naming the stop it stuck on.
+$maxNavShots = 60
 while ($step -lt $roadmap.Count) {
     $stepTries++
+    if ($navShot -ge $maxNavShots) {
+        Write-Warning ("Roadmap exceeded " + $maxNavShots + " nav shots at stop '" + $roadmap[$step] + "'. Stopping - see the nav shots and transcript for the last screen seen.")
+        $navFailed = $true
+        break
+    }
     if ($stepTries -gt 8) {
         Write-Warning ("Roadmap stuck at stop '" + $roadmap[$step] + "' after 8 tries. Stopping - see the nav shots and transcript for the last screen seen.")
         $navFailed = $true
@@ -609,13 +618,15 @@ while ($step -lt $roadmap.Count) {
         # the main menu highlights BE A PRO CAREER first, so Cross there
         # opens Be A Pro instead of Play Now. The Be A Pro hub highlights
         # PLAY NEXT GAME, so Cross is right there. Tell them apart by the
-        # OCR text.
+        # OCR text. Menu navigation uses D-pad Down ("Down"), not the left
+        # stick - the menu may ignore the stick, which left the highlight
+        # unmoved and ping-ponged Hub <-> Versus for 245 shots (v9 atlas).
         if ($text -match "play next game") {
             Write-Host "Be A Pro hub - selecting PLAY NEXT GAME for the Versus screen."
             Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
         } else {
             Write-Host "Main menu - moving down to PLAY NOW, then confirming."
-            Invoke-InputStage -Lines @("s 150", "sleep 1500", "j 150", "sleep 4000") -ExtraWaitSec 2
+            Invoke-InputStage -Lines @("Down 150", "sleep 1500", "j 150", "sleep 4000") -ExtraWaitSec 2
         }
         $step++
         continue

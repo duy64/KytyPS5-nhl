@@ -4,6 +4,12 @@
 // "Poor man's RenderDoc": KYTY_DBG_FRAME_DUMP=1 enables a frame dump that is triggered with F2 in the
 // game window. KYTY_DBG_FRAME_DUMP_CS_CONSTANTS=1 additionally surveys all compute bindings and
 // copies bound GPU buffers up to 4096 bytes, without reading protected guest backing.
+// KYTY_DBG_FRAME_DUMP_SAMPLED=1 additionally dumps sampled BC textures (BC1/BC3/BC7, ...) as raw
+// "smp" readbacks (<seq>_smp_<addr>_<WxH>_<format>.bin, one per guest address, cap 200) for offline
+// BC decoding — the only way to see whether a garbled sampled texture holds garbage data or is
+// merely sampled wrong. Sampled textures are never dumped by the normal path (only render targets
+// and written storage images are), so this is the atlas-dump diagnostic for the leaders shield,
+// missing team names, and red-ice texture questions.
 // The next complete guest frame (flip to flip) is captured: every draw/dispatch is
 // logged to <captures>/frame_<n>/frame.txt and every render pass's color/depth targets and every
 // dispatch's written storage images are read back and saved as PNG. Zero cost when the flag is off

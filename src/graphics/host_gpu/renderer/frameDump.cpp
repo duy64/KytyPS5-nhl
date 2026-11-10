@@ -37,7 +37,7 @@ std::atomic<bool> g_active {false};
 
 namespace {
 
-constexpr uint32_t   kMaxImages       = 400;
+constexpr uint32_t   kMaxImages       = 800;
 constexpr uint32_t   kMinSize         = 8;
 constexpr uint64_t   kMaxPendingBytes = 3ull << 30u;
 
@@ -55,6 +55,7 @@ struct Target {
 	uint32_t             seq = 0;
 	uint32_t             slices = 1; // >1: 3D volume, all z slices are read back
 	bool                 img3d = false; // 3D image bound to a KYTY_DBG_FRAME_DUMP_BUF_PS draw: raw .bin + IMG3D line
+	bool                 raw = false; // sampled-texture dump (KYTY_DBG_FRAME_DUMP_SAMPLED): raw .bin, no PNG decode
 };
 
 struct Pending {
@@ -108,6 +109,46 @@ std::vector<BufPending>  g_bufpending;
 std::string              g_buflog;
 std::set<std::pair<uint64_t, uint32_t>> g_seen_vol; // (address, draw seq)
 std::set<std::string>    g_seen_buf;
+
+// ---- sampled-texture dump (atlas dump) ----
+// KYTY_DBG_FRAME_DUMP_SAMPLED=1: dump sampled BC textures (BC1/BC3/BC7, ...) as raw "smp"
+// readbacks for offline BC decoding. Sampled textures are never dumped by the normal path
+// (RecordReadback skips them: BytesPerPixel is 0 for block-compressed formats), so without
+// this the capture cannot tell whether a garbled sampled texture holds garbage data (upload /
+// cache gap) or is merely sampled wrong. Requests are queued in OnDraw and flushed in
+// FlushRequests (outside the render pass); one entry per guest address, capped at 200.
+struct SmpReq {
+	Target   target;
+	uint32_t seq = 0;
+};
+std::vector<SmpReq>  g_smpreq;
+std::set<uint64_t>   g_seen_smp; // guest addresses already queued this capture
+bool                 g_smp_cap_logged = false;
+constexpr uint32_t   kMaxSampled = 200;
+
+bool SampledDumpEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_SAMPLED");
+		return v != nullptr && v[0] == '1';
+	}();
+	return enabled;
+}
+
+// Bytes per 4x4 block for BC (block-compressed) formats; 0 = not a BC format.
+uint32_t BcBlockBytes(vk::Format f) {
+	switch (f) {
+		case vk::Format::eBc1RgbaUnormBlock: case vk::Format::eBc1RgbaSrgbBlock:
+		case vk::Format::eBc4UnormBlock: case vk::Format::eBc4SnormBlock:
+			return 8;
+		case vk::Format::eBc2UnormBlock: case vk::Format::eBc2SrgbBlock:
+		case vk::Format::eBc3UnormBlock: case vk::Format::eBc3SrgbBlock:
+		case vk::Format::eBc5UnormBlock: case vk::Format::eBc5SnormBlock:
+		case vk::Format::eBc6HUfloatBlock: case vk::Format::eBc6HSfloatBlock:
+		case vk::Format::eBc7UnormBlock: case vk::Format::eBc7SrgbBlock:
+			return 16;
+		default: return 0;
+	}
+}
 
 struct CaptureJob {
 	std::vector<Pending>     pending;
@@ -317,6 +358,8 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash,
 
 void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t, const char* label,
                     uint32_t seq);
+void RecordSampledReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t,
+                           uint32_t seq);
 
 void EnsureWorker();
 void ProcessJob(CaptureJob& job);
@@ -324,7 +367,7 @@ void WorkerLoop();
 
 // Records the GPU->host copies of the queued buffers and volumes. cmd must be outside a render pass.
 void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
-	if (g_bufreq.empty() && g_volreq.empty()) return;
+	if (g_bufreq.empty() && g_volreq.empty() && g_smpreq.empty()) return;
 	using S = vk::PipelineStageFlagBits2;
 	using A = vk::AccessFlagBits2;
 	if (!g_bufreq.empty()) {
@@ -368,6 +411,10 @@ void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
 		RecordReadback(gfx, cmd, v.target, "vol", v.seq);
 	}
 	g_volreq.clear();
+	for (auto& s : g_smpreq) {
+		RecordSampledReadback(gfx, cmd, s.target, s.seq);
+	}
+	g_smpreq.clear();
 }
 
 std::string Hex(uint64_t v);
@@ -843,6 +890,43 @@ void ProcessOne(Pending& p, const std::string& dir, std::string& log) {
 			log += "RAW seq=" + std::to_string(p.seq) + " file_open_failed\n";
 		}
 	}
+	if (t.raw) {
+		// Sampled-texture dump: raw BC bytes for offline decoding (no PNG — Decode cannot
+		// handle block-compressed formats). File: <seq>_smp_<addr>_<WxH>_<format>.bin
+		char path[640];
+		std::snprintf(path, sizeof(path), "%s/%05u_smp_%s_%ux%u_%s.bin", dir.c_str(), p.seq,
+		              Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
+		std::string fname = "(write failed)";
+		if (FILE* f = std::fopen(path, "wb")) {
+			std::fwrite(p.mapped, 1, static_cast<size_t>(p.size), f);
+			std::fclose(f);
+			fname = std::filesystem::path(path).filename().string();
+		}
+		const auto*   d  = static_cast<const uint8_t*>(p.mapped);
+		const uint64_t nd = p.size / 4;
+		uint64_t      nz = 0;
+		for (uint64_t k = 0; k < nd; k++) {
+			uint32_t w;
+			std::memcpy(&w, d + k * 4, 4);
+			nz += w != 0;
+		}
+		char line[1024];
+		std::snprintf(line, sizeof(line),
+		              "SMP seq=%u addr=0x%s %ux%u fmt=%s bytes=%" PRIu64 " nonzero_dwords=%" PRIu64
+		              "/%" PRIu64 " first8:",
+		              p.seq, Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str(), p.size, nz,
+		              nd);
+		std::string l = line;
+		for (uint64_t k = 0; k < 8 && k < nd; k++) {
+			uint32_t w;
+			std::memcpy(&w, d + k * 4, 4);
+			char wb[16];
+			std::snprintf(wb, sizeof(wb), " %08x", w);
+			l += wb;
+		}
+		log += l + " -> " + fname + "\n";
+		return;
+	}
 	if (t.slices > 1) {
 		ProcessVolume(p, dir, log);
 		return;
@@ -986,7 +1070,7 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 	}
 	if (g_images >= kMaxImages) {
 		if (g_images == kMaxImages) {
-			g_log += "IMG cap reached (400 images), further images skipped\n";
+			g_log += "IMG cap reached (800 images), further images skipped\n";
 			g_images++;
 		}
 		return;
@@ -1041,6 +1125,71 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 	p.target   = t;
 	p.seq      = seq;
 	p.label    = label;
+	p.graphics = &gfx;
+	g_pending.push_back(std::move(p));
+}
+
+// Must be called with g_mutex held. Sampled-texture ("smp") readback: same staging-buffer copy
+// as RecordReadback, but sized by BC blocks (BytesPerPixel is 0 for block-compressed formats)
+// and labelled "smp" so ProcessOne writes the raw bytes instead of decoding a PNG. The copy
+// extent is the mip extent; for BC formats that is block-aligned in practice (mip 0), and a
+// smaller-than-block extent is only used when it equals the whole subresource.
+void RecordSampledReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t,
+                           uint32_t seq) {
+	char line[256];
+	const uint32_t bb = BcBlockBytes(t.format);
+	if (bb == 0 || t.image == nullptr) return;
+	if (g_images >= kMaxImages) {
+		if (g_images == kMaxImages) {
+			g_log += "IMG cap reached (800 images), further images skipped\n";
+			g_images++;
+		}
+		return;
+	}
+	const uint64_t size =
+	    static_cast<uint64_t>((t.w + 3) / 4) * ((t.h + 3) / 4) * bb * t.slices;
+	if (g_pending_bytes + size > kMaxPendingBytes) {
+		std::snprintf(line, sizeof(line), "SMP seq=%u addr=0x%s %ux%u fmt=%s SKIPPED (readback memory cap)\n",
+		              seq, Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
+		g_log += line;
+		return;
+	}
+	vk::BufferCreateInfo bi {};
+	bi.size  = size;
+	bi.usage = vk::BufferUsageFlagBits::eTransferDst;
+	VmaAllocationCreateInfo ai {};
+	ai.usage = VMA_MEMORY_USAGE_AUTO;
+	ai.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	VkBuffer          native = VK_NULL_HANDLE;
+	VmaAllocation     alloc  = nullptr;
+	VmaAllocationInfo info {};
+	if (vmaCreateBuffer(gfx.allocator, reinterpret_cast<const VkBufferCreateInfo*>(&bi), &ai, &native,
+	                    &alloc, &info) != VK_SUCCESS) {
+		g_log += "SMP buffer allocation failed\n";
+		return;
+	}
+	g_images++;
+	g_pending_bytes += size;
+
+	using S = vk::PipelineStageFlagBits2;
+	using A = vk::AccessFlagBits2;
+	BarrierImage(cmd, t, t.layout, vk::ImageLayout::eTransferSrcOptimal, S::eAllCommands,
+	             A::eMemoryWrite, S::eTransfer, A::eTransferRead);
+	vk::BufferImageCopy copy {};
+	copy.imageSubresource = {t.copy_aspect, t.mip, t.layer, 1};
+	copy.imageExtent      = vk::Extent3D {t.w, t.h, t.slices};
+	cmd.copyImageToBuffer(t.image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(native), 1, &copy);
+	BarrierImage(cmd, t, vk::ImageLayout::eTransferSrcOptimal, t.layout, S::eTransfer, A::eTransferRead,
+	             S::eAllCommands, A::eMemoryRead | A::eMemoryWrite);
+
+	Pending p;
+	p.buffer   = vk::Buffer(native);
+	p.alloc    = alloc;
+	p.mapped   = info.pMappedData;
+	p.size     = size;
+	p.target   = t;
+	p.seq      = seq;
+	p.label    = "smp";
 	p.graphics = &gfx;
 	g_pending.push_back(std::move(p));
 }
@@ -1117,6 +1266,9 @@ void BeginCapture(CommandBuffer& buffer) {
 	g_buflog.clear();
 	g_seen_vol.clear();
 	g_seen_buf.clear();
+	g_smpreq.clear();
+	g_seen_smp.clear();
+	g_smp_cap_logged = false;
 	g_capturing = true;
 	g_active.store(true, std::memory_order_relaxed);
 	std::printf("NHL27FRAMEDUMP: capturing frame -> %s\n", g_dir.c_str());
@@ -1340,6 +1492,36 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	}
 	for (int i = 0; i < 3; i++) AppendImages(s, ("vs_img" + std::to_string(i)).c_str(), draw.vs_images[i]);
 	AppendImages(s, "ps_img", draw.ps_images);
+	if (SampledDumpEnabled()) {
+		// Atlas dump: queue every sampled BC texture (one entry per guest address, cap 200).
+		// The GPU copy is recorded later in FlushRequests, outside the render pass.
+		const auto queue_smp = [&](const std::vector<TextureBinding>* images) {
+			if (images == nullptr) return;
+			for (size_t si = 0; si < images->size(); si++) {
+				const auto& im = (*images)[si];
+				if (BcBlockBytes(im.desc.info.pixel_format) == 0) continue;
+				const uint64_t addr = im.desc.info.data.address;
+				if (addr == 0) continue;
+				if (!g_seen_smp.insert(addr).second) continue;
+				if (g_smpreq.size() >= kMaxSampled) {
+					if (!g_smp_cap_logged) {
+						g_log += "SMP cap reached (200 sampled images), further sampled images skipped\n";
+						g_smp_cap_logged = true;
+					}
+					continue;
+				}
+				SmpReq r;
+				r.seq = seq;
+				if (MakeTarget(context, im.image_id, im.desc.view_info, im.layout, addr, r.target)) {
+					r.target.slot = static_cast<uint32_t>(si);
+					r.target.raw  = true;
+					g_smpreq.push_back(std::move(r));
+				}
+			}
+		};
+		queue_smp(draw.ps_images);
+		for (int i = 0; i < 3; i++) queue_smp(draw.vs_images[i]);
+	}
 	g_log += s;
 	if (draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {
 		CaptureBindings(*draw.ps_bindings, seq, draw.ps_hash);

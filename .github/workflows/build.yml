@@ -26,7 +26,8 @@ jobs:
         id: release_tag
         shell: bash
         run: |
-          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_SHA::7}-main" >> "$GITHUB_OUTPUT"
+          BRANCH_SLUG=$(echo "${GITHUB_REF_NAME##*/}" | sed 's/^nhl27-//; s/[^A-Za-z0-9-]/-/g')
+          echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${GITHUB_RUN_NUMBER}-${BRANCH_SLUG}-${GITHUB_SHA::7}-f2dump" >> "$GITHUB_OUTPUT"
 
   windows:
     name: Build KytyPS5 (Windows)

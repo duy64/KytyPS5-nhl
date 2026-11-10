@@ -590,6 +590,7 @@ void BufferCache::Unregister(BufferId id) {
 template <bool insert>
 void BufferCache::ChangeRegister(BufferId id) {
 	++m_registration_generation;
+	FrameBreakdown::VAdd(FrameBreakdown::g_counters.buffer_registrations);
 	auto& buffer = m_slot_buffers[id];
 	PageTable::PageRange pages {};
 	EXIT_IF(!(GuestRange {buffer.CpuAddress(), buffer.Size()}.Valid()) ||
@@ -2224,6 +2225,27 @@ void BufferCache::StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t
 			copies->Copy(destination, source, size);
 			return;
 		}
+		// A range no single mapping holds: a page at a time (mappings hold whole pages), so the
+		// copies still go to the copy thread instead of waiting for all of its work (in-play A/B:
+		// draw 3.572 -> 3.342 us, dispatch 2.304 -> 2.231 us).
+		if (deferring) {
+			constexpr uint64_t Page = 0x1000;
+			bool               all  = true;
+			for (uint64_t at = vaddr; at < vaddr + size && all;) {
+				const auto chunk = std::min((at & ~(Page - 1)) + Page, vaddr + size) - at;
+				all              = Libs::LibKernel::Memory::FindBackingPointer(at, chunk) != nullptr;
+				at += chunk;
+			}
+			if (all) {
+				for (uint64_t at = vaddr; at < vaddr + size;) {
+					const auto chunk = std::min((at & ~(Page - 1)) + Page, vaddr + size) - at;
+					copies->Copy(destination + (at - vaddr), Libs::LibKernel::Memory::FindBackingPointer(at, chunk),
+					             chunk);
+					at += chunk;
+				}
+				return;
+			}
+		}
 	}
 	if (deferring && copies != nullptr) {
 		copies->Drain();
@@ -2413,6 +2435,14 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		return {&buffer, entry.offset};
 	}
 	FrameBreakdown::VAdd(FrameBreakdown::g_counters.obtain_cache_misses);
+	if (FrameBreakdown::Verbose()) {
+		auto& c = FrameBreakdown::g_counters;
+		FrameBreakdown::VAdd(entry.vaddr != vaddr || entry.size != size         ? c.obtain_miss_slot
+		                     : entry.registration != m_registration_generation ? c.obtain_miss_registration
+		                     : IsBufferInvalid(entry.id) || !m_slot_buffers[entry.id].IsInBounds(vaddr, size)
+		                         ? c.obtain_miss_buffer
+		                         : c.obtain_miss_cpu);
+	}
 	// Stamp before the lookup so a CPU write racing with it forces a recheck on the next hit.
 	const auto registration = m_registration_generation;
 	const auto result       = ObtainBuffer(vaddr, size, false, false, id);
@@ -2422,6 +2452,11 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferCached(uint64_t vaddr, uin
 		if (!IsBufferInvalid(found) && &m_slot_buffers[found] == result.first) {
 			entry = {vaddr, size, registration, cpu, found, result.second};
 		}
+	} else if (FrameBreakdown::Verbose()) {
+		auto& c = FrameBreakdown::g_counters;
+		FrameBreakdown::VAdd(result.first == &m_stream_buffer             ? c.obtain_nostore_stream
+		                     : registration != m_registration_generation ? c.obtain_nostore_registration
+		                                                                 : c.obtain_nostore_cpu);
 	}
 	return result;
 }

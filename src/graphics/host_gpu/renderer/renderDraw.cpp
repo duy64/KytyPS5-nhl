@@ -28,6 +28,7 @@
 #include <fmt/format.h>
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/pageWriteSeq.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/nativeIndirect.h"
@@ -460,6 +461,18 @@ static bool PixelShaderHasDepthOrCoverageSideEffects(const HW::ShaderRegisters& 
 }
 
 // RenderExecutor::AcquireDrawRenderState() restores each member: keep it in sync.
+// The vertex buffers of a draw, prepared (see AcquireVertexBuffers). Defined here so a
+// resolution ahead of execution can carry them (see ResolvedDraw).
+struct PreparedVertexBuffers {
+	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
+
+	// Entries [0, count) are set.
+	std::array<vk::Buffer, MaxBuffers>     buffers;
+	std::array<vk::DeviceSize, MaxBuffers> offsets;
+	std::array<vk::DeviceSize, MaxBuffers> sizes;
+	uint32_t                               count = 0;
+};
+
 struct DrawRenderState {
 	RenderDepthInfo       depth_info;
 	RenderColorInfo       color_info[RENDER_COLOR_ATTACHMENTS_MAX] = {};
@@ -472,6 +485,10 @@ struct DrawRenderState {
 	// when the draw reuses the targets of the draw before.
 	RenderColorInfo* colors = color_info;
 	RenderDepthInfo* depth  = &depth_info;
+	// Vertex buffers prepared ahead by the resolve thread (see ResolvedDraw); null when this
+	// draw prepares them itself. Points into the resolution ring: valid only until the draw
+	// executes and releases its resolution.
+	const PreparedVertexBuffers* ahead_vertex_buffers = nullptr;
 };
 static_assert(std::is_trivially_destructible_v<DrawRenderState>);
 
@@ -495,12 +512,29 @@ struct RenderExecutor::ResolvedDraw {
 	DrawRenderStorage storage;
 	ProgramResolution programs;
 	std::atomic_bool  busy {false};
+	// Parallel draw prep (KYTY_PARALLEL_DRAWPREP): the vertex buffers prepared ahead by the
+	// resolve thread, so the execution thread skips AcquireVertexBuffers. Valid only when
+	// buffers_ready and no operation after buffer_resolve_base wrote the recorded guest
+	// ranges (see PageWriteSeq; the game does not rewrite memory submitted GPU work still
+	// reads). Otherwise the execution thread prepares them as before.
+	PreparedVertexBuffers vertex_buffers {};
+	bool                  buffers_ready = false;
+	uint64_t              buffer_resolve_base = 0;
+	bool                  buffer_base_valid = false;
+	// Guest ranges (address, size) the vertex buffers were read from; at most one merged
+	// range per vertex buffer slot.
+	static constexpr uint32_t MaxBufferRanges = PreparedVertexBuffers::MaxBuffers;
+	uint32_t              buffer_range_count = 0;
+	std::array<std::pair<uint64_t, uint64_t>, MaxBufferRanges> buffer_ranges {};
 };
 
-// More resolutions than operations can wait between the resolve and execution threads, so the
-// resolve thread only ever waits for room in that queue.
+// A resolver that gets this far ahead of the execution thread waits for the oldest resolution to be
+// released. Each resolution is about 38 KB: 320 of them (12 MB) did not stay in cache or in the TLB's
+// reach, and the execution thread read them cold (paused in-boot A/B, 48 per draw resolver instead of
+// 160: draw -1.2%, dispatch -1.9%). In play the resolvers need the slack: at 48 the execution thread
+// waited for them (idle 163 vs 94 ms/s, about -6% fps); 96 did not (idle 171 vs 212 ms/s).
 struct RenderExecutor::ResolvedDrawRing {
-	static constexpr size_t Size = 320;
+	static constexpr size_t Size = 192;
 
 	std::array<ResolvedDraw, Size> draws;
 	size_t                         next = 0;
@@ -509,6 +543,9 @@ struct RenderExecutor::ResolvedDrawRing {
 void RenderExecutor::ReleaseResolvedDraw(ResolvedDraw* resolved) noexcept {
 	resolved->busy.store(false, std::memory_order_release);
 }
+
+// Parallel draw prep (KYTY_PARALLEL_DRAWPREP): defined below, before ResolveDrawAhead.
+static bool AheadVertexBuffersValid(const RenderExecutor::ResolvedDraw& draw);
 
 // The render targets the last draw acquired. Nearly every draw renders to the targets of the
 // draw before it, with the same target registers, and acquiring them again repeats the same
@@ -765,6 +802,7 @@ static void ResetDrawRenderState(DrawRenderState& state, bool tessellation_stage
 	ValueInitialize(state.color_info[0]);
 	state.color_count = 0;
 	state.ps_active   = true;
+	state.ahead_vertex_buffers = nullptr;
 	ResetVertexInputInfo(state.vertex_info[0]);
 	if (tessellation_stages) {
 		ResetVertexInputInfo(state.vertex_info[1]);
@@ -800,7 +838,12 @@ DrawRenderState& RenderExecutor::AcquireDrawRenderState(bool tessellation, bool&
 		}
 	}
 	if (shaders_resolved) {
-		return resolved->storage.state;
+		auto& state = resolved->storage.state;
+		// Parallel draw prep: use the vertex buffers the resolve thread prepared when
+		// their guest ranges were not written since.
+		state.ahead_vertex_buffers =
+		    AheadVertexBuffersValid(*resolved) ? &resolved->vertex_buffers : nullptr;
+		return state;
 	}
 	if (m_draw_state == nullptr) {
 		m_draw_state = {new DrawRenderStorage {},
@@ -1286,18 +1329,12 @@ struct VertexBufferRange {
 	[[nodiscard]] uint64_t RequestedSize() const { return requested_end - base_address; }
 };
 
-struct PreparedVertexBuffers {
-	static constexpr uint32_t MaxBuffers = ShaderVertexInputInfo::RES_MAX;
-
-	// Entries [0, count) are set.
-	std::array<vk::Buffer, MaxBuffers>     buffers;
-	std::array<vk::DeviceSize, MaxBuffers> offsets;
-	std::array<vk::DeviceSize, MaxBuffers> sizes;
-	uint32_t                               count = 0;
-};
-
-static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               buffer,
-                                                  const ShaderVertexInputInfo& vs_input_info) {
+// Prepares the vertex buffers of a draw. ranges_out (when given) receives the merged guest
+// ranges actually read (address, size), for validity checks of work prepared ahead.
+static PreparedVertexBuffers AcquireVertexBuffers(BufferCache&                 cache,
+                                                  const ShaderVertexInputInfo& vs_input_info,
+                                                  std::pair<uint64_t, uint64_t>* ranges_out = nullptr,
+                                                  uint32_t* range_count_out = nullptr) {
 	EXIT_IF(vs_input_info.buffers_num < 0 ||
 	        vs_input_info.buffers_num > ShaderVertexInputInfo::RES_MAX);
 
@@ -1338,7 +1375,6 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		merged_ranges[merged_count++] = {range.base_address, range.requested_end, 0, nullptr, 0};
 	}
 
-	auto& cache = buffer.GetContext().GetBufferCache();
 	for (uint32_t i = 0; i < merged_count; i++) {
 		auto& range = merged_ranges[i];
 		// PPSA20298
@@ -1347,6 +1383,13 @@ static PreparedVertexBuffers AcquireVertexBuffers(CommandBuffer&               b
 		range.acquired_end = range.base_address + size;
 		std::tie(range.buffer, range.buffer_offset) =
 		    cache.ObtainBuffer(range.base_address, size, false);
+	}
+	if (ranges_out != nullptr && range_count_out != nullptr) {
+		*range_count_out = merged_count;
+		for (uint32_t i = 0; i < merged_count; i++) {
+			ranges_out[i] = {merged_ranges[i].base_address,
+			                 merged_ranges[i].acquired_end - merged_ranges[i].base_address};
+		}
 	}
 
 	// Rebuild slot bindings, offsetting non-empty slots into their acquired merged range.
@@ -1530,6 +1573,57 @@ static bool PixelShaderActive(const HW::Context& ctx, const HW::Shader& shaders,
 	        PixelShaderHasDepthOrCoverageSideEffects(ctx.GetShaderRegisters()));
 }
 
+// Parallel draw prep (KYTY_PARALLEL_DRAWPREP): whether the vertex buffers a resolution
+// prepared ahead are still valid: no operation after the resolve base wrote their guest
+// ranges (see PageWriteSeq; the game does not rewrite memory submitted GPU work still
+// reads). Mirrors the skip path of GuestReadLog::StillValid for program reads.
+static bool AheadVertexBuffersValid(const RenderExecutor::ResolvedDraw& draw) {
+	if (!draw.buffers_ready || !draw.buffer_base_valid ||
+	    draw.buffer_resolve_base <
+	        Libs::Graphics::PageWriteSeq::g_floor.load(std::memory_order_acquire)) {
+		return false;
+	}
+	for (uint32_t i = 0; i < draw.buffer_range_count; i++) {
+		const auto& range = draw.buffer_ranges[i];
+		if (Libs::Graphics::PageWriteSeq::Last(range.first, range.second) >
+		    draw.buffer_resolve_base) {
+			return false;
+		}
+	}
+	return true;
+}
+
+// Parallel draw prep (KYTY_PARALLEL_DRAWPREP): prepare a draw's vertex buffers on the
+// resolve thread, so the execution thread skips AcquireVertexBuffers. Records the guest
+// ranges read and the resolve base, so the execution thread can check they were not
+// written since (see AheadVertexBuffersValid). Runs only when the flag is on; otherwise
+// the draw prepares its buffers on the execution thread as before.
+static void PrepareVertexBuffersAhead(RenderExecutor::ResolvedDraw& draw,
+                                      const DrawRenderState& state, BufferCache& cache) {
+	draw.buffers_ready      = false;
+	draw.buffer_range_count = 0;
+	if (!Common::Experiments::Enabled(Common::Experiments::ParallelDrawPrep)) {
+		return;
+	}
+	const auto& vs_input = state.vertex_info[0];
+	if (vs_input.buffers_num <= 0) {
+		return;
+	}
+	draw.buffer_resolve_base = GuestReadLog::ResolveBase();
+	draw.buffer_base_valid   = GuestReadLog::ResolveBaseValid();
+	std::array<std::pair<uint64_t, uint64_t>, RenderExecutor::ResolvedDraw::MaxBufferRanges> ranges {};
+	uint32_t range_count = 0;
+	draw.vertex_buffers = AcquireVertexBuffers(cache, vs_input, ranges.data(), &range_count);
+	if (range_count > RenderExecutor::ResolvedDraw::MaxBufferRanges) {
+		return;
+	}
+	draw.buffer_range_count = range_count;
+	for (uint32_t i = 0; i < range_count; i++) {
+		draw.buffer_ranges[i] = ranges[i];
+	}
+	draw.buffers_ready = true;
+}
+
 RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context&    context,
                                                                const HW::UserConfig& user_config,
                                                                const HW::Shader&     shaders,
@@ -1573,6 +1667,8 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ResolveDrawAhead(const HW::Context
 	if (draw.programs.reads.Failed()) {
 		return nullptr;
 	}
+	// Parallel draw prep: prepare the vertex buffers on this thread too.
+	PrepareVertexBuffersAhead(draw, state, m_context.GetBufferCache());
 	// Published to the execution thread with the operation that carries it.
 	draw.busy.store(true, std::memory_order_relaxed);
 	return &draw;
@@ -1910,8 +2006,13 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!mesh_active) {
 		FrameBreakdown::Timer buffers_timer(FrameBreakdown::g_counters.dp_buffers_ns);
 		FrameBreakdown::Timer vertex_index_timer(FrameBreakdown::g_counters.dp_vertex_index_ns);
-		LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
-		vertex_bindings = AcquireVertexBuffers(buffer, state.vertex_info[0]);
+		if (state.ahead_vertex_buffers != nullptr) {
+			// Parallel draw prep: the resolve thread prepared these; skip AcquireVertexBuffers.
+			vertex_bindings = *state.ahead_vertex_buffers;
+		} else {
+			LogDrawPhase(draw.Name(), "PrepareVertexBuffers");
+			vertex_bindings = AcquireVertexBuffers(buffer.GetContext().GetBufferCache(), state.vertex_info[0]);
+		}
 		index_binding   = PrepareIndexBuffer(buffer, index_source);
 	}
 	// Upstream's DrawIndirectArgs records are never produced here: indirect draws take

@@ -1,7 +1,29 @@
-# Test-KytyBuild.ps1 - v14 (2026-11-10)
+# Test-KytyBuild.ps1 - v15 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v15 fixes the 2026-11-10 1736 run (#139 atlas, 4b197fb), which never
+# tested the versus screen or the pause menu even though the transcript
+# claims "Gameplay shots complete: 04-versus, ... 07 pause menu":
+#  - After PLAY NEXT GAME the game shows a "PLEASE CHOOSE A GAME
+#    EXPERIENCE" dialog (CUSTOM / QUICK / MEDIUM / REAL-TIME). v14 had
+#    no stop for it, and Get-ScreenKind read it as Ice because the
+#    dialog says "5 MINUTE PERIODS" and Ice matched bare "period".
+#    The roadmap is now Title -> Hub -> GameExperience -> Versus ->
+#    Ice, and the GameExperience stop confirms the highlighted choice
+#    (CUSTOM, the default - the same choice the 1736 run confirmed by
+#    accident, which reached versus and the ice fine). Do NOT move the
+#    highlight: changing the preset is the user's call.
+#  - Ice no longer matches bare "period"/"shots"/"goals"/"hits": it
+#    needs real HUD text ("sog", "power play", "penalty kill") or a
+#    game clock with a period ("13:54" + "1ST"). The dialog says
+#    "PERIODS" and the goal-summary screen says "GOAL SUMMARY", so
+#    both used to read as Ice.
+#  - The STEP 3 completion line only claims the versus shot when the
+#    Versus stop was actually reached, and the pause-menu shot is
+#    OCR-checked: if Options did not open a pause menu, the transcript
+#    says so instead of calling the shot a pause menu.
 #
 # v13 backs up the real save before every run (user's call). The test
 # already plays on a copy: it copies the run-folder save into the build
@@ -428,13 +450,21 @@ function Get-ScreenKind {
     # the loop pressed Down+Cross on it ~240 times). Versus markers are
     # "select team" / "select sides" / "versus" / faceoff.
     if ($t -match "select team|select sides|versus|faceoff|face-off") { return "Versus" }
+    # GameExperience BEFORE Ice: the dialog says "5 MINUTE PERIODS" and
+    # Ice used to match bare "period" (v14, 1736 run: the dialog was read
+    # as Ice and the nav loop quit before versus). Markers are the dialog
+    # title and the period-length options; "minute periods" covers the
+    # case where OCR reads only the options list, without the title or
+    # the "(1-2 SHIFTS PER PERIOD)" parenthetical.
+    if ($t -match "choose a game|game experience|shifts per period|minute periods") { return "GameExperience" }
     if ($t -match "be a pro|play now|play next game|franchise|hut|world of chel") { return "Hub" }
     if ($t -match "pause|paused|resume|quit to|settings") { return "Pause" }
-    # Ice needs real HUD text. The bare word "nhl" is in the window title
-    # bar of every screen capture, so it matched dark loading screens and
-    # quit the nav loop early (v7 atlas run, shot 04). Frame dumps have no
-    # title bar, but the scoreboard words match real ice either way.
-    if ($t -match "period|shots|goals|hits") { return "Ice" }
+    # Ice needs real HUD text. The bare words "period", "shots", "goals"
+    # and "hits" matched menus: the GameExperience dialog says "5 MINUTE
+    # PERIODS", the goal-summary screen says "GOAL SUMMARY". The scorebug
+    # shows SOG and a clock with a period, so match those instead.
+    if ($t -match "sog|power play|penalty kill") { return "Ice" }
+    if (($t -match "\d+:\d+") -and ($t -match "1st|2nd|3rd")) { return "Ice" }
     return "Unknown"
 }
 
@@ -513,7 +543,7 @@ if (-not $signInGone) {
 }
 
 # STEP 2 - roadmap navigation. The script follows a fixed route, not a
-# guess: Title -> Hub -> Versus -> Ice. It always knows which stop it is
+# guess: Title -> Hub -> GameExperience -> Versus -> Ice. It always knows which stop it is
 # heading for, and only accepts the screen it expects (or a known detour).
 # A reactive loop that presses buttons on whatever OCR reads gets lost:
 # it pressed Cross on the main menu with BE A PRO CAREER highlighted and
@@ -536,7 +566,7 @@ if (-not $signInGone) {
 # seen, instead of wandering. Be A Pro
 # rule (unchanged): if the screen offers only START CAREER with no
 # CONTINUE, STOP - never create a character.
-$roadmap = @("Title", "Hub", "Versus", "Ice")
+$roadmap = @("Title", "Hub", "GameExperience", "Versus", "Ice")
 $step = 0
 $navShot = 0
 $signInTries = 0
@@ -678,6 +708,16 @@ while ($step -lt $roadmap.Count) {
         $step++
         continue
     }
+    if ($want -eq "GameExperience") {
+        # The game asks which game experience to play. Confirm the
+        # highlighted choice (CUSTOM, the default) - the same choice the
+        # 1736 run confirmed, which reached versus and the ice. Do NOT
+        # move the highlight: changing the preset is the user's call.
+        Write-Host "Game experience dialog - confirming the highlighted choice for the Versus screen."
+        Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
+        $step++
+        continue
+    }
     if ($want -eq "Versus") {
         if (-not $reachedVersus) {
             $reachedVersus = $true
@@ -730,7 +770,13 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     Write-Host "Opening the pause menu (Options)."
     Invoke-InputStage -Lines @("Return 150", "sleep 3000") -ExtraWaitSec 2
     $g7 = Save-ScreenShot -ShotName "07-pause-menu.png"
-    Write-Host ("pause menu captured: " + $g7)
+    $g7Text = Get-ShotText -ShotPath $g7
+    $g7Kind = Get-ScreenKind -Text $g7Text
+    if ($g7Kind -eq "Pause") {
+        Write-Host ("pause menu captured: " + $g7)
+    } else {
+        Write-Warning ("Options did not open the pause menu - screen is " + $g7Kind + ", so 07-pause-menu.png is NOT a pause menu.")
+    }
     Write-Host "Resuming from the pause menu (Cross)."
     Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
     $g8 = Save-ScreenShot -ShotName "08-ice-resumed.png"
@@ -741,11 +787,17 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
         $gp = Save-ScreenShot -ShotName ("{0:D2}-ice-play-{1}.png" -f (8 + $p), $p)
         Write-Host ("extended play captured: " + $gp)
     }
-    Write-Host "Gameplay shots complete: 04-versus, 05/06/08/09/10/11 ice, 07 pause menu."
+    # Only claim the shots that were actually taken: v14 claimed
+    # "04-versus ... 07 pause menu" unconditionally, but the 1736 run
+    # never reached the Versus stop and 07 was a dialog, not a menu.
+    $doneMsg = "Gameplay shots complete: 05/06/08/09/10/11 ice"
+    if ($reachedVersus) { $doneMsg += ", 04-versus" } else { $doneMsg += " (04-versus was never captured - Versus stop not reached)" }
+    if ($g7Kind -eq "Pause") { $doneMsg += ", 07 pause menu" } else { $doneMsg += " (07 is not a pause menu - see warning above)" }
+    Write-Host $doneMsg
 } elseif ($reachedIce) {
     Write-Host "Reached the ice; gameplay shots skipped (-SkipGameplay)."
 } else {
-    Write-Warning "Did not reach the ice in 20 nav tries. Result folder holds the nav shots and the transcript for diagnosis."
+    Write-Warning "Did not reach the ice in 60 nav shots. Result folder holds the nav shots and the transcript for diagnosis."
 }
 
 # STEP 4 - dumb full-game gameplay (v4). The point is coverage, not skill:

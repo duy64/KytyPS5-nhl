@@ -503,7 +503,13 @@ void ReadEmu(const JsonValue& root, Settings& s, std::set<std::string>* seen)
 		{
 			if (e.type == JsonValue::Type::String)
 			{
-				s.env[k] = e.s;
+				if (e.s.empty())
+				{
+					s.env.erase(k);
+				} else
+				{
+					s.env[k] = e.s;
+				}
 			}
 		}
 	}
@@ -1120,6 +1126,19 @@ bool save_game_overrides(const Paths& paths, const std::string& title_id, const 
 		v.type                  = JsonValue::Type::String; // empty: unset it in the child's environment
 		file_env.o[entry.first] = std::move(v);
 		env_changed             = true;
+	}
+	// A variable that lives only in this file (not in any lower layer) and that the page removed is gone
+	// entirely: there is no lower value to unset, so keeping it would resurrect the row on the next load.
+	for (auto it = file_env.o.begin(); it != file_env.o.end();)
+	{
+		if (edited.env.count(it->first) == 0 && baseline.env.count(it->first) == 0)
+		{
+			it = file_env.o.erase(it);
+			env_changed = true;
+		} else
+		{
+			++it;
+		}
 	}
 	if (env_changed)
 	{

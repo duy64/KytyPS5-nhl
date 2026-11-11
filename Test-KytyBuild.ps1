@@ -1,7 +1,14 @@
-# Test-KytyBuild.ps1 - v27 (2026-11-11)
+# Test-KytyBuild.ps1 - v28 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v28 downscales screenshots to 1080p before OCR. Tesseract on a full
+# 3840x2160 image is slow and CPU-heavy, and it starves the emulator:
+# in the 1316 run the FPS collapsed from 60 to 5-6 during Versus
+# navigation, when the script runs OCR on every nav shot, and never
+# recovered. Manual play never hits this because no OCR runs at all.
+# The UI text the classifier needs is large and reads fine at 1080p.
 #
 # v27 brings the emulator window to the front before every screenshot
 # (Invoke-BringEmulatorToFront, AttachThreadInput trick so a background
@@ -226,7 +233,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 27
+$TestScriptVersion = 28
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -590,6 +597,27 @@ function Get-ShotText {
     if (-not $script:TesseractExe) { return "" }
     if (-not (Test-Path $ShotPath)) { return "" }
     $tmp = Join-Path $OutDir "ocr-tmp.txt"
+    # v28: downscale the 4K screenshot to 1080p before OCR. Tesseract on
+    # a full 3840x2160 image is slow and CPU-heavy, and it starves the
+    # emulator: in the 1316 run the FPS collapsed from 60 to 5-6 during
+    # Versus navigation, when the script runs OCR on every nav shot, and
+    # never recovered. Manual play never hits this because no OCR runs at
+    # all. The UI text the classifier needs is large and reads fine at
+    # 1080p. Falls back to the full-res image if downscaling fails.
+    $smallPath = Join-Path $OutDir "ocr-small.png"
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $src = [System.Drawing.Bitmap]::FromFile($ShotPath)
+        $small = New-Object System.Drawing.Bitmap(1920, 1080)
+        $g = [System.Drawing.Graphics]::FromImage($small)
+        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+        $g.DrawImage($src, 0, 0, 1920, 1080)
+        $g.Dispose()
+        $src.Dispose()
+        $small.Save($smallPath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $small.Dispose()
+        $ShotPath = $smallPath
+    } catch { }
     try {
         & $script:TesseractExe $ShotPath $tmp.Replace(".txt", "") --psm 6 2>$null | Out-Null
         if (Test-Path $tmp) { return (Get-Content $tmp -Raw -ErrorAction SilentlyContinue) }

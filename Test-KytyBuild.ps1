@@ -218,7 +218,7 @@ else { Write-Warning "Tesseract not found; navigation runs blind (Cross/Options 
 # k=Square, arrows=D-pad, w/a/s/d=left stick, f/h/t/g=right stick,
 # Return=Options (Start).
 $InputFile = Join-Path $OutDir "kyty-input.txt"
-if (Test-Path $InputFile) { Remove-Item $InputFile -Force }
+if (Test-FileExistsQuiet $InputFile) { Remove-Item $InputFile -Force }
 $env:KYTY_INPUT_FILE = $InputFile
 
 # Copy the saved game from the launcher's run folder into the build folder
@@ -254,6 +254,16 @@ if (Test-Path $runSave) {
     }
 }
 
+# Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
+# file is locked by another process ("Access is denied"). The emulator holds
+# kyty-input.txt open while reading it, so a plain Test-Path on it can kill
+# the whole run. That is what ended the 2342 run at cycle 528. This helper
+# never throws: locked or unreadable means "not there" for our purposes.
+function Test-FileExistsQuiet {
+    param([string]$Path)
+    try { return (Test-Path $Path) } catch { return $false }
+}
+
 # Write input lines to the file, then BLOCK until the emulator consumes it
 # (deletes it), up to 30 s. If it is never consumed, the emulator did not get
 # KYTY_INPUT_FILE, and pressing on would be pointless.
@@ -263,8 +273,8 @@ function Invoke-InputStage {
     Write-Host ("input stage: " + ($Lines -join " | "))
     Set-Content -Path $InputFile -Value $text -Encoding ASCII -NoNewline
     $deadline = (Get-Date).AddSeconds(30)
-    while ((Test-Path $InputFile) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 200 }
-    if (Test-Path $InputFile) {
+    while ((Test-FileExistsQuiet $InputFile) -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 200 }
+    if (Test-FileExistsQuiet $InputFile) {
         Write-Warning "Input file was not consumed; the emulator may not have KYTY_INPUT_FILE set."
         Remove-Item $InputFile -Force -ErrorAction SilentlyContinue
     }

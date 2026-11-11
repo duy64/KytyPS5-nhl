@@ -1,7 +1,20 @@
-# Test-KytyBuild.ps1 - v18 (2026-11-10)
+# Test-KytyBuild.ps1 - v20 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v20 adds $TestScriptVersion so the watcher can re-test a build when the
+# script changes: a build marked tested under an older script version gets
+# re-run automatically, so a script fix (like v19's) re-tests builds
+# instead of the marker blocking it forever.
+#
+# v19 fixes the 2026-11-10 2342 run (#146, 36fd0b1), which died at cycle
+# 528 (~49 min, exit code 1) with Test-Path "Access is denied" on
+# kyty-input.txt: the emulator holds the input file open while reading
+# it, and Test-Path throws a terminating error under ErrorActionPreference
+# Stop. New Test-FileExistsQuiet helper wraps the check in try/catch so
+# a locked input file never kills the run; used for all three
+# Test-Path $InputFile calls.
 #
 # v18 fixes the 2026-11-10 2258 run (#146, 36fd0b1), which never reached
 # the ice even though the game was fine - the versus screen was clean
@@ -144,6 +157,11 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# The watcher reads this number to decide whether a build needs re-testing:
+# a build marked tested with an older script version gets re-run when the
+# script version increases, so a script fix automatically re-tests builds.
+$TestScriptVersion = 20
 
 # Cleanup: frame dumps (D:\Downloads\captures\frame_*) from prior runs pile
 # up - the emulator writes a new frame_N folder per dump and nothing ever

@@ -1,9 +1,18 @@
-# Watch-KytyBuilds.ps1 - v6 (2026-11-10)
+# Watch-KytyBuilds.ps1 - v7 (2026-11-11)
 # Watches D:\Downloads for new KyTy builds and auto-runs the NHL 27 test
 # (Test-KytyBuild.ps1) for each one. Meant to run on a schedule (every
 # 15 min) via a Windows Scheduled Task. Results are copied to -UploadDir
 # (a Google Drive folder) when set, so they sync and can be reviewed
 # without anyone sending them.
+#
+# v7 versioned markers (user's call, 2026-11-11): v6's tested-<tag>.txt
+# blocked re-running a build forever unless the marker was deleted by
+# hand, which got in the way of re-testing after a script fix. The
+# marker now stores the test script version it was tested under, and a
+# build is only "done" if its marker version is at least the current
+# script version. When the script version increases, every build gets
+# re-tested once automatically. Old v6 markers (date only, no version)
+# count as version 0, so they re-test once under the new scheme.
 #
 # v6 efficiency fixes (the v5 loop wasted whole runs):
 #  - LOCAL MARKER FILES. v5 decided "done" only from result folders in
@@ -13,7 +22,11 @@
 #    file in this folder when a run is conclusive, and checks the marker
 #    first: atlas-done.txt (atlas capture succeeded), and
 #    tested-<tag>.txt (that build reached the game). Trashing Drive
-#    folders no longer causes a re-run. Delete a marker to force a re-run.
+#    folders no longer causes a re-run. v7: the marker stores the test
+#    script version, so a script update re-tests builds automatically;
+#    a marker is only "done" when its version is at least the current
+#    script version. Delete a marker to force a re-run under the same
+#    script version.
 #  - SORT BY RELEASE DATE, NOT FOLDER TIME. v5 sorted build folders by
 #    LastWriteTime, so a just re-downloaded older build (#139) sorted as
 #    "newest" and got tested before the actually-newer #146. v6 parses
@@ -136,11 +149,22 @@ try {
 # produces only nav shots, so it is NOT done and gets re-tested next pass.
 # v6 also checks a local marker file (tested-<tag>.txt in this folder),
 # written after a conclusive run, so trashing the Drive result folders
-# does not make the watcher forget a build was tested.
+# does not make the watcher forget a build was tested. v7: the marker
+# stores the test script version, and a build is only done when its
+# marker version is at least the current script version, so a script
+# update re-tests builds automatically. A v6 marker (date only, no
+# version) counts as version 0 and re-tests once.
 function Test-HasConclusiveResult {
     param([string]$BuildName)
     $marker = Join-Path $ScriptDir ("tested-" + $BuildName + ".txt")
-    if (Test-Path $marker) { return $true }
+    if (Test-Path $marker) {
+        $markedVersion = 0
+        try {
+            $content = Get-Content $marker -Raw -ErrorAction Stop
+            if ($content -match 'version\s*=\s*(\d+)') { $markedVersion = [int]$Matches[1] }
+        } catch { $markedVersion = 0 }
+        if ($markedVersion -ge $script:TestScriptVersion) { return $true }
+    }
     $folders = Get-ChildItem -Path $ResultsRoot -Directory -Filter ("KyTyTest-" + $BuildName + "-*") -ErrorAction SilentlyContinue
     foreach ($f in $folders) {
         if (Test-Path (Join-Path $f.FullName "04-versus.png")) { return $true }
@@ -150,7 +174,7 @@ function Test-HasConclusiveResult {
 function Set-TestedMarker {
     param([string]$BuildName)
     $marker = Join-Path $ScriptDir ("tested-" + $BuildName + ".txt")
-    Set-Content -Path $marker -Value (Get-Date -Format "yyyy-MM-dd HH:mm") -Encoding ASCII -ErrorAction SilentlyContinue
+    Set-Content -Path $marker -Value ("version=" + $script:TestScriptVersion + " " + (Get-Date -Format "yyyy-MM-dd HH:mm")) -Encoding ASCII -ErrorAction SilentlyContinue
 }
 
 # Release date from a build folder/tag name: the tag is always
@@ -223,15 +247,37 @@ function Get-BuildFolderForTag {
 
 # Self-update the test script: always pull the latest Test-KytyBuild.ps1
 # from the kyty-test branch before running, so script fixes flow
-# automatically and nobody has to replace files by hand. If the download
-# fails, keep the local copy and carry on.
+# automatically and nobody has to replace files by hand. v7 FORCES the
+# download (user's call, 2026-11-11): the script is downloaded to a temp
+# file, validated (size and a known marker), and only then moved into
+# place. If the download or validation fails, the watcher EXITS instead
+# of running a test with a possibly stale script, and retries next tick.
 $TestScriptUrl = "https://raw.githubusercontent.com/duy64/KytyPS5-nhl/kyty-test/Test-KytyBuild.ps1?cb=" + [DateTime]::UtcNow.Ticks
+$TestScriptTmp = Join-Path $ScriptDir "Test-KytyBuild.new.ps1"
 try {
-    Invoke-WebRequest -Uri $TestScriptUrl -OutFile $TestScript -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+    Invoke-WebRequest -Uri $TestScriptUrl -OutFile $TestScriptTmp -UseBasicParsing -TimeoutSec 60 -ErrorAction Stop
+    $tmpBytes = Get-Item $TestScriptTmp -ErrorAction Stop
+    $tmpText = Get-Content $TestScriptTmp -Raw -ErrorAction Stop
+    if ($tmpBytes.Length -le 1000 -or $tmpText -notmatch 'Test-KytyBuild\.ps1') {
+        throw "Downloaded test script failed validation (size or marker)."
+    }
+    Move-Item $TestScriptTmp $TestScript -Force -ErrorAction Stop
     Write-Host "Test script updated from GitHub."
 } catch {
-    Write-Host ("Test script update skipped (could not download latest): " + $_.Exception.Message)
+    Write-Host ("Test script download FAILED - will not run with a possibly stale script: " + $_.Exception.Message)
+    if (Test-Path $TestScriptTmp) { Remove-Item $TestScriptTmp -Force -ErrorAction SilentlyContinue }
+    exit 0
 }
+
+# v7: read the test script version ($TestScriptVersion = N in the script)
+# so markers can be compared against it. A missing or unparsable version
+# means 0, which re-tests everything once (safe default).
+$script:TestScriptVersion = 0
+try {
+    $verLine = Select-String -Path $TestScript -Pattern '^\$TestScriptVersion\s*=\s*(\d+)' -ErrorAction Stop | Select-Object -First 1
+    if ($verLine -and $verLine.Matches.Count -gt 0) { $script:TestScriptVersion = [int]$verLine.Matches[0].Groups[1].Value }
+} catch { $script:TestScriptVersion = 0 }
+Write-Host ("Test script version: " + $script:TestScriptVersion)
 
 # Atlas capture, automatic (v5). The atlas-dump build (#139) holds the
 # evidence for the versus corruption. A capture is "done" only when an

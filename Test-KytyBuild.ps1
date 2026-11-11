@@ -1,7 +1,28 @@
-# Test-KytyBuild.ps1 - v17 (2026-11-10)
+# Test-KytyBuild.ps1 - v18 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v18 fixes the 2026-11-10 2258 run (#146, 36fd0b1), which never reached
+# the ice even though the game was fine - the versus screen was clean
+# (both team logos render) and the game advanced into the pre-game tunnel
+# cinematic on its own. Three script gaps burned the 60-shot budget:
+#  - The Be A Pro hub was read as Versus: the hub preview headline says
+#    "Game Preview: ... Face-off Against ...", and the bare "face-off"
+#    Versus marker fired. "play next game" now classifies Hub BEFORE
+#    the Versus check (it is distinct from the Play Now "play now" the
+#    v9 Versus-first ordering protects).
+#  - The Be A Pro versus splash was read as Unknown: "VERSUS" is written
+#    vertically so OCR misses it, and the only text OCR reads is
+#    "AWAY | 53-1-0". "away" plus a W-L-OTL record now classifies
+#    Versus (OCR reads 0 as O, so the record pattern allows O).
+#  - Loading / cinematic pace burned the budget: the frame froze at 8598
+#    (fps 0) for 11 shots, then crept to 8641 through the tunnel at
+#    0-2 fps. Shots taken at loading pace (same frame as the last shot,
+#    or fps 2 or less) no longer count toward the 60-shot budget, and
+#    Unknown screens at that pace wait 10 s and press nothing. A 25
+#    minute nav deadline and a 30-shot frozen streak are the backstops,
+#    so a genuinely stuck game still fails instead of waiting forever.
 #
 # v17 efficiency: the gameplay OCR check ran every 6 cycles (about every
 # 30 seconds), and each check runs Tesseract, which costs CPU and slows
@@ -462,12 +483,23 @@ function Get-ScreenKind {
     $t = $Text.ToLower()
     if ($t -match "sign in|playstation network|psn|sign-in|ea servers|unable-to-connect") { return "SignIn" }
     if ($t -match "press any button|press x to start|press x") { return "Title" }
+    # Be A Pro hub FIRST for "play next game": the hub preview headline
+    # reads "Game Preview: ... Face-off Against ...", and the bare
+    # "face-off" Versus marker below swallowed the hub (2258 run shot 11:
+    # hub read as Versus, the loop jumped forward and never drove the
+    # hub). "play next game" is distinct from the Play Now "play now"
+    # the Versus-first ordering below protects, so this is safe.
+    if ($t -match "play next game") { return "Hub" }
     # Versus FIRST: the versus screen header reads "PLAY NOW SELECT TEAM",
     # so the Hub "play now" pattern below would swallow it (v9/v10 atlas
     # run: shot 234-nav.png is Versus on screen yet classified Hub, and
     # the loop pressed Down+Cross on it ~240 times). Versus markers are
     # "select team" / "select sides" / "versus" / faceoff.
     if ($t -match "select team|select sides|versus|faceoff|face-off") { return "Versus" }
+    # Be A Pro versus splash: two player panels, "VERSUS" written
+    # vertically (OCR usually misses it) and "AWAY | 53-1-0" top-left.
+    # The record is the reliable marker; OCR reads 0 as O, so allow O.
+    if (($t -match "away") -and ($t -match "[0-9o]+\s*-\s*[0-9o]+\s*-\s*[0-9o]+")) { return "Versus" }
     # GameExperience BEFORE Ice: the dialog says "5 MINUTE PERIODS" and
     # Ice used to match bare "period" (v14, 1736 run: the dialog was read
     # as Ice and the nav loop quit before versus). Markers are the dialog
@@ -594,14 +626,30 @@ $titleTries = 0
 $reachedIce = $false
 $reachedVersus = $false
 $navFailed = $false
+# Loading-pace tracking (v18): the frame counter in the overlay status
+# line ("frame: N, fps: M") tells whether the game is loading. A shot
+# that shows no new frame, or fps 2 or less, is a wait, not navigation.
+$lastFrame = -1
+$frozenStreak = 0
+$slowStreak = 0
+$navBudgetUsed = 0
+$navStart = Get-Date
 # Global cap: the jump resets the per-stop counter, so a stuck game can
 # ping-pong between two stops forever (245 shots in the v9 atlas run).
-# 60 nav shots is far more than a clean run needs (a good run takes under
-# 20); past that, fail naming the stop it stuck on.
+# 60 counted nav shots is far more than a clean run needs (a good run
+# takes under 20); past that, fail naming the stop it stuck on. Shots
+# taken at loading pace do not count (v18) - the 2258 run spent 11 shots
+# on one frozen frame and ~27 more on a 0-2 fps cinematic. A 25 minute
+# nav deadline is the backstop for a loop that never reaches a stop.
 $maxNavShots = 60
 while ($step -lt $roadmap.Count) {
-    if ($navShot -ge $maxNavShots) {
-        Write-Warning ("Roadmap exceeded " + $maxNavShots + " nav shots at stop '" + $roadmap[$step] + "'. Stopping - see the nav shots and transcript for the last screen seen.")
+    if ($navBudgetUsed -ge $maxNavShots) {
+        Write-Warning ("Roadmap exceeded " + $maxNavShots + " counted nav shots at stop '" + $roadmap[$step] + "'. Stopping - see the nav shots and transcript for the last screen seen.")
+        $navFailed = $true
+        break
+    }
+    if (((Get-Date) - $navStart).TotalMinutes -ge 25) {
+        Write-Warning ("Roadmap exceeded 25 minutes at stop '" + $roadmap[$step] + "'. Stopping - see the nav shots and transcript for the last screen seen.")
         $navFailed = $true
         break
     }
@@ -620,6 +668,22 @@ while ($step -lt $roadmap.Count) {
     $shot = Save-ScreenShot -ShotName $shotName
     $text = Get-ShotText -ShotPath $shot
     $kind = Get-ScreenKind -Text $text
+    # Loading pace from the overlay status line ("frame: N, fps: M").
+    # Parse it here, before any other -match in this scope clobbers
+    # $Matches. A shot at loading pace is a wait, not navigation, so it
+    # does not spend the 60-shot budget (v18).
+    $frameNow = -1
+    $fpsNow = -1
+    if ($text -match "frame:\s*([0-9]+)") { $frameNow = [int]$Matches[1] }
+    if ($text -match "fps:\s*([0-9]+)") { $fpsNow = [int]$Matches[1] }
+    $loadingPace = $false
+    if ($frameNow -ge 0) {
+        if ($frameNow -eq $lastFrame) { $frozenStreak++ } else { $frozenStreak = 0 }
+        if (($fpsNow -ge 0) -and ($fpsNow -le 2)) { $slowStreak++ } else { $slowStreak = 0 }
+        if (($frozenStreak -gt 0) -or ($slowStreak -gt 0)) { $loadingPace = $true }
+        $lastFrame = $frameNow
+    }
+    if (-not $loadingPace) { $navBudgetUsed++ }
     $want = $roadmap[$step]
     Write-Host ("roadmap: stop '" + $want + "' (try " + $stepTries + "), screen: " + $kind + " (shot " + $shotName + ")")
     if ($text) { Write-Host ("ocr: " + (($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join " | ")) }
@@ -648,7 +712,19 @@ while ($step -lt $roadmap.Count) {
         # Only after 3 in a row press Cross once; after 5, Cross + Options
         # for a possible unnamed dialog. Then re-read.
         $unknownStreak++
-        if ($unknownStreak -le 2) {
+        if ($loadingPace) {
+            # Loading or cinematic at 0-2 fps: the frame is barely moving,
+            # so pressing buttons cannot help - wait it out (this shot did
+            # not spend the nav budget). 30 frozen shots in a row (about
+            # 5 minutes at these waits) means genuinely stuck, not loading.
+            if ($frozenStreak -gt 30) {
+                Write-Warning ("Frame frozen at " + $frameNow + " for 30 shots - game is stuck, not loading. Stopping - see the nav shots and transcript for the last screen seen.")
+                $navFailed = $true
+                break
+            }
+            Write-Host ("Loading pace (frame " + $frameNow + ", fps " + $fpsNow + ") - waiting 10 s and re-reading (may be a loading screen or cinematic).")
+            Start-Sleep -Seconds 10
+        } elseif ($unknownStreak -le 2) {
             Write-Host "Screen not recognized - waiting 4 s and re-reading (may be a loading screen)."
             Start-Sleep -Seconds 4
         } elseif ($unknownStreak -eq 3) {
@@ -815,7 +891,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
 } elseif ($reachedIce) {
     Write-Host "Reached the ice; gameplay shots skipped (-SkipGameplay)."
 } else {
-    Write-Warning "Did not reach the ice in 60 nav shots. Result folder holds the nav shots and the transcript for diagnosis."
+    Write-Warning "Did not reach the ice in the nav loop. Result folder holds the nav shots and the transcript for diagnosis."
 }
 
 # STEP 4 - dumb full-game gameplay (v4). The point is coverage, not skill:

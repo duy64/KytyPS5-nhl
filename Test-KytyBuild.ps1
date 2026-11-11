@@ -1,7 +1,16 @@
-# Test-KytyBuild.ps1 - v30 (2026-11-11)
+# Test-KytyBuild.ps1 - v31 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v31 adds clip bursts (the user's call): single screenshots miss
+# transient glitches that appear and vanish between shots, so when the
+# script spots something odd (5 Unknown gameplay checks in a row, or 3
+# Unknown nav shots) it captures 8 frames over ~3 seconds. Capped at 3
+# bursts per run. 4K is kept - the user plays at 4K, and the test must
+# validate what he plays; the clip is a supplement, not a replacement
+# for the 4K screenshots, and a full video recording would be gigabytes
+# that do not sync to Drive.
 #
 # v30 is the white-lines build: the 05-ice shot uses the frame dump
 # (Save-Shot) so 05-ice-frame.txt lands in the result folder, and
@@ -245,7 +254,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 30
+$TestScriptVersion = 31
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -562,6 +571,31 @@ function Save-ScreenShot {
     $bmp.Dispose()
     Write-Host ("shot (screen): " + $dest)
     return $dest
+}
+
+# v31: capture a short burst of screenshots (a "clip") when the script
+# spots something odd. Single screenshots miss transient glitches that
+# appear and vanish between shots; a burst of 8 frames over ~3 seconds
+# shows what the screen is actually doing. Triggered on 5 Unknown
+# gameplay checks in a row (unrecognized screen - replay, cutscene,
+# glitch, or a state OCR cannot name) and on 3 Unknown nav shots.
+# Capped at 3 bursts per run so a stuck screen does not fill the result
+# folder and Drive with clips. 4K is kept (the user plays at 4K, and the
+# test must validate what he plays); the clip is a supplement, not a
+# replacement for the 4K screenshots.
+$script:ClipBurstCount = 0
+$script:MaxClipBursts = 3
+function Save-ClipBurst {
+    param([string]$Label)
+    if ($script:ClipBurstCount -ge $script:MaxClipBursts) { return }
+    $script:ClipBurstCount++
+    Write-Host ("clip burst " + $script:ClipBurstCount + " (" + $Label + "): capturing 8 frames over ~3 s.")
+    for ($i = 1; $i -le 8; $i++) {
+        $name = ("clip-" + $Label + "-" + $script:ClipBurstCount + "-" + $i + ".png")
+        Save-ScreenShot -ShotName $name | Out-Null
+        Start-Sleep -Milliseconds 400
+    }
+    Write-Host ("clip burst " + $script:ClipBurstCount + " done.")
 }
 
 # One screenshot by either path: frame dump first, screen capture on failure.
@@ -1116,7 +1150,8 @@ while ($step -lt $roadmap.Count) {
             Write-Host "Screen not recognized - waiting 4 s and re-reading (may be a loading screen)."
             Start-Sleep -Seconds 4
         } elseif ($unknownStreak -eq 3) {
-            Write-Host "Screen still not recognized - pressing confirm once and re-reading."
+            Write-Host "Screen still not recognized - capturing a clip burst, then pressing confirm once and re-reading."
+            Save-ClipBurst -Label "nav-unknown"
             Invoke-InputStage -Lines @("j 150", "sleep 2000") -ExtraWaitSec 2
         } else {
             Write-Host "Screen still not recognized - dismissing a possible dialog with Cross then Options."
@@ -1364,6 +1399,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
                 $unknownStreak++
                 if ($unknownStreak -ge 5) {
                     Write-Warning ("Gameplay screen not recognized for 5 checks in a row (cycle " + $cycle + "). The game may be in a replay, cutscene, or a state OCR cannot name. Continuing to send inputs.")
+                    Save-ClipBurst -Label ("gameplay-unknown-" + $cycle)
                     $unknownStreak = 0
                 }
             }

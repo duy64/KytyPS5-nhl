@@ -1,7 +1,16 @@
-# Test-KytyBuild.ps1 - v21 (2026-11-11)
+# Test-KytyBuild.ps1 - v22 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v22 fixes the frame-dump capture so the auto-run can diagnose the white
+# lines on the ice (user-confirmed Nov 11): the emulator writes each dump
+# to a NEW frame_N folder, but Save-FrameDumpShot only watched frame_0,
+# so every dump after the first was missed and gameplay shots fell back
+# to screen captures. It now watches the newest frame_* folder (re-checked
+# each pass) and copies frame.txt into the result folder so the monitor
+# can analyze which shader draws the ice. Deadline raised 60s to 90s
+# (at 1-2 fps the 30-flip trigger check alone takes 15-30s).
 #
 # v21 fixes v20's fatal hoisting bug: v20 defined Test-FileExistsQuiet
 # below the startup code that calls it, and PowerShell does not hoist
@@ -168,7 +177,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 21
+$TestScriptVersion = 22
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -371,7 +380,13 @@ function Save-FrameDumpShot {
     param([string]$ShotName)
     $dumpDir = $env:KYTY_DBG_FRAME_DUMP_DIR
     if (-not $dumpDir) { $dumpDir = "D:\Downloads\captures" }
-    $frameDir = Join-Path $dumpDir "frame_0"
+    # v22: the emulator writes each dump to a NEW frame_N folder (frame_0,
+    # frame_1, ...), so watching only frame_0 misses every dump after the
+    # first. Find the newest frame_* folder at call time and watch that.
+    $frameDir = $null
+    $frameDirs = @(Get-ChildItem -Path $dumpDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if ($frameDirs.Count -gt 0) { $frameDir = $frameDirs[0].FullName }
+    if (-not $frameDir) { $frameDir = Join-Path $dumpDir "frame_0" }
     $before = @()
     if (Test-Path $frameDir) {
         $before = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
@@ -380,11 +395,16 @@ function Save-FrameDumpShot {
     New-Item -ItemType File -Force -Path $runTrig | Out-Null
     $buildTrig = Join-Path $BuildDir "framedump.trigger"
     New-Item -ItemType File -Force -Path $buildTrig | Out-Null
-    $deadline = (Get-Date).AddSeconds(60)
+    $deadline = (Get-Date).AddSeconds(90)
     $found = $null
     $fallback = $null
+    $foundDir = $null
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
+        # Re-check for the newest frame_* folder each pass: the dump may
+        # create a new folder (frame_1, frame_2, ...) after the trigger.
+        $latest = @(Get-ChildItem -Path $dumpDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if ($latest.Count -gt 0) { $frameDir = $latest[0].FullName }
         if (Test-Path $frameDir) {
             $now = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
             foreach ($f in $now) {
@@ -393,8 +413,8 @@ function Save-FrameDumpShot {
                     # a depth image (6144x6144) or a storage image, and OCR
                     # on a depth map reads garbage. Keep the first new PNG
                     # as a fallback in case no rt0 appears.
-                    if (-not $fallback) { $fallback = $f.FullName }
-                    if ($f.Name -match "_rt0_") { $found = $f.FullName; break }
+                    if (-not $fallback) { $fallback = $f.FullName; $foundDir = $frameDir }
+                    if ($f.Name -match "_rt0_") { $found = $f.FullName; $foundDir = $frameDir; break }
                 }
             }
             if ($found) { break }
@@ -406,6 +426,16 @@ function Save-FrameDumpShot {
     $dest = Join-Path $OutDir $ShotName
     Copy-Item -Path $found -Destination $dest -Force
     Write-Host ("shot (dump): " + $dest)
+    # v22: copy frame.txt (the draw list) into the result folder so the
+    # monitor can analyze which shader draws what (e.g. the white lines
+    # on the ice) without needing the whole dump folder.
+    if ($foundDir) {
+        $frameTxt = Join-Path $foundDir "frame.txt"
+        if (Test-Path $frameTxt) {
+            $txtDest = Join-Path $OutDir ($ShotName -replace '\.png$', '-frame.txt')
+            Copy-Item -Path $frameTxt -Destination $txtDest -Force -ErrorAction SilentlyContinue
+        }
+    }
     return $dest
 }
 

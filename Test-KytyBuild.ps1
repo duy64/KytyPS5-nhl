@@ -1,7 +1,12 @@
-# Test-KytyBuild.ps1 - v22 (2026-11-11)
+# Test-KytyBuild.ps1 - v23 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v23 copies last-run.log into the result folder on a boot exit, so the
+# evidence for why the emulator died reaches Drive. Three consecutive
+# boot exits (08:16, 08:31, 08:46) all arrived log-less because the
+# boot-exit path called exit 1 before the end-of-script log copy.
 #
 # v22 fixes the frame-dump capture so the auto-run can diagnose the white
 # lines on the ice (user-confirmed Nov 11): the emulator writes each dump
@@ -177,7 +182,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 22
+$TestScriptVersion = 23
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -629,6 +634,14 @@ Start-Sleep -Seconds $BootWaitSec
 $EmulatorDead = -not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)
 if ($EmulatorDead) {
     Write-Warning "Emulator exited during the boot wait, before any input was sent. Stopping here - see last-run.log for why it exited."
+    # v23: copy last-run.log into the result folder BEFORE exiting, or the
+    # evidence for why the emulator died never reaches Drive (three
+    # consecutive boot exits 08:16/08:31/08:46 all arrived log-less).
+    $logSrc = Join-Path $env:LOCALAPPDATA "KytyPS5\logs\last-run.log"
+    if (Test-Path $logSrc) {
+        Copy-Item -Path $logSrc -Destination (Join-Path $OutDir "last-run.log") -Force -ErrorAction SilentlyContinue
+        Write-Host "log: copied last-run.log to the result folder"
+    }
     Stop-Transcript | Out-Null
     exit 1
 }

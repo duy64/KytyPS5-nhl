@@ -1,9 +1,21 @@
-# Watch-KytyBuilds.ps1 - v7 (2026-11-11)
+# Watch-KytyBuilds.ps1 - v8 (2026-11-11)
 # Watches D:\Downloads for new KyTy builds and auto-runs the NHL 27 test
 # (Test-KytyBuild.ps1) for each one. Meant to run on a schedule (every
 # 15 min) via a Windows Scheduled Task. Results are copied to -UploadDir
 # (a Google Drive folder) when set, so they sync and can be reviewed
 # without anyone sending them.
+#
+# v8 complete-copy gate (2026-11-11): the 1216 and 1516 result folders
+# reached Drive WITHOUT their nav shots, 04-versus.png, 05-ice.png, or
+# any frame.txt - only the late flash shots and transcript made it.
+# The old rule deleted the local folder as soon as the Drive copy held
+# transcript.txt alone (backfill) or 04-versus.png alone (post-run), so
+# a partial copy looked complete and the local evidence was lost. Now
+# the local folder is only deleted when the Drive copy holds the full
+# key set (transcript.txt, 04-versus.png, 05-ice.png, 07-pause-menu.png),
+# and the post-run copy waits 3 minutes for the Drive client to upload
+# before that check. A partial copy keeps its local folder, and the next
+# pass's backfill retries it.
 #
 # v7 versioned markers (user's call, 2026-11-11): v6's tested-<tag>.txt
 # blocked re-running a build forever unless the marker was deleted by
@@ -427,6 +439,20 @@ try {
     Write-Host ("Auto-download skipped (GitHub unreachable or rate-limited): " + $_.Exception.Message)
 }
 
+# v8: a Drive copy is only complete when it holds the full key set.
+# The old rule (transcript.txt alone, or 04-versus.png alone) let a
+# partial copy look complete, and the local folder was deleted while
+# the nav shots, the ice shot, and the frame.txt files never made it
+# to Drive (1216 and 1516 runs). The frame.txt files ride along with
+# the shots, so the shot files are the gate.
+function Test-DriveCopyComplete {
+    param([string]$DriveFolder)
+    foreach ($f in @("transcript.txt", "04-versus.png", "05-ice.png", "07-pause-menu.png")) {
+        if (-not (Test-Path (Join-Path $DriveFolder $f))) { return $false }
+    }
+    return $true
+}
+
 # Backfill: upload any Downloads KyTyTest result folders that never made it
 # to Drive (e.g. a manual run that did not pass -UploadDir). Runs whenever
 # the watcher passes, so a missed upload is picked up on the next pass
@@ -445,9 +471,15 @@ function Sync-ResultsToDrive {
             Copy-Item $r.FullName $dest -Recurse -Force
             Write-Host ("Backfilled results to Drive: " + $r.Name)
         }
-        if ((Test-Path (Join-Path $dest "04-versus.png")) -or (Test-Path (Join-Path $dest "transcript.txt"))) {
+        # v8: only delete local when the Drive copy holds the full key
+        # set. A partial copy (transcript only) keeps its local folder
+        # so the next pass retries the upload instead of losing the
+        # nav shots, the ice shot, and the frame.txt files.
+        if (Test-DriveCopyComplete -DriveFolder $dest) {
             Remove-Item $r.FullName -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host ("Local result folder deleted after Drive copy: " + $r.Name)
+        } else {
+            Write-Host ("Drive copy incomplete for " + $r.Name + " - keeping local folder for the next pass.")
         }
     }
 }
@@ -491,15 +523,21 @@ try {
         $dest = Join-Path $UploadDir (Split-Path $outDir -Leaf)
         Copy-Item $outDir $dest -Recurse -Force
         Write-Host ("Results copied to: " + $dest)
-        # v6: mark the build tested and clean up the local result folder,
-        # but only when the Drive copy landed with the versus shot. A
-        # stalled run (no 04-versus.png) keeps its local folder so the
-        # next pass can re-test it.
-        if (Test-Path (Join-Path $dest "04-versus.png")) {
+        # v8: give the Drive client 3 minutes to upload before judging
+        # the copy, and only mark tested + delete local when the Drive
+        # copy holds the full key set. The old rule (04-versus.png
+        # alone, checked right after the copy) let a partial upload
+        # look complete. A stalled run (no 04-versus.png) keeps its
+        # local folder so the next pass can re-test it.
+        Write-Host "Waiting 3 min for the Drive client to upload before checking the copy."
+        Start-Sleep -Seconds 180
+        if (Test-DriveCopyComplete -DriveFolder $dest) {
             Set-TestedMarker -BuildName $target.Name
             Write-Host "Build marked tested."
             Remove-Item $outDir -Recurse -Force -ErrorAction SilentlyContinue
             Write-Host "Local result folder deleted after Drive copy."
+        } else {
+            Write-Host "Drive copy incomplete - keeping local folder; the next pass backfills it."
         }
     } elseif (Test-Path (Join-Path $outDir "04-versus.png")) {
         # No Drive upload dir configured, but the run was conclusive.

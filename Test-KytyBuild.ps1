@@ -1,7 +1,14 @@
-# Test-KytyBuild.ps1 - v29 (2026-11-11)
+# Test-KytyBuild.ps1 - v30 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v30 is the white-lines build: the 05-ice shot uses the frame dump
+# (Save-Shot) so 05-ice-frame.txt lands in the result folder, and
+# Wait-FrameDumpQuiescent watches the newest frame_* folder (not
+# hardcoded frame_0) and runs before 05-ice so the versus download
+# finishes first. The draw list is what the white-lines diagnosis
+# needs: which shader draws the bright skate-mark layer.
 #
 # v29 handles the Be A Pro X-Factors screen: the v28 run sat on it
 # because the classifier returned Unknown (which just waits) and the
@@ -238,7 +245,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 29
+$TestScriptVersion = 30
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -501,20 +508,25 @@ function Save-FrameDumpShot {
 }
 
 # Wait until the frame-dump download is finished: no new PNG has appeared
-# in frame_0 for 10 seconds, or 120 seconds have passed. A capture writes
-# 300 images over minutes; a trigger fired while that download is still
-# running is swallowed and produces no new capture (proven by the v6 atlas
-# run, where 14 nav shots were all PNGs from the first capture). Call this
-# before the one frame dump that matters (the versus capture).
+# in the NEWEST frame_* folder for 10 seconds, or 120 seconds have passed.
+# A capture writes 300 images over minutes; a trigger fired while that
+# download is still running is swallowed and produces no new capture
+# (proven by the v6 atlas run, where 14 nav shots were all PNGs from the
+# first capture). Call this before the one frame dump that matters (the
+# versus capture). v30: watches the newest frame_* folder, not hardcoded
+# frame_0 (the v22 newest-folder fix never reached this function, so it
+# returned "quiescent" while a later frame_1 was still downloading).
 function Wait-FrameDumpQuiescent {
     $dumpDir = $env:KYTY_DBG_FRAME_DUMP_DIR
     if (-not $dumpDir) { $dumpDir = "D:\Downloads\captures" }
-    $frameDir = Join-Path $dumpDir "frame_0"
     $deadline = (Get-Date).AddSeconds(120)
     $lastCount = -1
     $quietSince = Get-Date
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 5
+        $frameDir = Join-Path $dumpDir "frame_0"
+        $latest = @(Get-ChildItem -Path $dumpDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+        if ($latest.Count -gt 0) { $frameDir = $latest[0].FullName }
         $count = 0
         if (Test-Path $frameDir) {
             $count = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue).Count
@@ -523,7 +535,7 @@ function Wait-FrameDumpQuiescent {
             $lastCount = $count
             $quietSince = Get-Date
         } elseif (((Get-Date) - $quietSince).TotalSeconds -ge 10) {
-            Write-Host ("frame dump quiescent: " + $count + " PNGs in frame_0, none new for 10 s.")
+            Write-Host ("frame dump quiescent: " + $count + " PNGs in " + (Split-Path $frameDir -Leaf) + ", none new for 10 s.")
             return
         }
     }
@@ -1231,7 +1243,16 @@ if ($navFailed) {
 # (faceoff, goal, replay, period changes). Skipped for -AtlasCapture
 # (the run already stopped at the versus screen).
 if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
-    $g5 = Save-ScreenShot -ShotName "05-ice.png"
+    # v30: the 05-ice shot uses the frame dump (Save-Shot), not a plain
+    # screen capture, so 05-ice-frame.txt lands in the result folder.
+    # That draw list is what the white-lines-on-ice diagnosis needs:
+    # which shader draws the bright skate-mark layer. Wait for the
+    # versus dump to finish downloading first, or this trigger is
+    # swallowed and the shot falls back to a screen capture (which is
+    # what happened in the 1516 run - 05-ice was a screen shot, so no
+    # on-ice frame.txt existed at all).
+    Wait-FrameDumpQuiescent
+    $g5 = Save-Shot -ShotName "05-ice.png"
     Write-Host ("ice captured: " + $g5)
     Write-Host "Skating (left stick up) for a gameplay shot."
     Invoke-InputStage -Lines @("w 2000", "sleep 1000") -ExtraWaitSec 1

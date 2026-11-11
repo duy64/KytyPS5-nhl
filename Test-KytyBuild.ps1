@@ -1,7 +1,14 @@
-# Test-KytyBuild.ps1 - v20 (2026-11-11)
+# Test-KytyBuild.ps1 - v21 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v21 fixes v20's fatal hoisting bug: v20 defined Test-FileExistsQuiet
+# below the startup code that calls it, and PowerShell does not hoist
+# function definitions, so the 0646 run died instantly ("not recognized").
+# The helper is now defined right after the param block, before any
+# top-level code calls it. Version bumped to 21 so the watcher re-tests
+# builds under the fixed script.
 #
 # v20 adds $TestScriptVersion so the watcher can re-test a build when the
 # script changes: a build marked tested under an older script version gets
@@ -161,7 +168,21 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 20
+$TestScriptVersion = 21
+
+# Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
+# file is locked by another process ("Access is denied"). The emulator holds
+# kyty-input.txt open while reading it, so a plain Test-Path on it can kill
+# the whole run. That is what ended the 2342 run at cycle 528. This helper
+# never throws: locked or unreadable means "not there" for our purposes.
+# Defined here, before any top-level code calls it: PowerShell does not
+# hoist function definitions, so a helper used by startup code must be
+# defined above that code (v20 defined it below the startup call and the
+# 0646 run died instantly with "not recognized").
+function Test-FileExistsQuiet {
+    param([string]$Path)
+    try { return (Test-Path $Path) } catch { return $false }
+}
 
 # Cleanup: frame dumps (D:\Downloads\captures\frame_*) from prior runs pile
 # up - the emulator writes a new frame_N folder per dump and nothing ever
@@ -270,16 +291,6 @@ if (Test-Path $runSave) {
     } catch {
         Write-Warning ("save backup: copy failed, continuing: " + $_.Exception.Message)
     }
-}
-
-# Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
-# file is locked by another process ("Access is denied"). The emulator holds
-# kyty-input.txt open while reading it, so a plain Test-Path on it can kill
-# the whole run. That is what ended the 2342 run at cycle 528. This helper
-# never throws: locked or unreadable means "not there" for our purposes.
-function Test-FileExistsQuiet {
-    param([string]$Path)
-    try { return (Test-Path $Path) } catch { return $false }
 }
 
 # Write input lines to the file, then BLOCK until the emulator consumes it

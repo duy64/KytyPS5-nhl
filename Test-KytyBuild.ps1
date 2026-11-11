@@ -1,7 +1,17 @@
-# Test-KytyBuild.ps1 - v15 (2026-11-10)
+# Test-KytyBuild.ps1 - v16 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v16 adds a flash-watch to the gameplay phase (user's call, 2026-11-10):
+# the 10-minute frame-dump data shots can miss brief/transient glitches
+# (a flash that lasts a frame or two). During STEP 4 a fast screen
+# capture is now taken every 5 cycles (about 30 seconds) and saved as
+# 12-flash-<n>.png, so the monitor can scan for flashes, garbled frames
+# and other brief glitches the 10-minute shots would miss. Screen
+# captures are cheap (no frame dump), so this is affordable: about 180
+# shots over a 90-minute game. The 10-minute frame-dump data shots are
+# unchanged.
 #
 # v15 fixes the 2026-11-10 1736 run (#139 atlas, 4b197fb), which never
 # tested the versus screen or the pause menu even though the transcript
@@ -811,8 +821,10 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
 # sends a varied input pattern (skate, pass, shoot, poke). The screen is
 # OCR-checked every few cycles from a fast screen capture: Pause is
 # resumed with Cross, a menu means the game is over, Unknown is tolerated
-# and logged. A frame-dump data shot is taken every 10 minutes. The
-# emulator exiting (crash) ends the phase immediately. Skipped for
+# and logged. A frame-dump data shot is taken every 10 minutes, and a
+# fast screen capture (flash-watch, 12-flash-<n>.png) every 5 cycles
+# (about 30 seconds) to catch brief glitches the 10-minute shots miss.
+# The emulator exiting (crash) ends the phase immediately. Skipped for
 # -AtlasCapture (the run already stopped at the versus screen).
 if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $gameplayStart = Get-Date
@@ -821,6 +833,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $cycle = 0
     $unknownStreak = 0
     $gameplayShotCount = 0
+    $flashShotCount = 0
     $lastDataShot = $gameplayStart
     Write-Host ("gameplay phase: up to " + $GameplayMinutes + " min of dumb play, ends early if the game returns to a menu.")
     while (((Get-Date) -lt $gameplayEnd) -and -not $gameOver) {
@@ -879,6 +892,15 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
             $ds = Save-Shot -ShotName ("12-gameplay-" + $gameplayShotCount + ".png")
             Write-Host ("gameplay data shot: " + $ds)
         }
+        # Flash-watch: fast screen capture every 5 cycles (about 30
+        # seconds) to catch brief/transient glitches the 10-minute
+        # frame-dump shots would miss. Screen capture only - no frame
+        # dump, so it is cheap and does not disturb play.
+        if (($cycle % 5) -eq 0) {
+            $flashShotCount++
+            $fs = Save-ScreenShot -ShotName ("12-flash-" + $flashShotCount + ".png")
+            Write-Host ("flash-watch shot: " + $fs)
+        }
         # Progress line every 30 cycles so the transcript shows the phase
         # is alive without flooding it.
         if (($cycle % 30) -eq 0) {
@@ -887,7 +909,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
         }
     }
     $gameplayMins = [math]::Round(((Get-Date) - $gameplayStart).TotalMinutes, 1)
-    Write-Host ("gameplay phase done: " + $cycle + " cycles, " + $gameplayMins + " min, " + $gameplayShotCount + " data shots.")
+    Write-Host ("gameplay phase done: " + $cycle + " cycles, " + $gameplayMins + " min, " + $gameplayShotCount + " data shots, " + $flashShotCount + " flash-watch shots.")
 }
 
 # Copy the emulator log into the result folder for diagnosis.

@@ -1,7 +1,15 @@
-# Test-KytyBuild.ps1 - v26 (2026-11-11)
+# Test-KytyBuild.ps1 - v27 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v27 brings the emulator window to the front before every screenshot
+# (Invoke-BringEmulatorToFront, AttachThreadInput trick so a background
+# scheduled task can steal focus). The screen capture grabs the foreground
+# window, so if the browser or anything else is covering the game, the
+# nav shots capture that instead and OCR reads the wrong screen - the
+# Nov 9 background-task failure. The emulator must be in front for the
+# screenshots, not just running.
 #
 # v26 waits 10 s after the display wake before launching, and logs the
 # pre-launch machine state (workstation locked? idle time since last
@@ -218,7 +226,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 26
+$TestScriptVersion = 27
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -517,6 +525,9 @@ function Save-ScreenShot {
     param([string]$ShotName)
     Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
     Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+    # v27: bring the emulator to the front first, or the capture grabs
+    # whatever window is covering the game.
+    Invoke-BringEmulatorToFront | Out-Null
     $bounds = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
     $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
     $g = [System.Drawing.Graphics]::FromImage($bmp)
@@ -657,6 +668,58 @@ function Request-DisplayAwake {
 }
 function Clear-DisplayAwake {
     try { [KytyDisplayAwake]::Clear() | Out-Null } catch { }
+}
+
+# v27: bring the emulator window to the front before a screenshot. The
+# screen capture grabs the foreground window, so if the browser or anything
+# else is covering the game, the nav shots capture that instead and OCR
+# reads the wrong screen (the Nov 9 background-task failure). A scheduled
+# task cannot steal focus with SetForegroundWindow alone, so the helper
+# uses the AttachThreadInput trick to attach to the foreground thread
+# first. Returns $true when the emulator is in front afterwards.
+$KytyForegroundCode = @"
+using System;
+using System.Runtime.InteropServices;
+public static class KytyForeground {
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
+}
+"@
+function Invoke-BringEmulatorToFront {
+    try { Add-Type -TypeDefinition $KytyForegroundCode -ErrorAction Stop } catch { }
+    try {
+        $emu = Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $emu) { return $false }
+        $hwnd = $emu.MainWindowHandle
+        if ($hwnd -eq [IntPtr]::Zero) { return $false }
+        if ([KytyForeground]::IsIconic($hwnd)) {
+            [KytyForeground]::ShowWindow($hwnd, 9) | Out-Null
+        }
+        $fgHwnd = [KytyForeground]::GetForegroundWindow()
+        if ($fgHwnd -eq $hwnd) { return $true }
+        $fgTid = 0
+        [void][KytyForeground]::GetWindowThreadProcessId($fgHwnd, [ref]$fgTid)
+        $myTid = [KytyForeground]::GetCurrentThreadId()
+        [KytyForeground]::AttachThreadInput($myTid, $fgTid, $true) | Out-Null
+        [KytyForeground]::SetForegroundWindow($hwnd) | Out-Null
+        [KytyForeground]::AttachThreadInput($myTid, $fgTid, $false) | Out-Null
+        Start-Sleep -Milliseconds 300
+        return ([KytyForeground]::GetForegroundWindow() -eq $hwnd)
+    } catch {
+        return $false
+    }
 }
 
 # Launch the emulator exactly the way the launcher does: the game path, the

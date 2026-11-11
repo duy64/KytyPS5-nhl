@@ -1,13 +1,19 @@
-# Test-KytyBuild.ps1 - v23 (2026-11-11)
+# Test-KytyBuild.ps1 - v24 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v23 copies last-run.log into the result folder on a boot exit, so the
-# evidence for why the emulator died reaches Drive. Three consecutive
-# boot exits (08:16, 08:31, 08:46) all arrived log-less because the
-# boot-exit path called exit 1 before the end-of-script log copy.
+# v24 reports the emulator exit code and checks last-run.log freshness on
+# a boot exit, instead of blindly copying the log. The 09:16 run copied a
+# 28 MB log that was still the 22:58 session (167,159 lines, t=5999s) -
+# the emulator does not rewrite last-run.log when it exits during boot,
+# so the copy proved nothing and five consecutive boot exits on #146
+# (08:16, 08:31, 08:46, 09:01, 09:16) arrived with no usable evidence.
+# A stale log is now labelled STALE and not copied; the exit code
+# (-1073741819 = 0xC0000005 access violation, 0 = clean exit) is the one
+# fact a boot exit always leaves behind.
 #
+# v23 copies last-run.log into the result folder on a boot exit, so the
 # v22 fixes the frame-dump capture so the auto-run can diagnose the white
 # lines on the ice (user-confirmed Nov 11): the emulator writes each dump
 # to a NEW frame_N folder, but Save-FrameDumpShot only watched frame_0,
@@ -182,7 +188,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 23
+$TestScriptVersion = 24
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -622,6 +628,17 @@ $psi.EnvironmentVariables["KYTY_DBG_SKIP_BAD_SHADERS"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_BREADCRUMBS"] = "0"
 $psi.EnvironmentVariables["KYTY_DBG_CONTROLLERS"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
+# v24: fingerprint last-run.log BEFORE launch, so a boot exit can tell a
+# fresh log from a stale one. The emulator does not rewrite the log when
+# it exits during boot (the 09:16 run copied the 22:58 session's log).
+$logSrc = Join-Path $env:LOCALAPPDATA "KyTyPS5\logs\last-run.log"
+$logBefore = $null
+if (Test-Path $logSrc) {
+    $logBefore = Get-Item $logSrc
+    Write-Host ("log before launch: " + $logBefore.Length + " bytes, modified " + $logBefore.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"))
+} else {
+    Write-Host "log before launch: no last-run.log present"
+}
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 
@@ -634,13 +651,33 @@ Start-Sleep -Seconds $BootWaitSec
 $EmulatorDead = -not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)
 if ($EmulatorDead) {
     Write-Warning "Emulator exited during the boot wait, before any input was sent. Stopping here - see last-run.log for why it exited."
-    # v23: copy last-run.log into the result folder BEFORE exiting, or the
-    # evidence for why the emulator died never reaches Drive (three
-    # consecutive boot exits 08:16/08:31/08:46 all arrived log-less).
-    $logSrc = Join-Path $env:LOCALAPPDATA "KytyPS5\logs\last-run.log"
+    # v24: the exit code is the one fact a boot exit always leaves behind,
+    # and the log fingerprint tells a fresh log from a stale one. A blind
+    # copy wastes the upload and misleads the monitor (09:16 copied the
+    # 22:58 session's log). A stale log is labelled and not copied.
+    if ($proc.HasExited) {
+        Write-Host ("emulator exit code: " + $proc.ExitCode + " (decimal; -1073741819 = 0xC0000005 access violation, 0 = clean exit)")
+        Write-Host ("emulator exit time: " + $proc.ExitTime.ToString("yyyy-MM-dd HH:mm:ss"))
+    } else {
+        Write-Host "emulator exit code: process object still reports running (name check disagrees - see transcript)"
+    }
     if (Test-Path $logSrc) {
-        Copy-Item -Path $logSrc -Destination (Join-Path $OutDir "last-run.log") -Force -ErrorAction SilentlyContinue
-        Write-Host "log: copied last-run.log to the result folder"
+        $logAfter = Get-Item $logSrc
+        $logFresh = $false
+        if ($logBefore -ne $null) {
+            $logFresh = ($logAfter.LastWriteTime -gt $logBefore.LastWriteTime) -or ($logAfter.Length -ne $logBefore.Length)
+        } else {
+            $logFresh = $true
+        }
+        Write-Host ("log after exit: " + $logAfter.Length + " bytes, modified " + $logAfter.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss") + ", fresh=" + $logFresh)
+        if ($logFresh) {
+            Copy-Item -Path $logSrc -Destination (Join-Path $OutDir "last-run.log") -Force -ErrorAction SilentlyContinue
+            Write-Host "log: copied last-run.log to the result folder"
+        } else {
+            Write-Host "log: STALE (unchanged since before launch) - not copied; it is a previous session, not this boot exit"
+        }
+    } else {
+        Write-Host "log: no last-run.log present after the boot exit"
     }
     Stop-Transcript | Out-Null
     exit 1

@@ -1,7 +1,19 @@
-# Test-KytyBuild.ps1 - v25 (2026-11-11)
+# Test-KytyBuild.ps1 - v26 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v26 waits 10 s after the display wake before launching, and logs the
+# pre-launch machine state (workstation locked? idle time since last
+# input). v25's wake ran on the 10:16 run and the emulator still died
+# about 1 s after launch in vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+# (ErrorUnknown -13), with the assert site confirmed in
+# emulator-stdout.log: src/graphics/host_gpu/vulkanCommon.cpp:123.
+# The wake request starts the wake, but the display path may not be up
+# when the first surface query lands, so the launch now waits for it.
+# The state log tells the next boot exit apart: a locked workstation
+# (logonui running) leaves no usable surface at all and needs the user,
+# not a longer wait.
 #
 # v25 captures the emulator's stdout/stderr to emulator-stdout.log and
 # emulator-stderr.log in the result folder, and wakes the display before
@@ -206,7 +218,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 25
+$TestScriptVersion = 26
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -699,6 +711,45 @@ if (Test-Path $logSrc) {
 # suspect for the overnight vkGetPhysicalDeviceSurfaceCapabilitiesKHR
 # launch crashes (see Request-DisplayAwake above).
 Request-DisplayAwake
+# v26: log the pre-launch machine state, then give the display time to
+# come up after the wake request before launching. v25's wake ran on the
+# 10:16 run and the emulator still died about 1 s after launch in
+# vkGetPhysicalDeviceSurfaceCapabilitiesKHR (ErrorUnknown -13): the wake
+# request starts the wake, but the display path may not be ready when the
+# first surface query lands. A locked workstation (logonui running) leaves
+# no usable surface at all - that case needs the user, not a longer wait.
+$LastInputCode = @"
+using System;
+using System.Runtime.InteropServices;
+public static class KytyLastInput {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct LASTINPUTINFO { public uint cbSize; public uint dwTime; }
+    [DllImport("user32.dll")]
+    public static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    [DllImport("kernel32.dll")]
+    public static extern uint GetTickCount();
+    public static uint IdleMilliseconds() {
+        LASTINPUTINFO lii = new LASTINPUTINFO();
+        lii.cbSize = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(LASTINPUTINFO));
+        if (!GetLastInputInfo(ref lii)) return uint.MaxValue;
+        uint now = GetTickCount();
+        return now - lii.dwTime;
+    }
+}
+"@
+$locked = Get-Process -Name "logonui" -ErrorAction SilentlyContinue
+if ($locked) { Write-Warning "Workstation is LOCKED (logonui running) - the emulator may not get a usable display surface." }
+else { Write-Host "Workstation unlocked (no logonui process)." }
+try {
+    Add-Type -TypeDefinition $LastInputCode -ErrorAction Stop
+    $idleMs = [KytyLastInput]::IdleMilliseconds()
+    if ($idleMs -eq [uint32]::MaxValue) { Write-Host "Idle time: unknown (GetLastInputInfo failed)." }
+    else { Write-Host ("Idle time since last input: " + [math]::Round($idleMs / 1000) + " s") }
+} catch {
+    Write-Host "Idle time: unknown (could not query last input)."
+}
+Write-Host "Waiting 10 s after the display wake so the display path is up before launch."
+Start-Sleep -Seconds 10
 # Log any kyty_emulator process already running before launch, so a later
 # launch crash can be told apart from a leftover-process conflict. The
 # watcher normally skips when one is running; this line closes the loop

@@ -1,7 +1,15 @@
-# Test-KytyBuild.ps1 - v16 (2026-11-10)
+# Test-KytyBuild.ps1 - v17 (2026-11-10)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v17 efficiency: the gameplay OCR check ran every 6 cycles (about every
+# 30 seconds), and each check runs Tesseract, which costs CPU and slows
+# the game a little. The check only needs to catch Pause, a return to a
+# menu (game over), or a long Unknown streak - none of which need a
+# 30-second response. v17 runs it every 12 cycles (about every minute),
+# halving the OCR overhead. The flash-watch (every 5 cycles) and the
+# 10-minute frame-dump data shots are unchanged.
 #
 # v16 adds a flash-watch to the gameplay phase (user's call, 2026-11-10):
 # the 10-minute frame-dump data shots can miss brief/transient glitches
@@ -861,10 +869,13 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
             $lines = @("Up 150", "sleep 300", "w 2000", "sleep 300", "j 150", "sleep 500")
         }
         Invoke-InputStage -Lines $lines -ExtraWaitSec 1
-        # Every 6 cycles (about a minute), OCR-check the screen from a
+        # Every 12 cycles (about a minute), OCR-check the screen from a
         # fast screen capture and react. The frame-dump data shot below is
         # separate; this check only needs to read the screen state.
-        if (($cycle % 6) -eq 0) {
+        # (v17: was every 6 cycles; Tesseract every 30 seconds cost CPU
+        # and slowed the game for no benefit - Pause/menu/game-over do
+        # not need a 30-second response.)
+        if (($cycle % 12) -eq 0) {
             $checkShot = Save-ScreenShot -ShotName "12-gameplay-check.png"
             $checkText = Get-ShotText -ShotPath $checkShot
             $checkKind = Get-ScreenKind -Text $checkText

@@ -1,7 +1,25 @@
-# Test-KytyBuild.ps1 - v24 (2026-11-11)
+# Test-KytyBuild.ps1 - v25 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v25 captures the emulator's stdout/stderr to emulator-stdout.log and
+# emulator-stderr.log in the result folder, and wakes the display before
+# launch. The 09:46 run (#146) exited during boot with code 321, which
+# is EXIT_HALT (Common::DbgExit(321), src/common/assert.h) - a fatal
+# assert, not an access violation. The fatal report is written by
+# Log::WriteFatal, which ALWAYS prints to stdout, but the script never
+# redirected the emulator's stdout, so the report was lost and
+# last-run.log was never rewritten (STALE). Redirecting stdout/stderr
+# with async readers captures the fatal report (file:line + host stack)
+# on the next boot exit. The display wake is ported from the Nov 9
+# local commit that never reached this branch: the 2026-11-09 04:59
+# auto-test of #135 crashed at launch in
+# vkGetPhysicalDeviceSurfaceCapabilitiesKHR (ErrorUnknown -13) with the
+# monitor off overnight, and the same build runs fine with the monitor
+# on. Seven consecutive morning boot exits on #146 (08:16-09:46) fit
+# the same pattern - the display is off/asleep when the watcher
+# launches. ES_DISPLAY_REQUIRED wakes it for the test run.
 #
 # v24 reports the emulator exit code and checks last-run.log freshness on
 # a boot exit, instead of blindly copying the log. The 09:16 run copied a
@@ -188,7 +206,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 24
+$TestScriptVersion = 25
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -598,6 +616,37 @@ function Get-ScreenKind {
     return "Unknown"
 }
 
+# Keep the display awake for the test run: the overnight auto-tests keep
+# dying at launch in vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+# (ErrorUnknown -13), which points at the display being off or asleep when
+# the watcher launches the emulator - the same build runs fine manually
+# with the monitor on. ES_DISPLAY_REQUIRED wakes a display that power
+# management turned off and keeps it on while the test runs; it is cleared
+# at the end of the script. A physically powered-off monitor is unaffected.
+# Ported from the Nov 9 local commit, which never reached this branch.
+$DisplayAwakeCode = @"
+using System;
+using System.Runtime.InteropServices;
+public static class KytyDisplayAwake {
+    [DllImport("kernel32.dll")]
+    public static extern uint SetThreadExecutionState(uint esFlags);
+    public static uint Wake() { return SetThreadExecutionState(0x80000003u); }
+    public static uint Clear() { return SetThreadExecutionState(0x80000000u); }
+}
+"@
+function Request-DisplayAwake {
+    try { Add-Type -TypeDefinition $DisplayAwakeCode -ErrorAction Stop } catch { }
+    try {
+        [KytyDisplayAwake]::Wake() | Out-Null
+        Write-Host "Display wake requested (display stays on for the test run)."
+    } catch {
+        Write-Warning ("Could not request display wake: " + $_.Exception.Message)
+    }
+}
+function Clear-DisplayAwake {
+    try { [KytyDisplayAwake]::Clear() | Out-Null } catch { }
+}
+
 # Launch the emulator exactly the way the launcher does: the game path, the
 # red-zone flag, --skip-notice-screen, and the full play resolution. The
 # emulator never reads cfgGlobal.json (only the launcher applies it), so the
@@ -613,6 +662,13 @@ $psi.FileName = $EmulatorExe
 $psi.Arguments = $argString
 $psi.WorkingDirectory = $BuildDir
 $psi.UseShellExecute = $false
+# v25: redirect the emulator's stdout/stderr so the fatal report behind a
+# boot exit is captured. Log::WriteFatal always prints to stdout, and a
+# directly-launched emulator never writes last-run.log, so without this
+# the report is lost entirely. Async readers drain the pipes while the
+# script sleeps, so a chatty emulator can never block on a full pipe.
+$psi.RedirectStandardOutput = $true
+$psi.RedirectStandardError = $true
 $psi.EnvironmentVariables["KYTY_INPUT_FILE"] = $InputFile
 $psi.EnvironmentVariables["KYTY_COMPUTE_RESOLVE_AHEAD"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP"] = "1"
@@ -639,8 +695,39 @@ if (Test-Path $logSrc) {
 } else {
     Write-Host "log before launch: no last-run.log present"
 }
+# Wake the display before launching: a sleeping display is the prime
+# suspect for the overnight vkGetPhysicalDeviceSurfaceCapabilitiesKHR
+# launch crashes (see Request-DisplayAwake above).
+Request-DisplayAwake
+# Log any kyty_emulator process already running before launch, so a later
+# launch crash can be told apart from a leftover-process conflict. The
+# watcher normally skips when one is running; this line closes the loop
+# for runs started any other way.
+$preExisting = Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue
+foreach ($p in $preExisting) {
+    $started = "unknown"
+    try { $started = $p.StartTime.ToString() } catch { }
+    Write-Warning ("kyty_emulator already running before launch: PID " + $p.Id + " started " + $started)
+}
+$stdoutLog = Join-Path $OutDir "emulator-stdout.log"
+$stderrLog = Join-Path $OutDir "emulator-stderr.log"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
+# v25: start the async stdout/stderr readers. Register-ObjectEvent drains
+# the pipes on the event manager while the script sleeps or navigates
+# (sandbox-proven: 200,000 stdout lines + 5,000 stderr lines captured
+# with no deadlock while the child flooded output). If registration fails,
+# stop the emulator and fail fast: a redirected process with no reader
+# would block once the pipe fills, and a crippled run proves nothing.
+try {
+    $stdoutSub = Register-ObjectEvent -InputObject $proc -EventName OutputDataReceived -MessageData $stdoutLog -Action { if ($EventArgs.Data -ne $null) { [System.IO.File]::AppendAllText($Event.MessageData, $EventArgs.Data + "`r`n") } }
+    $stderrSub = Register-ObjectEvent -InputObject $proc -EventName ErrorDataReceived -MessageData $stderrLog -Action { if ($EventArgs.Data -ne $null) { [System.IO.File]::AppendAllText($Event.MessageData, $EventArgs.Data + "`r`n") } }
+    $proc.BeginOutputReadLine()
+    $proc.BeginErrorReadLine()
+} catch {
+    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    throw ("Could not start emulator output capture: " + $_.Exception.Message)
+}
 
 # Boot wait: the game needs the full time to load the title screen and the
 # sign-in dialog before input means anything. Fail fast if the emulator died
@@ -656,7 +743,7 @@ if ($EmulatorDead) {
     # copy wastes the upload and misleads the monitor (09:16 copied the
     # 22:58 session's log). A stale log is labelled and not copied.
     if ($proc.HasExited) {
-        Write-Host ("emulator exit code: " + $proc.ExitCode + " (decimal; -1073741819 = 0xC0000005 access violation, 0 = clean exit)")
+        Write-Host ("emulator exit code: " + $proc.ExitCode + " (decimal; 321 = EXIT_HALT fatal assert, -1073741819 = 0xC0000005 access violation, 0 = clean exit)")
         Write-Host ("emulator exit time: " + $proc.ExitTime.ToString("yyyy-MM-dd HH:mm:ss"))
     } else {
         Write-Host "emulator exit code: process object still reports running (name check disagrees - see transcript)"
@@ -679,6 +766,16 @@ if ($EmulatorDead) {
     } else {
         Write-Host "log: no last-run.log present after the boot exit"
     }
+    # v25: stop the async readers so emulator-stdout.log / emulator-stderr.log
+    # are complete before the watcher copies the result folder. The 2s pause
+    # lets the event queue drain trailing lines after the process exited.
+    # The fatal report behind this boot exit is in emulator-stdout.log.
+    Start-Sleep -Seconds 2
+    try { $proc.CancelOutputRead() } catch { }
+    try { $proc.CancelErrorRead() } catch { }
+    if ($stdoutSub -ne $null) { Unregister-Event -SubscriptionId $stdoutSub.Id -ErrorAction SilentlyContinue }
+    if ($stderrSub -ne $null) { Unregister-Event -SubscriptionId $stderrSub.Id -ErrorAction SilentlyContinue }
+    Clear-DisplayAwake
     Stop-Transcript | Out-Null
     exit 1
 }
@@ -1135,6 +1232,15 @@ if ($KeepRunning) {
         Stop-Process -Id $emu.Id -Force -ErrorAction SilentlyContinue
         Write-Host "Emulator stopped."
     }
+    # v25: stop the async stdout/stderr readers so the capture logs are
+    # complete before the watcher copies the result folder. The 2s pause
+    # lets the event queue drain trailing lines after the process exited.
+    Start-Sleep -Seconds 2
+    try { $proc.CancelOutputRead() } catch { }
+    try { $proc.CancelErrorRead() } catch { }
+    if ($stdoutSub -ne $null) { Unregister-Event -SubscriptionId $stdoutSub.Id -ErrorAction SilentlyContinue }
+    if ($stderrSub -ne $null) { Unregister-Event -SubscriptionId $stderrSub.Id -ErrorAction SilentlyContinue }
 }
+Clear-DisplayAwake
 Stop-Transcript | Out-Null
 Write-Host ("done. result folder: " + $OutDir)

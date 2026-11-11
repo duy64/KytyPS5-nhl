@@ -1,7 +1,12 @@
-# Test-KytyBuild.ps1 - v28 (2026-11-11)
+# Test-KytyBuild.ps1 - v29 (2026-11-11)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v29 handles the Be A Pro X-Factors screen: the v28 run sat on it
+# because the classifier returned Unknown (which just waits) and the
+# loop never backed out. XFactor is now a recognized kind; the nav loop
+# presses Circle to return to the hub.
 #
 # v28 downscales screenshots to 1080p before OCR. Tesseract on a full
 # 3840x2160 image is slow and CPU-heavy, and it starves the emulator:
@@ -233,7 +238,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 28
+$TestScriptVersion = 29
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -632,6 +637,10 @@ function Get-ScreenKind {
     $t = $Text.ToLower()
     if ($t -match "sign in|playstation network|psn|sign-in|ea servers|unable-to-connect") { return "SignIn" }
     if ($t -match "press any button|press x to start|press x") { return "Title" }
+    # X-Factors screen (Be A Pro player abilities): the nav loop backs
+    # out of it with Circle. Check before Hub, since the screen can
+    # carry a "BE A PRO" header that the Hub pattern would swallow.
+    if ($t -match "x-factor|x factor|xfactor") { return "XFactor" }
     # Be A Pro hub FIRST for "play next game": the hub preview headline
     # reads "Game Preview: ... Face-off Against ...", and the bare
     # "face-off" Versus marker below swallowed the hub (2258 run shot 11:
@@ -1063,6 +1072,15 @@ while ($step -lt $roadmap.Count) {
     if ($kind -eq "Pause") {
         Write-Host "Pause menu - resuming with Cross."
         Invoke-InputStage -Lines @("j 150", "sleep 3000") -ExtraWaitSec 2
+        continue
+    }
+    if ($kind -eq "XFactor") {
+        # The Be A Pro X-Factors screen: a player-abilities menu the
+        # nav loop wandered into (the 2026-11-11 v28 run sat on it -
+        # Unknown just waits, so it never backed out). Circle backs out
+        # to the hub; re-read after.
+        Write-Host "X-Factors screen - backing out with Circle."
+        Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
         continue
     }
     if ($kind -eq "Unknown") {

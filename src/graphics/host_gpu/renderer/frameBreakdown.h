@@ -22,6 +22,8 @@
 //   NHL27FRAME fps=... frame=... gpu_thread_busy=... wait_gpu=... readback=... faults=...
 //              compile=... draw_prep=... draws=... dispatches=...
 //   NHL27DRAWPREP total=... materialize=... textures=... buffers=... descriptors=... pipeline=... other=...
+//   NHL27DRAWPROF total=... programs=...(share) targets=... bindings=... gfxprep=... textures=... buffers=...
+//              pipefetch=... attach=... descriptors=... constants=... dynstate=... other=... calls=... programs_calls=...
 //   NHL27MATERIALIZE calls=... total=... flat=... eval=...(n) indirect=... spec=... rest=... reuse_hit=... reuse_miss=... reuse_fallback=...
 //   NHL27BUFFERS vertex_index=... indirect=... find=... bda=... rebind=... rebind_lookup=... rebind_upload=...
 //   NHL27PROTECT calls=... ms=...
@@ -118,6 +120,26 @@ struct Counters {
 	std::atomic<uint64_t> obtain_cache_misses {0}; // KYTY_BUFFER_FAST: lookups that went to ObtainBuffer
 	std::atomic<uint64_t> dp_descriptors_ns {0};  // CommitBindings (descriptor writes)
 	std::atomic<uint64_t> dp_pipeline_ns {0};     // pipeline lookup, render targets, dynamic state, draw emit
+	// NHL27DRAWPROF phases: finer sequential sub-phases of the same draw-prep window, timed in
+	// addition to the dp_* buckets above. programs and targets split PrepareDrawRenderState, whose
+	// cost the DRAWPREP line cannot see today (dp_materialize_ns has no producer, so materialize
+	// prints 0.00, and render-target resolution is untimed); both sit in DRAWPREP "other". bindings
+	// (the PrepareBindings loop) and gfxprep (the PrepareGraphicsBindings head) are in "other" too.
+	// pipefetch, attach, constants and dynstate split dp_pipeline_ns. At print time textures,
+	// buffers and descriptors are read from the existing dp_* counters, so the named phases
+	// partition draw_prep_ns and other = draw_prep_ns minus the named phases, clamped at zero.
+	// As with the dp_* buckets, draws that return before their vkCmd draw still add to these
+	// phases but not to draw_prep_ns.
+	std::atomic<uint64_t> dp_prof_programs_ns {0};    // PrepareDrawRenderState: RefreshShaders (program lookup + materialization)
+	std::atomic<uint64_t> dp_prof_programs_calls {0}; // PrepareDrawRenderState entries with shaders not resolved ahead
+	std::atomic<uint64_t> dp_prof_targets_ns {0};     // PrepareDrawRenderState: render-target resolution + sample-count fixups
+	std::atomic<uint64_t> dp_prof_bindings_ns {0};    // ExecutePreparedDraw: PrepareBindings loop (per-stage binding preparation)
+	std::atomic<uint64_t> dp_prof_gfxprep_ns {0};     // PrepareGraphicsBindings head: FindBuffers + DMA bases + PrepareBda + image-heap rebind
+	std::atomic<uint64_t> dp_prof_pipefetch_ns {0};   // ExecutePreparedDraw: GetGraphicsPipeline only
+	std::atomic<uint64_t> dp_prof_attach_ns {0};      // ExecutePreparedDraw: AcquireRenderTargets
+	std::atomic<uint64_t> dp_prof_constants_ns {0};   // ExecutePreparedDraw: pushConstants (mesh draw data, draw data, user clip planes)
+	std::atomic<uint64_t> dp_prof_dynstate_ns {0};    // ExecutePreparedDraw: UpdateGraphicsDynamicState + DynamicState::Commit
+	std::atomic<uint64_t> dp_prof_calls {0};          // PrepareDrawRenderState entries (draw-prep window starts)
 	// NHL27MATERIALIZE: MaterializeResourcesImpl split. total is the whole call; flat, eval, indirect and
 	// spec are sequential sub-scopes (eval includes the clean walker); rest = total - the four.
 	std::atomic<uint64_t> mat_calls {0};
@@ -884,6 +906,16 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 	const uint64_t dp_buffers_ns     = Take(c.dp_buffers_ns);
 	const uint64_t dp_descriptors_ns = Take(c.dp_descriptors_ns);
 	const uint64_t dp_pipeline_ns    = Take(c.dp_pipeline_ns);
+	const uint64_t dp_prof_programs_ns    = Take(c.dp_prof_programs_ns);
+	const uint64_t dp_prof_programs_calls = Take(c.dp_prof_programs_calls);
+	const uint64_t dp_prof_targets_ns     = Take(c.dp_prof_targets_ns);
+	const uint64_t dp_prof_bindings_ns    = Take(c.dp_prof_bindings_ns);
+	const uint64_t dp_prof_gfxprep_ns     = Take(c.dp_prof_gfxprep_ns);
+	const uint64_t dp_prof_pipefetch_ns   = Take(c.dp_prof_pipefetch_ns);
+	const uint64_t dp_prof_attach_ns      = Take(c.dp_prof_attach_ns);
+	const uint64_t dp_prof_constants_ns   = Take(c.dp_prof_constants_ns);
+	const uint64_t dp_prof_dynstate_ns    = Take(c.dp_prof_dynstate_ns);
+	const uint64_t dp_prof_calls          = Take(c.dp_prof_calls);
 	const uint64_t mat_calls         = Take(c.mat_calls);
 	const uint64_t mat_total_ns      = Take(c.mat_total_ns);
 	const uint64_t mat_flat_ns       = Take(c.mat_flat_ns);
@@ -1056,6 +1088,43 @@ inline void PrintIfDueLocked(Clock::time_point now) {
 		            "descriptors=%.2fms pipeline=%.2fms other=%.2fms\n",
 		            ms(draw_prep_ns), ms(dp_materialize_ns), ms(dp_textures_ns), ms(dp_buffers_ns),
 		            ms(dp_descriptors_ns), ms(dp_pipeline_ns), other_ms);
+		// NHL27DRAWPROF: the same window as the sequential phases of PrepareDrawRenderState and
+		// ExecutePreparedDraw (see the dp_prof_* counters). Each phase prints its per-frame ms
+		// and its share of the draw-prep total in parentheses. dp_pipeline_ns is not a phase
+		// here: pipefetch, attach, constants and dynstate split it, and the rest of it (render
+		// pass begin, pipeline bind, draw emit) falls into other.
+		{
+			const double total_ms = ms(draw_prep_ns);
+			const auto   pct      = [total_ms](double phase_ms) {
+				return total_ms > 0.0 ? phase_ms * 100.0 / total_ms : 0.0;
+			};
+			const double prof_named_ms = ms(dp_prof_programs_ns) + ms(dp_prof_targets_ns) +
+			                             ms(dp_prof_bindings_ns) + ms(dp_prof_gfxprep_ns) +
+			                             ms(dp_textures_ns) + ms(dp_buffers_ns) +
+			                             ms(dp_prof_pipefetch_ns) + ms(dp_prof_attach_ns) +
+			                             ms(dp_descriptors_ns) + ms(dp_prof_constants_ns) +
+			                             ms(dp_prof_dynstate_ns);
+			const double prof_other_ms = std::max(0.0, total_ms - prof_named_ms);
+			std::printf("NHL27DRAWPROF total=%.2fms programs=%.2fms(%.0f%%) targets=%.2fms(%.0f%%) "
+			            "bindings=%.2fms(%.0f%%) gfxprep=%.2fms(%.0f%%) textures=%.2fms(%.0f%%) "
+			            "buffers=%.2fms(%.0f%%) pipefetch=%.2fms(%.0f%%) attach=%.2fms(%.0f%%) "
+			            "descriptors=%.2fms(%.0f%%) constants=%.2fms(%.0f%%) dynstate=%.2fms(%.0f%%) "
+			            "other=%.2fms(%.0f%%) calls=%.1f programs_calls=%.1f\n",
+			            total_ms, ms(dp_prof_programs_ns), pct(ms(dp_prof_programs_ns)),
+			            ms(dp_prof_targets_ns), pct(ms(dp_prof_targets_ns)),
+			            ms(dp_prof_bindings_ns), pct(ms(dp_prof_bindings_ns)),
+			            ms(dp_prof_gfxprep_ns), pct(ms(dp_prof_gfxprep_ns)),
+			            ms(dp_textures_ns), pct(ms(dp_textures_ns)),
+			            ms(dp_buffers_ns), pct(ms(dp_buffers_ns)),
+			            ms(dp_prof_pipefetch_ns), pct(ms(dp_prof_pipefetch_ns)),
+			            ms(dp_prof_attach_ns), pct(ms(dp_prof_attach_ns)),
+			            ms(dp_descriptors_ns), pct(ms(dp_descriptors_ns)),
+			            ms(dp_prof_constants_ns), pct(ms(dp_prof_constants_ns)),
+			            ms(dp_prof_dynstate_ns), pct(ms(dp_prof_dynstate_ns)),
+			            prof_other_ms, pct(prof_other_ms),
+			            per(dp_prof_calls), per(dp_prof_programs_calls));
+			std::fflush(stdout);
+		}
 		if (Verbose()) {
 			auto&          tx = g_tex;
 			const uint64_t t_res = Take(tx.resolve_ns), t_bind = Take(tx.bind_ns), t_reb = Take(tx.rebind_ns);

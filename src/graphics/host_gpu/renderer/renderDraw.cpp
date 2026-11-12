@@ -1584,12 +1584,16 @@ bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_
                                             DrawRenderState&    state) {
 	const auto color_output_mask = DrawColorOutputMask(buffer.GetRegisters());
 	FrameBreakdown::DrawPrepBegin();
+	FrameBreakdown::Add(FrameBreakdown::g_counters.dp_prof_calls);
 	if (!shaders_resolved) {
+		FrameBreakdown::Timer programs_timer(FrameBreakdown::g_counters.dp_prof_programs_ns);
+		FrameBreakdown::Add(FrameBreakdown::g_counters.dp_prof_programs_calls);
 		state.ps_active =
 		    PixelShaderActive(buffer.GetRegisters(), buffer.GetShaders(), color_output_mask);
 		RefreshShaders(buffer, draw, color_output_mask, state);
 	}
 	if (!state.programs.vertex[0]) return false;
+	FrameBreakdown::Timer targets_timer(FrameBreakdown::g_counters.dp_prof_targets_ns);
 	uint32_t mrt_mask = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
@@ -1873,14 +1877,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	auto&                            bindings = m_graphics_bindings;
 	std::array<PreparedBindings*, 4> descriptor_stages {};
 	uint32_t                         stage_count = 0;
-	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
-		PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
-		descriptor_stages[stage_count++] = &bindings.vertex[i];
-	}
-	if (state.ps_active) {
-		if (!bindings.pixel) bindings.pixel.emplace();
-		PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
-		descriptor_stages[stage_count++] = &*bindings.pixel;
+	{
+		FrameBreakdown::Timer bindings_timer(FrameBreakdown::g_counters.dp_prof_bindings_ns);
+		for (uint32_t i = 0; i < vertex_stages.size(); i++) {
+			PrepareBindings(state.vertex_info[i].stage, bindings.vertex[i]);
+			descriptor_stages[stage_count++] = &bindings.vertex[i];
+		}
+		if (state.ps_active) {
+			if (!bindings.pixel) bindings.pixel.emplace();
+			PrepareBindings(state.ps_input_info.stage, *bindings.pixel);
+			descriptor_stages[stage_count++] = &*bindings.pixel;
+		}
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	if (emit.indirect_stage != nullptr && state.vertex_info[0].stage.program->info.native_draw &&
@@ -1964,17 +1971,21 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	// Pipeline bucket: paused around CommitBindings (its own bucket) and stopped after the draw.
 	std::optional<FrameBreakdown::Timer> pipeline_timer;
 	pipeline_timer.emplace(FrameBreakdown::g_counters.dp_pipeline_ns);
+	FrameBreakdown::Timer pipefetch_timer(FrameBreakdown::g_counters.dp_prof_pipefetch_ns);
 	auto& pipeline = m_context.GetPipelineCache().GetGraphicsPipeline(
 	    std::span {state.colors, state.color_count}, *state.depth, vertex_stages, buffer,
 	    state.ps_active ? &state.ps_input_info : nullptr, topology, primitive_restart_enable,
 	    state.programs);
+	pipefetch_timer.Stop();
 	pipeline_section.Stop();
 	BufferCache::PerfTimerScope attachments_section(BufferCache::PerfTimer::DrawAttachments);
 	vk::ImageAspectFlags feedback_aspects;
 	FrameBreakdown::Timer targets_timer(FrameBreakdown::g_pl.targets_ns, FrameBreakdown::Verbose());
+	FrameBreakdown::Timer attach_timer(FrameBreakdown::g_counters.dp_prof_attach_ns);
 	const auto rendering =
 	    AcquireRenderTargets(buffer, state.colors, state.color_count, *state.depth,
 	                         feedback_aspects, stages);
+	attach_timer.Stop();
 	attachments_section.Stop();
 	BufferCache::PerfTimerScope commit_section(BufferCache::PerfTimer::DrawCommit);
 	targets_timer.Stop();
@@ -2001,6 +2012,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	std::optional<FrameBreakdown::Timer> vcommit2_timer;
 	vcommit2_timer.emplace(FrameBreakdown::g_pl.vcommit_ns, FrameBreakdown::Verbose());
 	if (mesh_active) {
+		FrameBreakdown::Timer constants_timer(FrameBreakdown::g_counters.dp_prof_constants_ns);
 		const uint32_t draw_data[] {
 		    draw.index_count,
 		    draw.IsIndexed() ? static_cast<uint32_t>(emit.vertex_offset) : emit.first_vertex,
@@ -2018,6 +2030,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 	vcommit2_timer.reset();
 	using ShaderRecompiler::IR::PushData;
+	FrameBreakdown::Timer constants_timer(FrameBreakdown::g_counters.dp_prof_constants_ns);
 	const auto draw_stages =
 	    vk::ShaderStageFlagBits::eFragment |
 	    (mesh_active ? vk::ShaderStageFlagBits::eMeshEXT : vk::ShaderStageFlagBits::eVertex);
@@ -2044,6 +2057,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		                        std::bit_width(planes) * 4u * sizeof(uint32_t),
 		                        buffer.GetRegisters().GetUserClipPlanes().data());
 	}
+	constants_timer.Stop();
 
 
 	// KYTY_PIPELINE_MEMO. The pipeline bound by this path is remembered together with the recording it was bound
@@ -2070,6 +2084,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 
 	{
 		FrameBreakdown::Timer dyn_timer(FrameBreakdown::g_pl.dyn_ns, FrameBreakdown::Verbose());
+		FrameBreakdown::Timer prof_dyn_timer(FrameBreakdown::g_counters.dp_prof_dynstate_ns);
 		auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
 		if (foreign_state) {
 			dynamic_state.Invalidate();

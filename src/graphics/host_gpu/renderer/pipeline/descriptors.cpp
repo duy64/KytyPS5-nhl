@@ -1589,6 +1589,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
 
+	FrameBreakdown::Timer gfxprep_timer(FrameBreakdown::g_counters.dp_prof_gfxprep_ns);
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
@@ -1601,6 +1602,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
+	gfxprep_timer.Stop();
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
 		FrameBreakdown::TexScope tex_scope;

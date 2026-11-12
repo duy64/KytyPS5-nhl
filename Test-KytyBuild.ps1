@@ -1,7 +1,24 @@
-# Test-KytyBuild.ps1 - v31 (2026-11-11)
+# Test-KytyBuild.ps1 - v32 (2026-11-12)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v32 copies last-run.log only AFTER the emulator has fully exited.
+# Run 0012 proved the old order wrong: the end-of-run copy ran while
+# the emulator was still alive, so it copied the previous manual
+# session's last-run.log (md5-identical to it) and the collapsed run
+# left no usable log at all - which is why no 0-fps run has ever
+# produced a log the FPS stall can be diagnosed from. The emulator
+# writes last-run.log as it runs / on exit, so a copy taken before the
+# process is gone is the previous session, not this run. The copy now
+# lives in one helper (Copy-EmulatorLog): it waits for the process to
+# be fully gone (bounded 60 s), then copies only if the log is fresh
+# against the pre-launch fingerprint (v24's rule, kept). The end-of-run
+# cleanup stops the emulator, waits, stops the stdout/stderr readers,
+# and only then copies - so emulator-stdout.log is final too. With
+# -KeepRunning the copy is skipped and labelled, never taken stale.
+# Nothing else changes: same 4K, clip bursts, roadmap, frame-dump
+# shots.
 #
 # v31 adds clip bursts (the user's call): single screenshots miss
 # transient glitches that appear and vanish between shots, so when the
@@ -254,7 +271,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 31
+$TestScriptVersion = 32
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -805,6 +822,68 @@ function Invoke-BringEmulatorToFront {
     }
 }
 
+# v32: wait for the emulator to FULLY exit before any log is copied, and
+# copy last-run.log only then. The 0012 run proved the old order wrong:
+# the end-of-run copy ran while the emulator was still alive, so it
+# copied the previous manual session's last-run.log (md5-identical to
+# it) and the collapsed run left no usable log at all. The emulator
+# writes last-run.log as it runs / on exit, so a copy taken before the
+# process is gone is a copy of the previous session, not this run.
+# The wait polls for the process by name (the $proc object alone is not
+# enough - the user may have closed the game window himself, or the
+# process may have been restarted). Bounded: after $TimeoutSec it gives
+# up and reports false instead of hanging the run. -ProcessName exists
+# only so a fixture can exercise the wait against a dummy process; the
+# production calls all use the default.
+function Wait-EmulatorExit {
+    param([int]$TimeoutSec = 60, [string]$ProcessName = "kyty_emulator")
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        if (-not (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)) {
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    if (-not (Get-Process -Name $ProcessName -ErrorAction SilentlyContinue)) {
+        return $true
+    }
+    Write-Warning ("Emulator still running after " + $TimeoutSec + " s wait - logs will not be copied yet; the running process may still be writing them.")
+    return $false
+}
+
+# v32: the one place last-run.log is copied. Waits for the emulator to
+# exit first (see Wait-EmulatorExit), then copies only if the log is
+# fresh against the pre-launch fingerprint ($logBefore, taken before
+# launch): a log unchanged since before launch is a previous session,
+# not this run, and is labelled STALE and left out (v24's rule, kept).
+# $logSrc and $logBefore are set in the launch section, before any call.
+function Copy-EmulatorLog {
+    param([int]$TimeoutSec = 60, [string]$ProcessName = "kyty_emulator")
+    $waited = Wait-EmulatorExit -TimeoutSec $TimeoutSec -ProcessName $ProcessName
+    if (-not $waited) {
+        Write-Host "log: emulator did not exit in time - last-run.log not copied (it would be stale or still being written)"
+        return
+    }
+    if (-not (Test-Path $logSrc)) {
+        Write-Host "log: no last-run.log present after the emulator exited"
+        return
+    }
+    $logAfter = Get-Item $logSrc
+    $logFresh = $false
+    if ($logBefore -ne $null) {
+        $logFresh = ($logAfter.LastWriteTime -gt $logBefore.LastWriteTime) -or ($logAfter.Length -ne $logBefore.Length)
+    } else {
+        $logFresh = $true
+    }
+    Write-Host ("log after exit: " + $logAfter.Length + " bytes, modified " + $logAfter.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss") + ", fresh=" + $logFresh)
+    if ($logFresh) {
+        Copy-Item -Path $logSrc -Destination (Join-Path $OutDir "last-run.log") -Force -ErrorAction SilentlyContinue
+        Write-Host "log: copied last-run.log to the result folder"
+    } else {
+        Write-Host "log: STALE (unchanged since before launch) - not copied; it is a previous session, not this run"
+    }
+}
+
 # Launch the emulator exactly the way the launcher does: the game path, the
 # red-zone flag, --skip-notice-screen, and the full play resolution. The
 # emulator never reads cfgGlobal.json (only the launcher applies it), so the
@@ -923,6 +1002,9 @@ try {
     $proc.BeginErrorReadLine()
 } catch {
     Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+    # v32: wait for it to actually be gone, so a half-started emulator
+    # does not linger and block the next watcher pass.
+    Wait-EmulatorExit -TimeoutSec 30 | Out-Null
     throw ("Could not start emulator output capture: " + $_.Exception.Message)
 }
 
@@ -945,24 +1027,10 @@ if ($EmulatorDead) {
     } else {
         Write-Host "emulator exit code: process object still reports running (name check disagrees - see transcript)"
     }
-    if (Test-Path $logSrc) {
-        $logAfter = Get-Item $logSrc
-        $logFresh = $false
-        if ($logBefore -ne $null) {
-            $logFresh = ($logAfter.LastWriteTime -gt $logBefore.LastWriteTime) -or ($logAfter.Length -ne $logBefore.Length)
-        } else {
-            $logFresh = $true
-        }
-        Write-Host ("log after exit: " + $logAfter.Length + " bytes, modified " + $logAfter.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss") + ", fresh=" + $logFresh)
-        if ($logFresh) {
-            Copy-Item -Path $logSrc -Destination (Join-Path $OutDir "last-run.log") -Force -ErrorAction SilentlyContinue
-            Write-Host "log: copied last-run.log to the result folder"
-        } else {
-            Write-Host "log: STALE (unchanged since before launch) - not copied; it is a previous session, not this boot exit"
-        }
-    } else {
-        Write-Host "log: no last-run.log present after the boot exit"
-    }
+    # v32: one helper for the log copy - it waits for the emulator to be
+    # fully gone (a no-op here, it already exited) and copies only a
+    # fresh log, so a boot exit can never plant the previous session.
+    Copy-EmulatorLog
     # v25: stop the async readers so emulator-stdout.log / emulator-stderr.log
     # are complete before the watcher copies the result folder. The 2s pause
     # lets the event queue drain trailing lines after the process exited.
@@ -1432,23 +1500,31 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     Write-Host ("gameplay phase done: " + $cycle + " cycles, " + $gameplayMins + " min, " + $gameplayShotCount + " data shots, " + $flashShotCount + " flash-watch shots.")
 }
 
-# Copy the emulator log into the result folder for diagnosis.
-$logSrc = Join-Path $env:LOCALAPPDATA "KytyPS5\logs\last-run.log"
-if (Test-Path $logSrc) {
-    Copy-Item -Path $logSrc -Destination (Join-Path $OutDir "last-run.log") -Force -ErrorAction SilentlyContinue
-    Write-Host "log: copied last-run.log to the result folder"
-}
-
 # Cleanup: leave the emulator running only when asked; otherwise stop it so
 # the next watcher pass (or the user) starts clean.
+# v32: the last-run.log copy used to sit here, BEFORE the emulator was
+# stopped - it copied the previous session's log (run 0012). It now
+# happens at the end of the else branch, after the emulator has fully
+# exited and the readers have stopped.
 if ($KeepRunning) {
     Write-Host "Keeping the emulator running (-KeepRunning)."
+    # v32: no log copy while the emulator is still running. The file on
+    # disk is the previous session's until this process exits, so copying
+    # it now would plant a stale log in the result folder (the 0012 run).
+    Write-Host "log: skipped - emulator still running, so last-run.log is not this run's finished log"
 } else {
     $emu = Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue
     if ($emu) {
         Stop-Process -Id $emu.Id -Force -ErrorAction SilentlyContinue
         Write-Host "Emulator stopped."
     }
+    # v32: wait for the process to be fully gone before the readers stop
+    # and the log is copied. Stop-Process only asks it to die; copying
+    # last-run.log (or draining stdout) before it has exited copies the
+    # previous session's file - the 0012 run. Bounded (60 s); a timed-out
+    # wait still cannot plant a stale log, because Copy-EmulatorLog
+    # refuses one.
+    Wait-EmulatorExit -TimeoutSec 60 | Out-Null
     # v25: stop the async stdout/stderr readers so the capture logs are
     # complete before the watcher copies the result folder. The 2s pause
     # lets the event queue drain trailing lines after the process exited.
@@ -1457,6 +1533,10 @@ if ($KeepRunning) {
     try { $proc.CancelErrorRead() } catch { }
     if ($stdoutSub -ne $null) { Unregister-Event -SubscriptionId $stdoutSub.Id -ErrorAction SilentlyContinue }
     if ($stderrSub -ne $null) { Unregister-Event -SubscriptionId $stderrSub.Id -ErrorAction SilentlyContinue }
+    # v32: copy AFTER the emulator has exited and the readers have
+    # stopped, so last-run.log and emulator-stdout.log are this run's
+    # finished files, not the previous session's.
+    Copy-EmulatorLog
 }
 Clear-DisplayAwake
 Stop-Transcript | Out-Null

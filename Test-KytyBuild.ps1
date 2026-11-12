@@ -1,7 +1,28 @@
-# Test-KytyBuild.ps1 - v33 (2026-11-12)
+# Test-KytyBuild.ps1 - v34 (2026-11-12)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v34 is a stripped / idle diagnostic run, not a fix. Run 0636 (v33,
+# all five perf flags on) still collapsed, but the fault data reframed
+# the cause: the healthy manual session had MORE guest faults per
+# frame (n about 312) than the collapsed run (n about 230) - the
+# difference is the cost per fault, about 27-33 us/fault in manual
+# play vs about 1200-1400 us/fault in the auto-run (NHL27FAULTCOST
+# lines in emulator-stdout.log). The user's theory: the script's own
+# activity (screenshots, OCR, frame dumps) is what makes each fault
+# expensive. v34 tests exactly that and changes nothing else: same
+# launch environment as v33 (the five perf flags stay on), same
+# navigation as far as the Hub - then, instead of proceeding to
+# GameExperience / Versus / Ice / gameplay, the script goes completely
+# idle for 15 minutes: no screenshots, no OCR, no inputs, no frame
+# dumps, only a process-alive check every 30 s. Decision rule: during
+# the idle window, if NHL27FAULTCOST us/fault is back near ~30 (the
+# manual-session level), the script's own activity is what makes
+# faults expensive; if it stays near ~1200, the launch path itself is
+# the cause. After the idle window the normal v33 cleanup runs
+# (stop emulator, wait for exit, stop the readers, copy the logs)
+# and the run exits normally.
 #
 # v33 is a controlled diagnostic run, not a fix: it adds the 5 perf
 # flags the healthy manual launcher process has and the collapsing
@@ -288,7 +309,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 33
+$TestScriptVersion = 34
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1304,6 +1325,28 @@ while ($step -lt $roadmap.Count) {
             $navFailed = $true
             break
         }
+        # v34 IDLE TEST: the Hub stop has been reached, so this run's
+        # navigation is done. Do NOT take the Hub action below and do
+        # NOT proceed to GameExperience / Versus / Ice / gameplay. Sit
+        # on the hub and go completely idle for 15 minutes - no
+        # screenshots, no OCR, no input-file writes, no
+        # framedump.trigger, nothing but a process-alive check every
+        # 30 s. The NHL27FAULTCOST lines the emulator writes during
+        # this window decide the run 0636 question (see the v34 header
+        # for the decision rule). Leaving the nav loop here falls
+        # through to the normal cleanup: $reachedIce stays $false, so
+        # the gameplay shots and the gameplay phase are skipped.
+        Write-Host "IDLE TEST START - script going idle for 15 minutes (no screenshots, no OCR, no inputs, no frame dumps)"
+        $idleEnd = (Get-Date).AddMinutes(15)
+        while ((Get-Date) -lt $idleEnd) {
+            if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
+                Write-Warning "IDLE TEST: emulator exited during the idle window - ending the idle phase early."
+                break
+            }
+            Start-Sleep -Seconds 30
+        }
+        Write-Host "IDLE TEST END"
+        break
         # Two different Hub screens. The Be A Pro hub highlights PLAY NEXT
         # GAME, so Cross is right there. The main menu highlights BE A PRO
         # CAREER first, so Cross alone opens Be A Pro - that is the route

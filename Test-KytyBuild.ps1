@@ -1,7 +1,24 @@
-# Test-KytyBuild.ps1 - v32 (2026-11-12)
+# Test-KytyBuild.ps1 - v33 (2026-11-12)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v33 is a controlled diagnostic run, not a fix: it adds the 5 perf
+# flags the healthy manual launcher process has and the collapsing
+# auto-test process lacks. The NHL27CFG diff (script run 0 vs manual
+# run 1) shows the script-launched emulator is missing 4 flags the
+# launcher applies from assets/cfgGlobal.json, because the script
+# launches kyty_emulator.exe directly and sets only its own env vars:
+# KYTY_FAULT_PARSE_GATE, KYTY_SRT_CFG_SCHEDULE, KYTY_WRITE_COVER_SKIP
+# and KYTY_AGED_WRITEBACK. Prime suspect is FAULT_PARSE_GATE: in
+# faultManager.cpp gate=1 lets a 1-invocation gate dispatch skip the
+# full fault-bitmap parser when the dirty word is clear; gate=0 runs
+# the parser over the whole bitmap on every fault/write pass. A fifth
+# var, KYTY_PERF_STATS=1, is added so the run emits the NHL27FRAME
+# breakdown lines (12 in the collapsing log vs 1230 in the manual
+# log) the collapse needs to be localized. If the run stays at 0-2
+# fps with all five on, the flags are exonerated; if it holds ~54 fps,
+# the next step is to bisect one at a time. Nothing else changes.
 #
 # v32 copies last-run.log only AFTER the emulator has fully exited.
 # Run 0012 proved the old order wrong: the end-of-run copy ran while
@@ -271,7 +288,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 32
+$TestScriptVersion = 33
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -920,6 +937,16 @@ $psi.EnvironmentVariables["KYTY_DBG_LOOP_CAP"] = "65536"
 $psi.EnvironmentVariables["KYTY_DBG_SKIP_BAD_SHADERS"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_BREADCRUMBS"] = "0"
 $psi.EnvironmentVariables["KYTY_DBG_CONTROLLERS"] = "1"
+# v33 (diagnostic, not a fix): the launcher applies cfgGlobal.json to the
+# emulator process; the script launches it directly, so these 4 perf flags
+# the healthy manual run has were missing from every collapsing auto-run.
+# KYTY_PERF_STATS=1 is added so the run emits the NHL27FRAME breakdown
+# lines (12 in the collapsing log vs 1230 in the manual log).
+$psi.EnvironmentVariables["KYTY_FAULT_PARSE_GATE"] = "1"
+$psi.EnvironmentVariables["KYTY_SRT_CFG_SCHEDULE"] = "1"
+$psi.EnvironmentVariables["KYTY_WRITE_COVER_SKIP"] = "1"
+$psi.EnvironmentVariables["KYTY_AGED_WRITEBACK"] = "1"
+$psi.EnvironmentVariables["KYTY_PERF_STATS"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 # v24: fingerprint last-run.log BEFORE launch, so a boot exit can tell a
 # fresh log from a stale one. The emulator does not rewrite the log when

@@ -1,30 +1,30 @@
-# Test-KytyBuild.ps1 - v35 (2026-11-12)
+# Test-KytyBuild.ps1 - v36 (2026-11-12)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
 #
-# v35 is a single-variable controlled test on top of v34, not a fix.
-# v33/v34 exonerated the four NHL27CFG-table flags and the script's
-# own activity. The launch-path investigation then found a SECOND
-# experiment table, Common::Experiments::EnvironmentMask
-# (src/common/experiments.cpp), which no log ever prints. Five of its
-# bits are set to "1" by the shipped assets/cfgGlobal.json, default
-# OFF in code, and are set by NO auto-run: KYTY_PROTECT_SHARED_LOCK,
-# KYTY_CLOCK_WAIT_PREDICT, KYTY_CP_CLEAN_REG_READS,
-# KYTY_CP_SKIP_IDLE_SPIN and KYTY_SPECULATE_DIRTY_READS. v35 adds
-# exactly ONE of them to the launch environment, the lead candidate
-# KYTY_PROTECT_SHARED_LOCK: in the kernel memory address space
-# (memoryAddressSpace.inc, ProtectTransient) it switches an exclusive
-# address-space lock to a shared one so GPU page-tracking protections
-# can run in parallel; with it off, every transient protection
-# serializes. Everything else is identical to v34: same stripped
-# hub + 15-minute idle profile. Decision rule: in the idle window,
-# if NHL27FAULTCOST median us/fault falls from ~1900 toward the
-# manual band (~30, or at least under ~300) and idle NHL27FPS median
-# rises from 9 to roughly 40+, ProtectSharedLock is confirmed as the
-# blowup; if us/fault stays ~1200-1900 and idle fps stays ~5-13, it
-# is exonerated and the next single-variable test is
-# KYTY_SPECULATE_DIRTY_READS=1.
+# v36 is a single-variable controlled test, not a fix. It is the next
+# test in the queue after v35 exonerated KYTY_PROTECT_SHARED_LOCK:
+# run 1013 (v35, ProtectSharedLock=1 alone) still collapsed - idle
+# NHL27FAULTCOST median us/fault 1838.9, total 141.94 ms/frame over
+# 939 samples, fps median 65 until t=60 then 9. v36 changes exactly
+# one variable on the v34 base: KYTY_SPECULATE_DIRTY_READS=1. It is
+# the next bit of the second, unlogged experiment table
+# (Common::Experiments::EnvironmentMask): cfgGlobal.json sets it to
+# "1", it defaults off in code (experiments.cpp:105), and no auto-run
+# has ever set it. It targets the readmem component of fault cost
+# (experiments.h:70; memory.cpp:1184, bufferCache.cpp:2732): reads of
+# GPU-dirty bytes are served from the backing and checked later,
+# instead of the synchronous exact path. Decision rule: during the
+# idle window, if NHL27FAULTCOST median us/fault falls from ~1900
+# toward the manual band (~30, or at least under ~300) and idle
+# NHL27FPS median rises from 9 to roughly 40+, SpeculateDirtyReads
+# is confirmed as (part of) the cause; if us/fault stays ~1200-1900
+# and idle fps stays ~5-13, it is exonerated and the next
+# single-variable test is KYTY_PERF_NO_SYNC_READBACK=1. Note: the
+# NHL27CFG printout does NOT cover this variable (different table),
+# so the transcript line before launch is the run's only self-record
+# of what changed.
 #
 # v34 is a stripped / idle diagnostic run, not a fix. Run 0636 (v33,
 # all five perf flags on) still collapsed, but the fault data reframed
@@ -332,7 +332,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 35
+$TestScriptVersion = 36
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -991,13 +991,10 @@ $psi.EnvironmentVariables["KYTY_SRT_CFG_SCHEDULE"] = "1"
 $psi.EnvironmentVariables["KYTY_WRITE_COVER_SKIP"] = "1"
 $psi.EnvironmentVariables["KYTY_AGED_WRITEBACK"] = "1"
 $psi.EnvironmentVariables["KYTY_PERF_STATS"] = "1"
-# v35 (single-variable diagnostic, not a fix): ONE bit from the second
-# experiment table (Common::Experiments::EnvironmentMask in
-# experiments.cpp), which the NHL27CFG printout does not cover. Lead
-# candidate: it lets GPU page-tracking protections run in parallel
-# under a shared address-space lock instead of serializing on the
-# exclusive lock.
-$psi.EnvironmentVariables["KYTY_PROTECT_SHARED_LOCK"] = "1"
+# v36 (single-variable diagnostic, not a fix): the next bit of the
+# unlogged EnvironmentMask table after v35 exonerated ProtectSharedLock.
+# SpeculateDirtyReads targets the readmem component of fault cost.
+$psi.EnvironmentVariables["KYTY_SPECULATE_DIRTY_READS"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 # v24: fingerprint last-run.log BEFORE launch, so a boot exit can tell a
 # fresh log from a stale one. The emulator does not rewrite the log when
@@ -1065,7 +1062,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v35 single-variable test: KYTY_PROTECT_SHARED_LOCK=1 (all else identical to v34)"
+Write-Host "v36 single-variable test: KYTY_SPECULATE_DIRTY_READS=1 (all else identical to v34)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

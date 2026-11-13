@@ -471,6 +471,18 @@ Pull requests that include AI-assisted or AI-generated work should disclose the 
 involvement and describe the human review and testing performed before submission. Unverified or
 untested generated changes may be closed without review.
 
+## Credits
+
+This fork builds on other people's work:
+
+- **[KytyPS5](https://github.com/KytyPS5/KytyPS5)** — the upstream emulator this fork is based on, and all of its contributors.
+- **[Kyty](https://github.com/InoriRus/Kyty)** by **InoriRus** — the original emulator KytyPS5 is based on.
+- **pengui07** — author of the fork this one started from, including the controller rumble work included in main.
+- **petrmolek** — upstream performance commits included in this fork: the buffer obtain and by-range memos, the resolved-draw rings, page-by-page copy-thread copies, the render-pass attachment compare, and the strict-read skip.
+- **pargi** — the shipped configuration change lowering the debug loop cap.
+- **Artyom Zabroda** — the TrackingSpinLock optimization (TTAS with cached thread ID), via MatusRiedl/KytyPS5-nhl27-enhanced.
+- **superkeka** — GPU interrupt coalescing, via MatusRiedl/KytyPS5-nhl27-enhanced.
+
 ## License
 
 KytyPS5 is licensed under the [GNU General Public License version 2](LICENSE) (`GPL-2.0-only`).

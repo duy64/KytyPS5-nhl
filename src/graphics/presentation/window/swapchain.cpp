@@ -1125,6 +1125,7 @@ struct PresentCapture {
 	void*         mapped = nullptr;
 	uint32_t      w = 0, h = 0;
 	vk::Format    format = vk::Format::eUndefined;
+	std::string   dir;
 };
 
 static bool CapturablePresentFormat(vk::Format format) {
@@ -1208,7 +1209,8 @@ static void WritePresentCapture(GraphicContext& graphics, PresentCapture& captur
 		rgb[i * 3 + 1] = static_cast<uint8_t>(g);
 		rgb[i * 3 + 2] = static_cast<uint8_t>(b);
 	}
-	const auto path = "present_" + std::to_string(count++) + ".png";
+	const auto path = (capture.dir.empty() ? std::string() : capture.dir + "/") + "present_" +
+	                  std::to_string(count++) + ".png";
 	const bool ok   = FrameDump::WriteRgbPng(path, capture.w, capture.h, rgb);
 	std::printf("NHL27PRESENTCAPTURE: %s %ux%u %s%s\n", path.c_str(), capture.w, capture.h,
 	            vk::to_string(capture.format).c_str(), ok ? "" : " (write failed)");
@@ -1244,9 +1246,23 @@ void Presenter::Impl::Present() {
 	}
 	static uint32_t capture_check  = 0;
 	bool            capture_wanted = false;
+	static std::string capture_dir;
 	if (++capture_check % 30 == 0 && main_frame != nullptr && !main_frame->blank) {
 		std::error_code error;
+		capture_dir.clear();
 		capture_wanted = std::filesystem::remove("present.trigger", error);
+		if (!capture_wanted) {
+			// F2 light captures ask from the frame-dump folder instead (window.cpp writes
+			// the trigger there), so the PNG lands next to the frame dumps.
+			static const std::string dump_dir = [] {
+				const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_DIR");
+				return v != nullptr ? std::string(v) : std::string();
+			}();
+			if (!dump_dir.empty() && std::filesystem::remove(dump_dir + "/present.trigger", error)) {
+				capture_wanted = true;
+				capture_dir    = dump_dir;
+			}
+		}
 	}
 	for (uint32_t attempt = 0; attempt < 2; attempt++) {
 		auto status = swapchain.AcquireNextImage(present_scheduler);
@@ -1255,6 +1271,7 @@ void Presenter::Impl::Present() {
 			continue;
 		}
 		PresentCapture capture;
+		capture.dir    = capture_dir;
 		uint64_t       submitted = 0;
 		// present_mutex owns the prepared frames and this scheduler. Only queue submission
 		// is shared with rendering, and it has its own queue_mutex.

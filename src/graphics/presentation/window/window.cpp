@@ -521,7 +521,15 @@ void WindowContext::ProcessEvent(double time_s) {
 								return v != nullptr && v[0] == '1';
 							}();
 							if (light) {
-								if (std::FILE* f = std::fopen("present.trigger", "wb"); f != nullptr) {
+								// Ask in the frame-dump folder when one is configured, so the PNG
+								// lands next to the frame dumps; the presenter checks both folders.
+								static const std::string trigger_path = [] {
+									const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_DIR");
+									return (v != nullptr && *v != '\0')
+									           ? std::string(v) + "/present.trigger"
+									           : std::string("present.trigger");
+								}();
+								if (std::FILE* f = std::fopen(trigger_path.c_str(), "wb"); f != nullptr) {
 									std::fclose(f);
 									std::printf("NHL27FRAMEDUMP: F2 light - present capture triggered\n");
 									std::fflush(stdout);

@@ -511,6 +511,9 @@ void WindowContext::ProcessEvent(double time_s) {
 					if ((event->key.mod & SDL_KMOD_SHIFT) != 0) {
 						TogglePerformanceOverlayDetails();
 					} else {
+						if (!event->key.repeat) {
+							Libs::Graphics::FrameDump::Request();
+						}
 						TogglePerformanceOverlay();
 					}
 				}

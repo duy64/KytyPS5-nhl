@@ -503,4 +503,12 @@ jobs:
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \
               --title "$RELEASE_NAME"
+            gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" --json body --jq .body > release-notes.md              
+            cat >> release-notes.md <<'KYTY_CREDITS_EOF'            
+
+          ---
+
+          **Credits** — Built on [KytyPS5](https://github.com/KytyPS5/KytyPS5) and the original [Kyty](https://github.com/InoriRus/Kyty) by InoriRus; fork base by pengui07. This fork also includes upstream work by petrmolek, pargi, Artyom Zabroda, and superkeka. See the README's Credits section for details.
+          KYTY_CREDITS_EOF          
+            gh release edit "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" --notes-file release-notes.md          
           fi

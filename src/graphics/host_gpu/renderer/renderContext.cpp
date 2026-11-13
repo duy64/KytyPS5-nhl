@@ -10,6 +10,7 @@
 #include "graphics/guest_gpu/stageStats.h"
 #include "graphics/host_gpu/pageWriteSeq.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
@@ -44,6 +45,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
 }
 
 RenderContext::~RenderContext() {
+	// Stop the frame-dump download worker first, while the allocator and the
+	// command scheduler are still alive for its final VMA calls.
+	FrameDump::Shutdown();
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }

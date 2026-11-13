@@ -512,7 +512,23 @@ void WindowContext::ProcessEvent(double time_s) {
 						TogglePerformanceOverlayDetails();
 					} else {
 						if (!event->key.repeat) {
-							Libs::Graphics::FrameDump::Request();
+							// KYTY_DBG_FRAME_DUMP_LIGHT=1: F2 saves only the presented frame -- one PNG
+							// written by the presenter through its present.trigger path -- instead of
+							// the full frame dump, which reads back every image of the frame and
+							// stalls the game for about a minute at 4K.
+							static const bool light = [] {
+								const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_LIGHT");
+								return v != nullptr && v[0] == '1';
+							}();
+							if (light) {
+								if (std::FILE* f = std::fopen("present.trigger", "wb"); f != nullptr) {
+									std::fclose(f);
+									std::printf("NHL27FRAMEDUMP: F2 light - present capture triggered\n");
+									std::fflush(stdout);
+								}
+							} else {
+								Libs::Graphics::FrameDump::Request();
+							}
 						}
 						TogglePerformanceOverlay();
 					}

@@ -1,7 +1,27 @@
-# Test-KytyBuild.ps1 - v41 (2026-11-14)
+# Test-KytyBuild.ps1 - v42 (2026-11-14)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v42: STRATEGY CHANGE - full launcher environment. Log-mining on
+# 2026-11-14 (collapse-log-mining-2026-11-14.md) found: (1) every long
+# wait is MasterSemaphore::Wait (vkWaitSemaphores on the host timeline
+# semaphore); a GPU-thread caller stack holds 49% of collapsed wait
+# time at ~62 ms avg and is absent in healthy play. (2) Fault volume is
+# LOWER in collapse (74 vs 355 per window) but unit cost is ~90x
+# (2278 vs 25 us/fault), GPU-attributed fault cost 102.7 ms/window vs
+# 0.0 healthy. (3) The shipped cfgGlobal.json carries 67 env rows; this
+# script set only 16 - 56 rows have never been in a script launch,
+# including all five singly-exonerated bisect variables TOGETHER plus
+# ~50 untested rows (PIPELINE_CACHE_DIRTY, SHADER_PREGEN,
+# READBACK_QUEUE, LDS_NO_READBACK, FALSE_SHARE_ANY_THREAD, ...). Five
+# one-at-a-time tests on a bare base could only ever exonerate.
+# v42 therefore sets the FULL cfgGlobal env exactly as shipped
+# (including KYTY_NHL_RES_SCALE=0.6667) plus the script's diagnostic
+# rows. Decision rule: idle fps median ~40+ AND fault cost <300
+# us/fault = the cause is in the env set; bisect DOWN by groups next.
+# Still ~9-11 fps / >1200 us = the launch difference is not env at
+# all; pivot to launch mechanics (cwd, stdio, priority).
 #
 # v41: two runs on build 158 (v40) EXONERATE KYTY_CLOCK_WAIT_PREDICT:
 # run 0246 idle fps median 9.0 (t>=100, n=899), fault cost median 2072
@@ -399,7 +419,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 41
+$TestScriptVersion = 42
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1065,6 +1085,63 @@ $psi.EnvironmentVariables["KYTY_PERF_STATS"] = "1"
 # processor waited for the execution thread at once, not after a 2 ms
 # spin (experiments.h:64).
 $psi.EnvironmentVariables["KYTY_CP_SKIP_IDLE_SPIN"] = "1"
+# v42: the cfgGlobal rows the script never set (full launcher env).
+$psi.EnvironmentVariables["KYTY_BDA_DIRTY_CACHE"] = "1"
+$psi.EnvironmentVariables["KYTY_BDA_DIRTY_REGIONS"] = "1"
+$psi.EnvironmentVariables["KYTY_CLEAR_REGISTER_WIDE"] = "1"
+$psi.EnvironmentVariables["KYTY_CLOCK_WAIT_PREDICT"] = "1"
+$psi.EnvironmentVariables["KYTY_CP_CLEAN_REG_READS"] = "1"
+$psi.EnvironmentVariables["KYTY_DIRECT_EOP_INTERRUPTS"] = "1"
+$psi.EnvironmentVariables["KYTY_DPP_PRESERVE_INACTIVE"] = "1"
+$psi.EnvironmentVariables["KYTY_EOP_DIRECT_LABELS"] = "1"
+$psi.EnvironmentVariables["KYTY_FALSE_SHARE_ANY_THREAD"] = "1"
+$psi.EnvironmentVariables["KYTY_FAST_MINMAX"] = "1"
+$psi.EnvironmentVariables["KYTY_FLAG_FILE"] = ""
+$psi.EnvironmentVariables["KYTY_FSR1"] = "0"
+$psi.EnvironmentVariables["KYTY_FSR2_CAPTURE"] = "0"
+$psi.EnvironmentVariables["KYTY_FSR2_PROBE"] = "0"
+$psi.EnvironmentVariables["KYTY_FSR3_CAPTURE"] = "0"
+$psi.EnvironmentVariables["KYTY_FSR3_HDR"] = "1"
+$psi.EnvironmentVariables["KYTY_FSR3_LUMA_FORMAT_FIX"] = "1"
+$psi.EnvironmentVariables["KYTY_FSR3_NHL27_HISTORY"] = "1"
+$psi.EnvironmentVariables["KYTY_FSR3_NHL27_PRESENT"] = "1"
+$psi.EnvironmentVariables["KYTY_FSR3_NHL27_SHADOW"] = "1"
+$psi.EnvironmentVariables["KYTY_LABEL_UNCACHED_DIRECT"] = "1"
+$psi.EnvironmentVariables["KYTY_LAZY_SHARED_WRITES"] = "1"
+$psi.EnvironmentVariables["KYTY_LDS_NO_READBACK"] = "1"
+$psi.EnvironmentVariables["KYTY_LONG_BUFFER_GC_AGE"] = "1"
+$psi.EnvironmentVariables["KYTY_NATIVE_INDIRECT"] = "1"
+$psi.EnvironmentVariables["KYTY_NHL_RES_SCALE"] = "0.6667"
+$psi.EnvironmentVariables["KYTY_OUTPUT_1080P"] = "0"
+$psi.EnvironmentVariables["KYTY_PARTIAL_WAVE_REDUCTION"] = "1"
+$psi.EnvironmentVariables["KYTY_PERF_DRAW_DETAIL"] = "0"
+$psi.EnvironmentVariables["KYTY_PERF_GPU_TIMING"] = "0"
+$psi.EnvironmentVariables["KYTY_PERF_NO_SYNC_READBACK"] = "1"
+$psi.EnvironmentVariables["KYTY_PIPELINE_CACHE_DIRTY"] = "1"
+$psi.EnvironmentVariables["KYTY_PIXEL_QUAD_CORRECT"] = "1"
+$psi.EnvironmentVariables["KYTY_PM4_CLEAN_BACKING"] = "1"
+$psi.EnvironmentVariables["KYTY_PM4_CLEAN_METADATA"] = "1"
+$psi.EnvironmentVariables["KYTY_PM4_WRITE_DATA_FAST"] = "1"
+$psi.EnvironmentVariables["KYTY_PROGRAM_RESOURCE_CACHE"] = "1"
+$psi.EnvironmentVariables["KYTY_PROTECT_SHARED_LOCK"] = "1"
+$psi.EnvironmentVariables["KYTY_READBACK_QUEUE"] = "1"
+$psi.EnvironmentVariables["KYTY_READONLY_BUFFERS"] = "1"
+$psi.EnvironmentVariables["KYTY_RESOURCE_DYNAMIC_DEPS"] = "1"
+$psi.EnvironmentVariables["KYTY_RESOURCE_MEMO_BYPASS"] = "1"
+$psi.EnvironmentVariables["KYTY_RESOURCE_MEMO_VERIFY"] = "0"
+$psi.EnvironmentVariables["KYTY_RESOURCE_MULTI_CACHE"] = "1"
+$psi.EnvironmentVariables["KYTY_SHADER_PREGEN"] = "1"
+$psi.EnvironmentVariables["KYTY_SKIP_BOUNDS_CHECKS"] = "1"
+$psi.EnvironmentVariables["KYTY_SPARSE_BUFFER_GC"] = "1"
+$psi.EnvironmentVariables["KYTY_SPECULATE_DIRTY_READS"] = "1"
+$psi.EnvironmentVariables["KYTY_SRT_CFG_GATHER"] = "1"
+$psi.EnvironmentVariables["KYTY_SRT_CFG_TAPE"] = "1"
+$psi.EnvironmentVariables["KYTY_SRT_CFG_TRACE"] = "1"
+$psi.EnvironmentVariables["KYTY_SRT_TAPE"] = "1"
+$psi.EnvironmentVariables["KYTY_SRT_TAPE_VERIFY"] = "0"
+$psi.EnvironmentVariables["KYTY_WORKGROUP_BUFFER_SYNC"] = "1"
+$psi.EnvironmentVariables["SDL_JOYSTICK_GAMEINPUT"] = "0"
+$psi.EnvironmentVariables["SDL_JOYSTICK_GAMEINPUT_RAW"] = "0"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 # v24: fingerprint last-run.log BEFORE launch, so a boot exit can tell a
 # fresh log from a stale one. The emulator does not rewrite the log when
@@ -1132,7 +1209,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v41: KYTY_CP_SKIP_IDLE_SPIN=1 (v34 base; dirty-reads, no-sync-readback, clean-reg-reads and clock-wait-predict exonerated)"
+Write-Host "v42: FULL cfgGlobal env (67 rows) + script diagnostics (v34 base; single-variable bisect superseded by log-mining 2026-11-14)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

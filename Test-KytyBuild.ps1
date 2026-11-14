@@ -1,4 +1,17 @@
-# Test-KytyBuild.ps1 - v42 (2026-11-14)
+# Test-KytyBuild.ps1 - v43 (2026-11-14)
+# v43: run 0816 (build 158, v42) ANSWERED the collapse question: full
+# cfgGlobal env, idle at the Hub - 978 FPS samples, median 109 fps
+# (min 55.9, max 240, every 100 s bucket 94-113), fault cost median
+# 119.8 us/fault (max 204.3) vs ~2476 collapsed. The collapse is GONE:
+# the cause is in the env set, not in launch mechanics. The v34 idle
+# test has served its purpose and is REMOVED here, so navigation
+# resumes Hub -> GameExperience -> Versus -> Ice with the full env
+# kept. This run tests whether fast FPS holds on the ice and captures
+# the versus / pause / on-ice / transition coverage the loop still
+# lacks. Bisect-down by groups is deferred until that coverage exists:
+# the full env IS the shipped launcher configuration, so there is no
+# requirement to minimize it.
+#
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
@@ -419,7 +432,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 42
+$TestScriptVersion = 43
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1209,7 +1222,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v42: FULL cfgGlobal env (67 rows) + script diagnostics (v34 base; single-variable bisect superseded by log-mining 2026-11-14)"
+Write-Host "v43: FULL cfgGlobal env (67 rows) + full navigation (idle test removed; v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains
@@ -1500,28 +1513,6 @@ while ($step -lt $roadmap.Count) {
             $navFailed = $true
             break
         }
-        # v34 IDLE TEST: the Hub stop has been reached, so this run's
-        # navigation is done. Do NOT take the Hub action below and do
-        # NOT proceed to GameExperience / Versus / Ice / gameplay. Sit
-        # on the hub and go completely idle for 15 minutes - no
-        # screenshots, no OCR, no input-file writes, no
-        # framedump.trigger, nothing but a process-alive check every
-        # 30 s. The NHL27FAULTCOST lines the emulator writes during
-        # this window decide the run 0636 question (see the v34 header
-        # for the decision rule). Leaving the nav loop here falls
-        # through to the normal cleanup: $reachedIce stays $false, so
-        # the gameplay shots and the gameplay phase are skipped.
-        Write-Host "IDLE TEST START - script going idle for 15 minutes (no screenshots, no OCR, no inputs, no frame dumps)"
-        $idleEnd = (Get-Date).AddMinutes(15)
-        while ((Get-Date) -lt $idleEnd) {
-            if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
-                Write-Warning "IDLE TEST: emulator exited during the idle window - ending the idle phase early."
-                break
-            }
-            Start-Sleep -Seconds 30
-        }
-        Write-Host "IDLE TEST END"
-        break
         # Two different Hub screens. The Be A Pro hub highlights PLAY NEXT
         # GAME, so Cross is right there. The main menu highlights BE A PRO
         # CAREER first, so Cross alone opens Be A Pro - that is the route

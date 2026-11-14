@@ -17,6 +17,8 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
@@ -166,6 +168,7 @@ private:
 	static const void*     PrepareOutputBuffer(const PortOut& port, const void* data,
 	                                           std::vector<uint8_t>* buffer, float gain,
 	                                           const float* gains);
+	static void            MeasureOutputLevels(const PortOut& port, const void* data);
 	static bool QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
 	                          const float* gains);
 };
@@ -389,6 +392,98 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 	return buffer->data();
 }
 
+void Audio::MeasureOutputLevels(const PortOut& port, const void* data) {
+	// NHL27AUDIOLVL level meter: accumulates the raw guest buffers per port and
+	// channel and prints one line per second for every port that submitted audio
+	// (rms/peak in dBFS, measured before any KyTy scaling or the height fold), so
+	// the level the game sends on every port can be compared directly.
+	struct Slot {
+		double   sumsq[12] = {};
+		float    peak[12]  = {};
+		uint64_t frames    = 0;
+		int      type      = 0;
+		int      channels  = 0;
+		int      format    = 0;
+	};
+	static Slot          slots[OUT_PORTS_MAX];
+	static uint64_t      last_flush_us = 0;
+	static Common::Mutex mutex;
+
+	if (g_audio == nullptr || data == nullptr) {
+		return;
+	}
+	const auto slot_index = static_cast<int>(&port - g_audio->m_out_ports);
+	if (slot_index < 0 || slot_index >= OUT_PORTS_MAX) {
+		return;
+	}
+	const auto channels = static_cast<uint32_t>(port.channels_num);
+	const auto frames   = port.samples_num;
+	if (channels == 0 || channels > 12 || frames == 0) {
+		return;
+	}
+
+	Common::LockGuard lock(mutex);
+	auto&             slot = slots[slot_index];
+	slot.type              = port.type;
+	slot.channels          = static_cast<int>(channels);
+	slot.format            = static_cast<int>(port.format);
+	if (FormatIsFloat(port.format)) {
+		const auto* src = static_cast<const float*>(data);
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			for (uint32_t ch = 0; ch < channels; ch++) {
+				const float sample = src[frame * channels + ch];
+				slot.sumsq[ch] += static_cast<double>(sample) * sample;
+				slot.peak[ch] = std::max(slot.peak[ch], std::abs(sample));
+			}
+		}
+	} else {
+		const auto* src = static_cast<const int16_t*>(data);
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			for (uint32_t ch = 0; ch < channels; ch++) {
+				const float sample = static_cast<float>(src[frame * channels + ch]) / 32768.0f;
+				slot.sumsq[ch] += static_cast<double>(sample) * sample;
+				slot.peak[ch] = std::max(slot.peak[ch], std::abs(sample));
+			}
+		}
+	}
+	slot.frames += frames;
+
+	const auto now = LibKernel::KernelGetProcessTime();
+	if (last_flush_us == 0) {
+		last_flush_us = now;
+		return;
+	}
+	if (now - last_flush_us < 1000000) {
+		return;
+	}
+	last_flush_us = now;
+	for (int i = 0; i < OUT_PORTS_MAX; i++) {
+		auto& s = slots[i];
+		if (s.frames == 0) {
+			continue;
+		}
+		char line[1024];
+		int  pos = std::snprintf(line, sizeof(line),
+		                         "NHL27AUDIOLVL: port=%d type=%d ch=%d fmt=%d rms/peak=[", i,
+		                         s.type, s.channels, s.format);
+		for (int ch = 0; ch < s.channels; ch++) {
+			const double rms =
+			    s.sumsq[ch] > 0.0
+			        ? 10.0 * std::log10(s.sumsq[ch] / static_cast<double>(s.frames))
+			        : -99.9;
+			const double peak = s.peak[ch] > 0.0f
+			                        ? 20.0 * std::log10(static_cast<double>(s.peak[ch]))
+			                        : -99.9;
+			pos += std::snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos),
+			                     "%s%.1f/%.1f", ch > 0 ? " " : "", rms, peak);
+		}
+		std::snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos), "]\n");
+		std::printf("%s", line);
+		s = {};
+	}
+	std::fflush(stdout);
+}
+
 bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float gain,
                           const float* gains) {
 	EXIT_IF(port == nullptr);
@@ -397,6 +492,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 		return false;
 	}
 
+	MeasureOutputLevels(*port, data);
 	std::vector<uint8_t> prepared_buffer;
 	const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer, gain, gains);
 	const auto           output_channels = OutputChannels(*port);

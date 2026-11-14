@@ -1,7 +1,25 @@
-# Test-KytyBuild.ps1 - v36 (2026-11-12)
+# Test-KytyBuild.ps1 - v37 (2026-11-13)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v37 adds one print-only flag for build 157's dark-screen fix check:
+# KYTY_DEBUG_BLOCK_STORAGE=1 makes the emulator print a BlockStorage line
+# for every block-storage shadow write (Image::PrepareShadowStorage) and
+# for any storage view attempted on a no-storage image. The flag changes
+# no emulator behavior - it only enables prints that already exist.
+# Build 157 (f2fix147 tip) lets descriptor bindings that match the
+# texture cache's shadow predicate fall through to the block-storage
+# shadow instead of dropping the writes; NHL 27's environment bake is
+# the target. Decision rule, from emulator-stdout.log: if BlockStorage
+# shadow-write lines appear during the load bursts and the
+# "dropping storage writes to Bc6HUfloatBlock" warning does not, the
+# shadow engaged and the fix is live; if the warning still fires (it now
+# prints the view format), the producer binds a non-matching view and
+# the fix does not engage - report the printed format. The v36 variable
+# (KYTY_SPECULATE_DIRTY_READS=1) stays set, so the fault-cost bisect
+# continues on this same run; the build under test is 157 instead of
+# 147, same base line, so the idle-window numbers stay comparable.
 #
 # v36 is a single-variable controlled test, not a fix. It is the next
 # test in the queue after v35 exonerated KYTY_PROTECT_SHARED_LOCK:
@@ -332,7 +350,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 36
+$TestScriptVersion = 37
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -995,6 +1013,9 @@ $psi.EnvironmentVariables["KYTY_PERF_STATS"] = "1"
 # unlogged EnvironmentMask table after v35 exonerated ProtectSharedLock.
 # SpeculateDirtyReads targets the readmem component of fault cost.
 $psi.EnvironmentVariables["KYTY_SPECULATE_DIRTY_READS"] = "1"
+# v37 (print-only, no behavior change): shadow engagement evidence for
+# build 157's BC storage gate fix - see the header note.
+$psi.EnvironmentVariables["KYTY_DEBUG_BLOCK_STORAGE"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 # v24: fingerprint last-run.log BEFORE launch, so a boot exit can tell a
 # fresh log from a stale one. The emulator does not rewrite the log when
@@ -1062,7 +1083,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v36 single-variable test: KYTY_SPECULATE_DIRTY_READS=1 (all else identical to v34)"
+Write-Host "v37: KYTY_SPECULATE_DIRTY_READS=1 (as v36) + KYTY_DEBUG_BLOCK_STORAGE=1 (print-only, build 157 BC shadow check)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

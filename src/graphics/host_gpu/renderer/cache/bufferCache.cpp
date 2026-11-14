@@ -514,6 +514,23 @@ void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 }
 
+void BufferCache::DiscardMemory(uint64_t vaddr, uint64_t size, bool poison) {
+	if (!m_pending_guest_reads.empty()) {
+		FinishPendingGuestReads(vaddr, size);
+	}
+	if (poison) {
+		std::vector<std::pair<uint64_t, uint64_t>> bytes;
+		m_gpu_modified_ranges.ForEachInRange(vaddr, size,
+		                                     [&](uint64_t begin, uint64_t end) { bytes.emplace_back(begin, end); });
+		for (const auto& [begin, end]: bytes) {
+			const std::vector<uint8_t> fill(end - begin, 0xCD);
+			Libs::LibKernel::Memory::WriteBacking(begin, fill.data(), fill.size());
+		}
+	}
+	DiscardGpuModified(vaddr, size);
+	ForgetColorMetadataChecks(vaddr, size);
+}
+
 void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return;

@@ -17,6 +17,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <vector>
@@ -348,11 +349,26 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 			}
 			if (channels == 12) {
 				// Add the four top channels to their front/back channels, turning 12 into 8.
-				// SDL handles the rest if the output device has fewer channels.
+				// The console folds height content down attenuated; summing it at full
+				// volume makes everything carried in the top channels (ambience, crowd,
+				// music sends) far louder than the center channel, which receives no
+				// height contribution. KYTY_AUDIO_HEIGHT_FOLD scales the fold: the
+				// default is half power (0.7071), 1 restores the old unity sum, and 0
+				// drops the top channels. SDL handles the rest if the output device
+				// has fewer channels.
+				static const float height_fold = [] {
+					const char* v = std::getenv("KYTY_AUDIO_HEIGHT_FOLD");
+					if (v == nullptr || *v == '\0') {
+						return 0.70710678f;
+					}
+					const float parsed = std::strtof(v, nullptr);
+					return parsed >= 0.0f ? parsed : 0.70710678f;
+				}();
 				static constexpr uint32_t HEIGHT_DST[4] = {0, 1, 4, 5};
 				for (uint32_t ch = 0; ch < 4; ch++) {
 					dst[frame * output_channels + HEIGHT_DST[ch]] +=
-					    static_cast<float>(src[frame * channels + 8 + ch] * scales[8 + ch]);
+					    static_cast<float>(src[frame * channels + 8 + ch] * scales[8 + ch] *
+					                       height_fold);
 				}
 			}
 		}

@@ -44,6 +44,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
 }
 
 RenderContext::~RenderContext() {
+	// Stop the frame-dump download worker first, while the allocator and the
+	// command scheduler are still alive for its final VMA calls.
+	FrameDump::Shutdown();
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }

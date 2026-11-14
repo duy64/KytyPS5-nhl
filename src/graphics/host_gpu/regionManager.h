@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_REGIONMANAGER_H_
 
 #include "common/assert.h"
+#include "common/spinWait.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
@@ -41,14 +42,9 @@ public:
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
 			// Wait on reads, so the holder's cache line is not written until the lock is free.
+			uint32_t spins = 0;
 			while (m_lock.test(std::memory_order_relaxed)) {
-#if defined(__x86_64__) || defined(_M_X64)
-				_mm_pause();
-#elif defined(_M_ARM64)
-				__yield();
-#elif defined(__aarch64__)
-				asm volatile("yield");
-#endif
+				Kyty::SpinWait::Step(spins);
 			}
 		}
 		m_owner.store(thread, std::memory_order_relaxed);

@@ -884,18 +884,37 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	} else if (storage) {
 		// Block-compressed images whose format has no storage support on this device (e.g.
 		// BC6H on AMD) are created without STORAGE usage; a storage view on them is invalid and
-		// hangs the GPU. Drop the guest's writes into a null storage image instead.
+		// hangs the GPU. A binding whose view matches the block-storage shadow's shape is let
+		// through so TextureCache::FindTexture can substitute the shadow, which takes the
+		// writes and flushes them back into the real image; every other binding keeps the
+		// null drop below.
 		if (image->backing.image != nullptr &&
 		    !(image->backing.usage & vk::ImageUsageFlagBits::eStorage)) {
-			static std::atomic_flag warned = ATOMIC_FLAG_INIT;
-			if (!warned.test_and_set(std::memory_order_relaxed)) {
-				std::printf("Warning: dropping storage writes to %s image without storage usage\n",
-				            vk::to_string(image->info.pixel_format).c_str());
-				std::fflush(stdout);
+			// This predicate must match FindTexture's shadow substitution exactly; falling
+			// through on anything wider would build the invalid view the gate exists to
+			// prevent. KYTY_BC_STORAGE_SHADOW=0 restores the drop for every binding.
+			static const bool shadow_enabled = [] {
+				const char* e = std::getenv("KYTY_BC_STORAGE_SHADOW");
+				return e == nullptr || std::strcmp(e, "0") != 0;
+			}();
+			const bool shadowable = shadow_enabled && image->NeedsStorageShadow() &&
+			                        desc.view_info.level_count == 1 &&
+			                        vk::blockExtent(desc.view_info.format)[0] == 1 &&
+			                        vk::blockSize(desc.view_info.format) ==
+			                            image->info.bytes_per_block;
+			if (!shadowable) {
+				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+				if (!warned.test_and_set(std::memory_order_relaxed)) {
+					std::printf("Warning: dropping storage writes to %s image without storage "
+					            "usage (view format %s)\n",
+					            vk::to_string(image->info.pixel_format).c_str(),
+					            vk::to_string(desc.view_info.format).c_str());
+					std::fflush(stdout);
+				}
+				auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Storage);
+				const auto null_id   = texture_cache.FindImage(null_desc);
+				return {null_id, nullptr, std::move(null_desc)};
 			}
-			auto       null_desc = NullTextureDesc(resource, TextureCache::BindingType::Storage);
-			const auto null_id   = texture_cache.FindImage(null_desc);
-			return {null_id, nullptr, std::move(null_desc)};
 		}
 		ValidateStorageColorView(image->info.pixel_format, view_format, descriptor.DstSelXYZW());
 	} else {
@@ -1589,6 +1608,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	bool uses_dma        = false;
 	bool uses_image_heap = false;
 
+	FrameBreakdown::Timer gfxprep_timer(FrameBreakdown::g_counters.dp_prof_gfxprep_ns);
 	FindBuffers(stages);
 	for (auto* stage: stages) {
 		if (stage->runtime->program->info.uses_dma) {
@@ -1601,6 +1621,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	if (uses_image_heap) {
 		m_context.GetImageHeap().Rebind(*this);
 	}
+	gfxprep_timer.Stop();
 	{
 		FrameBreakdown::Timer textures_timer(FrameBreakdown::g_counters.dp_textures_ns);
 		FrameBreakdown::TexScope tex_scope;

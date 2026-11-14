@@ -1,7 +1,23 @@
-# Test-KytyBuild.ps1 - v40 (2026-11-14)
+# Test-KytyBuild.ps1 - v41 (2026-11-14)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v41: two runs on build 158 (v40) EXONERATE KYTY_CLOCK_WAIT_PREDICT:
+# run 0246 idle fps median 9.0 (t>=100, n=899), fault cost median 2072
+# us/fault; run 0316 idle fps median 11.0 (t>=100, n=899), fault cost
+# median 1948 us/fault - the same collapse signature (wait_gpu ~77-106
+# ms/frame, faults ~132-144 ms/frame). Both runs reached the Hub clean
+# (01-nav.png: hub renders clean, no corruption), idled 15 min, then
+# the nav loop could not reach the ice at ~9-11 fps, so there is still
+# no versus / pause / on-ice coverage. No crashes, no device loss, no
+# SYNCING, zero "dropping storage writes" warnings in either run.
+# Next variable on the v34 base: KYTY_CP_SKIP_IDLE_SPIN=1 (rank 5, the
+# LAST named candidate in the EnvironmentMask queue; then the queue is
+# exhausted and the hunt needs a new lead). Per experiments.h:64,
+# CpSkipIdleSpin starts work queued while the command processor waited
+# for the execution thread at once, not after a 2 ms spin.
+# KYTY_CLOCK_WAIT_PREDICT is back to unset: one variable at a time.
 #
 # v40: run 0116 (build 158, v39) EXONERATED KYTY_CP_CLEAN_REG_READS:
 # idle fps median 9, fault cost median 2485 us/fault - still collapsed
@@ -383,7 +399,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 40
+$TestScriptVersion = 41
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1042,12 +1058,13 @@ $psi.EnvironmentVariables["KYTY_SRT_CFG_SCHEDULE"] = "1"
 $psi.EnvironmentVariables["KYTY_WRITE_COVER_SKIP"] = "1"
 $psi.EnvironmentVariables["KYTY_AGED_WRITEBACK"] = "1"
 $psi.EnvironmentVariables["KYTY_PERF_STATS"] = "1"
-# v40 (single-variable diagnostic, not a fix): the next bit of the
-# EnvironmentMask table after run 0116 exonerated CpCleanRegReads
-# (idle fps median 9, fault cost median 2485 us/fault - still
-# collapsed). ClockWaitPredict lets WAIT_REG_MEM skip waiting on a
-# pending clock write.
-$psi.EnvironmentVariables["KYTY_CLOCK_WAIT_PREDICT"] = "1"
+# v41 (single-variable diagnostic, not a fix): the next bit of the
+# EnvironmentMask table after runs 0246/0316 exonerated ClockWaitPredict
+# (idle fps median 9.0/11.0, fault cost median 2072/1948 us/fault -
+# still collapsed). CpSkipIdleSpin starts work queued while the command
+# processor waited for the execution thread at once, not after a 2 ms
+# spin (experiments.h:64).
+$psi.EnvironmentVariables["KYTY_CP_SKIP_IDLE_SPIN"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 # v24: fingerprint last-run.log BEFORE launch, so a boot exit can tell a
 # fresh log from a stale one. The emulator does not rewrite the log when
@@ -1115,7 +1132,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v40: KYTY_CLOCK_WAIT_PREDICT=1 (v34 base; dirty-reads, no-sync-readback and clean-reg-reads exonerated)"
+Write-Host "v41: KYTY_CP_SKIP_IDLE_SPIN=1 (v34 base; dirty-reads, no-sync-readback, clean-reg-reads and clock-wait-predict exonerated)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

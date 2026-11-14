@@ -1,7 +1,20 @@
-# Test-KytyBuild.ps1 - v39 (2026-11-13)
+# Test-KytyBuild.ps1 - v40 (2026-11-14)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v40: run 0116 (build 158, v39) EXONERATES KYTY_CP_CLEAN_REG_READS:
+# idle-window fps median 9.0 (t>=100, range 4-13), fault cost median
+# ~2490 us/fault over collapsed lines - the same collapse signature
+# (gpu_waits ~112-126 ms/frame, faults ~167-188 ms/frame). The run
+# reached the Hub clean (title + hub shots clean, no corruption),
+# idled 15 min, then the nav loop could not reach the ice at ~9 fps,
+# so there is still no versus / pause / on-ice coverage. No crashes,
+# no device loss, no SYNCING, zero "dropping storage writes" warnings.
+# Next variable on the v34 base: KYTY_CLOCK_WAIT_PREDICT=1 (rank 4;
+# then CP_SKIP_IDLE_SPIN). Per experiments.h:61, ClockWaitPredict lets
+# WAIT_REG_MEM on a pending clock write skip waiting for it.
+# KYTY_CP_CLEAN_REG_READS is back to unset: one variable at a time.
 #
 # v39: two verdicts from run 2150 (build 158, v38). (1) The dark-screen
 # shadow fix ENGAGED: 168 BlockStorage shadow writes to the Bc6H
@@ -376,7 +389,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 39
+$TestScriptVersion = 40
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1035,12 +1048,12 @@ $psi.EnvironmentVariables["KYTY_SRT_CFG_SCHEDULE"] = "1"
 $psi.EnvironmentVariables["KYTY_WRITE_COVER_SKIP"] = "1"
 $psi.EnvironmentVariables["KYTY_AGED_WRITEBACK"] = "1"
 $psi.EnvironmentVariables["KYTY_PERF_STATS"] = "1"
-# v39 (single-variable diagnostic, not a fix): the next bit of the
-# EnvironmentMask table after run 2150 exonerated NoSyncReadback
-# (idle fps median 11, fault cost median 1748 us/fault - still
-# collapsed). CpCleanRegReads lets the command processor read clean
-# indirect register tables from the backing.
-$psi.EnvironmentVariables["KYTY_CP_CLEAN_REG_READS"] = "1"
+# v40 (single-variable diagnostic, not a fix): the next bit of the
+# EnvironmentMask table after run 0116 exonerated CpCleanRegReads
+# (idle fps median 9.0, fault cost median ~2490 us/fault - still
+# collapsed). ClockWaitPredict lets WAIT_REG_MEM on a pending clock
+# write skip waiting for it (experiments.h:61).
+$psi.EnvironmentVariables["KYTY_CLOCK_WAIT_PREDICT"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 # v24: fingerprint last-run.log BEFORE launch, so a boot exit can tell a
 # fresh log from a stale one. The emulator does not rewrite the log when
@@ -1108,7 +1121,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v39: KYTY_CP_CLEAN_REG_READS=1 (v34 base; dirty-reads and no-sync-readback exonerated)"
+Write-Host "v40: KYTY_CLOCK_WAIT_PREDICT=1 (v34 base; dirty-reads, no-sync-readback and clean-reg-reads exonerated)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

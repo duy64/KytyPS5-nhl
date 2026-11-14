@@ -1,7 +1,20 @@
-# Test-KytyBuild.ps1 - v38 (2026-11-13)
+# Test-KytyBuild.ps1 - v39 (2026-11-13)
 # Drives NHL 27 in the KyTy emulator from launch to the versus screen and
 # through a full game of dumb gameplay, using OCR-guided navigation and the
 # emulator's scripted input file. No window-focus tricks.
+#
+# v39: two verdicts from run 2150 (build 158, v38). (1) The dark-screen
+# shadow fix ENGAGED: 168 BlockStorage shadow writes to the Bc6H
+# environment array 0x11b8000000 - 24 at each of its 7 mip levels, view
+# format 107 (R32G32B32A32Uint) - and ZERO "dropping storage writes"
+# warnings, where build 156 dropped every write. The array is written
+# now; the remaining dark-screen check is the visual one in gameplay.
+# (2) KYTY_PERF_NO_SYNC_READBACK is EXONERATED for the collapse: idle
+# fps median 11, fault cost median 1748 us/fault - still collapsed.
+# Next variable on the v34 base: KYTY_CP_CLEAN_REG_READS=1 (rank 3;
+# then CLOCK_WAIT_PREDICT, CP_SKIP_IDLE_SPIN). The
+# KYTY_DEBUG_BLOCK_STORAGE flag is removed: its question is answered,
+# and the prints cost ~140 lines a run.
 #
 # v38: v36 is EXONERATED - run 2049 (v36, dirty-reads=1) still collapsed:
 # idle-window NHL27FPS median 9, NHL27FAULTCOST median 1461 us/fault,
@@ -363,7 +376,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 38
+$TestScriptVersion = 39
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1022,15 +1035,12 @@ $psi.EnvironmentVariables["KYTY_SRT_CFG_SCHEDULE"] = "1"
 $psi.EnvironmentVariables["KYTY_WRITE_COVER_SKIP"] = "1"
 $psi.EnvironmentVariables["KYTY_AGED_WRITEBACK"] = "1"
 $psi.EnvironmentVariables["KYTY_PERF_STATS"] = "1"
-# v38 (single-variable diagnostic, not a fix): the next bit of the
-# unlogged EnvironmentMask table after v36 exonerated SpeculateDirtyReads
-# (run 2049: idle fps median 9, fault cost median 1461 us/fault - still
-# collapsed). NoSyncReadback targets the readback-sync component of
-# fault cost.
-$psi.EnvironmentVariables["KYTY_PERF_NO_SYNC_READBACK"] = "1"
-# v37 (print-only, no behavior change): shadow engagement evidence for
-# build 157's BC storage gate fix - see the header note.
-$psi.EnvironmentVariables["KYTY_DEBUG_BLOCK_STORAGE"] = "1"
+# v39 (single-variable diagnostic, not a fix): the next bit of the
+# EnvironmentMask table after run 2150 exonerated NoSyncReadback
+# (idle fps median 11, fault cost median 1748 us/fault - still
+# collapsed). CpCleanRegReads lets the command processor read clean
+# indirect register tables from the backing.
+$psi.EnvironmentVariables["KYTY_CP_CLEAN_REG_READS"] = "1"
 Write-Host ("KYTY_INPUT_FILE=" + $psi.EnvironmentVariables["KYTY_INPUT_FILE"])
 # v24: fingerprint last-run.log BEFORE launch, so a boot exit can tell a
 # fresh log from a stale one. The emulator does not rewrite the log when
@@ -1098,7 +1108,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v38: KYTY_PERF_NO_SYNC_READBACK=1 (v34 base, v36 exonerated) + KYTY_DEBUG_BLOCK_STORAGE=1 (print-only, build 158 BC shadow check)"
+Write-Host "v39: KYTY_CP_CLEAN_REG_READS=1 (v34 base; dirty-reads and no-sync-readback exonerated)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

@@ -64,6 +64,21 @@ jobs:
           & (Join-Path $bin "glslang.exe") --version
           $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Install FidelityFX SDK 2.4 (FSR 4 bridge)
+        shell: pwsh
+        run: |
+          # Sparse partial clone: only Kits/FidelityFX is needed (the signed
+          # DX12 DLLs and FFX_API headers) for -DKYTY_ENABLE_FSR4=ON.
+          $dir = Join-Path $env:RUNNER_TEMP "FidelityFX-SDK"
+          git clone --depth 1 --branch v2.4.0 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git $dir
+          if ($LASTEXITCODE -ne 0) { throw "FidelityFX SDK clone failed" }
+          git -C $dir sparse-checkout set Kits/FidelityFX
+          if ($LASTEXITCODE -ne 0) { throw "FidelityFX SDK sparse checkout failed" }
+          $dll = Join-Path $dir "Kits\FidelityFX\signedbin\amd_fidelityfx_upscaler_dx12.dll"
+          if (-not (Test-Path $dll)) {
+            throw "amd_fidelityfx_upscaler_dx12.dll is missing from the SDK clone"
+          }
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -98,7 +113,9 @@ jobs:
             -DKYTY_ARCH_AVX2=ON ^
             -DKYTY_PGO=use ^
             -DKYTY_PGO_PROFILE=%CD%/tools/pgo/nhl27-clang19.profdata ^
-            -DKYTY_PGO_PROFILE_COMPILER=19.1.5
+            -DKYTY_PGO_PROFILE_COMPILER=19.1.5 ^
+            -DKYTY_ENABLE_FSR4=ON ^
+            -DFIDELITYFX4_SDK_DIR=%RUNNER_TEMP%\FidelityFX-SDK
 
       - name: Build
         shell: cmd

@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 
 #include <cerrno>
 #include <set>
@@ -109,6 +110,36 @@ std::string              g_buflog;
 std::set<std::pair<uint64_t, uint32_t>> g_seen_vol; // (address, draw seq)
 std::set<std::string>    g_seen_buf;
 
+// ---- guest sampled-texture readback (NHL27GUESTTEX) ----
+// Sampled textures are never read back from the GPU (the dump saves render
+// targets and written storage images only), so what a shader actually sampled
+// is the dump's blind spot. For every unique sampled binding of the captured
+// frame whose guest data is at most 1 MiB, the download worker copies the RAW
+// GUEST BYTES out of guest memory (LibKernel::Memory::TryReadBacking, which
+// fails cleanly on unmapped/short ranges) into a .bin next to the PNGs,
+// indexed by guesttex.txt. That is what lets a capture answer "what bytes does
+// the game hold at this texture's address" (e.g. the Bc7 logo textures)
+// offline. The copies run in the worker, not on the game thread; guest memory
+// may have moved on by then, which is acceptable for the streamed/static
+// assets this targets. Separate byte budget from the GPU readback staging:
+// these are plain host file writes, no staging allocations are held.
+struct GuestTexReq {
+	uint64_t    addr      = 0;
+	uint64_t    size      = 0;
+	uint32_t    seq       = 0; // first draw/dispatch that bound it
+	uint32_t    guest_fmt = 0;
+	std::string vk_fmt;
+	uint32_t    w = 0, h = 0, d = 0;
+	uint32_t    levels = 0, layers = 0;
+	uint32_t    tile_mode = 0;
+};
+std::vector<GuestTexReq>                g_guesttex;
+std::set<std::pair<uint64_t, uint64_t>> g_seen_guesttex; // (address, size)
+uint64_t                                g_guesttex_bytes = 0;
+constexpr uint64_t kGuestTexMaxSize  = 1ull << 20;  // per texture
+constexpr uint64_t kGuestTexMaxBytes = 64ull << 20; // per capture
+constexpr size_t   kGuestTexMaxCount = 512;
+
 // ---- async download: finished captures are handed to a worker thread ----
 // The flip thread records a capture and waits only for the GPU copies
 // (FinishCapture); the worker thread does the per-pixel decode, the PNG
@@ -116,6 +147,7 @@ std::set<std::string>    g_seen_buf;
 struct CaptureJob {
 	std::vector<Pending>    pending;    // staging buffers, moved out of g_pending
 	std::vector<BufPending> bufpending; // moved out of g_bufpending
+	std::vector<GuestTexReq> guesttex;  // moved out of g_guesttex (NHL27GUESTTEX)
 	std::string             draws;      // moved out of g_log (draw/dispatch lines)
 	std::string             buflog;     // moved out of g_buflog
 	std::string             dir;        // copied from g_dir
@@ -437,12 +469,14 @@ uint32_t BytesPerPixel(vk::Format f) {
 		case vk::Format::eR8Unorm: case vk::Format::eR8Uint: case vk::Format::eR8Snorm:
 		case vk::Format::eR8Sint: return 1;
 		case vk::Format::eR8G8Unorm: case vk::Format::eR8G8Uint: case vk::Format::eR8G8Snorm:
+		case vk::Format::eR8G8Sint:
 		case vk::Format::eR16Unorm: case vk::Format::eR16Sfloat: case vk::Format::eR16Uint:
 		case vk::Format::eR16Snorm: case vk::Format::eR16Sint:
 		case vk::Format::eR5G6B5UnormPack16: case vk::Format::eD16Unorm:
 		case vk::Format::eD16UnormS8Uint: return 2;
 		case vk::Format::eR8G8B8A8Unorm: case vk::Format::eR8G8B8A8Srgb:
 		case vk::Format::eR8G8B8A8Snorm: case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR8G8B8A8Sint:
 		case vk::Format::eB8G8R8A8Unorm: case vk::Format::eB8G8R8A8Srgb:
 		case vk::Format::eA2B10G10R10UnormPack32: case vk::Format::eA2R10G10B10UnormPack32:
 		case vk::Format::eA2B10G10R10UintPack32: case vk::Format::eB10G11R11UfloatPack32:
@@ -452,8 +486,13 @@ uint32_t BytesPerPixel(vk::Format f) {
 		case vk::Format::eD24UnormS8Uint: case vk::Format::eD32SfloatS8Uint: return 4;
 		case vk::Format::eR16G16B16A16Sfloat: case vk::Format::eR16G16B16A16Unorm:
 		case vk::Format::eR16G16B16A16Uint: case vk::Format::eR16G16B16A16Snorm:
-		case vk::Format::eR32G32Sfloat: case vk::Format::eR32G32Uint: return 8;
-		case vk::Format::eR32G32B32A32Sfloat: case vk::Format::eR32G32B32A32Uint: return 16;
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR32G32Sfloat: case vk::Format::eR32G32Uint: case vk::Format::eR32G32Sint:
+		case vk::Format::eR64Uint: case vk::Format::eR64Sint: case vk::Format::eR64Sfloat: return 8;
+		case vk::Format::eR32G32B32Sfloat: case vk::Format::eR32G32B32Uint:
+		case vk::Format::eR32G32B32Sint: return 12;
+		case vk::Format::eR32G32B32A32Sfloat: case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR32G32B32A32Sint: return 16;
 		default: return 0;
 	}
 }
@@ -714,6 +753,82 @@ std::string Hex(uint64_t v) {
 	return b;
 }
 
+// Records one sampled binding for the guest-byte dump (see GuestTexReq).
+// Called with g_mutex held.
+void CollectGuestTex(uint32_t seq, const TextureBinding& b) {
+	const auto& info = b.desc.info;
+	if (b.desc.type != TextureCache::BindingType::Texture) return;
+	const uint64_t addr = info.data.address;
+	const uint64_t size = info.data.size;
+	if (addr == 0 || size == 0 || size > kGuestTexMaxSize) return;
+	if (!info.data.Valid()) return;
+	if (g_guesttex.size() >= kGuestTexMaxCount || g_guesttex_bytes + size > kGuestTexMaxBytes) return;
+	if (!g_seen_guesttex.insert(std::make_pair(addr, size)).second) return;
+	GuestTexReq r;
+	r.addr      = addr;
+	r.size      = size;
+	r.seq       = seq;
+	r.guest_fmt = static_cast<uint32_t>(info.guest_format);
+	r.vk_fmt    = vk::to_string(info.pixel_format);
+	r.w         = info.extent.width;
+	r.h         = info.extent.height;
+	r.d         = info.extent.depth;
+	r.levels    = info.resources.levels;
+	r.layers    = info.resources.layers;
+	r.tile_mode = static_cast<uint32_t>(info.tile_mode);
+	g_guesttex.push_back(std::move(r));
+	g_guesttex_bytes += size;
+}
+
+// Worker side of the guest sampled-texture dump: reads the guest bytes for
+// each recorded binding and writes them as .bin files plus the guesttex.txt
+// index. Runs on the download worker thread (ProcessJob).
+void ProcessGuestTex(CaptureJob& job) {
+	if (job.guesttex.empty()) return;
+	std::string          index;
+	uint32_t             written = 0;
+	uint64_t             bytes   = 0;
+	std::vector<uint8_t> data;
+	for (const auto& r : job.guesttex) {
+		char fname[320];
+		std::snprintf(fname, sizeof(fname), "guesttex_%05u_%s_%ux%ux%u_g%u_%s.bin", r.seq,
+		              Hex(r.addr).c_str(), r.w, r.h, r.d, r.guest_fmt, r.vk_fmt.c_str());
+		char line[768];
+		data.assign(static_cast<size_t>(r.size), 0);
+		if (!LibKernel::Memory::TryReadBacking(r.addr, data.data(), r.size)) {
+			std::snprintf(line, sizeof(line),
+			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " SKIPPED (guest read failed)\n",
+			              r.seq, Hex(r.addr).c_str(), r.size);
+			index += line;
+			continue;
+		}
+		const std::string path = job.dir + "/" + fname;
+		if (FILE* f = std::fopen(path.c_str(), "wb")) {
+			std::fwrite(data.data(), 1, data.size(), f);
+			std::fclose(f);
+			written++;
+			bytes += r.size;
+			std::snprintf(line, sizeof(line),
+			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " guest_fmt=%u vk=%s %ux%ux%u "
+			              "levels=%u layers=%u tile_mode=%u -> %s\n",
+			              r.seq, Hex(r.addr).c_str(), r.size, r.guest_fmt, r.vk_fmt.c_str(), r.w, r.h, r.d,
+			              r.levels, r.layers, r.tile_mode, fname);
+		} else {
+			std::snprintf(line, sizeof(line),
+			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " SKIPPED (file write failed)\n",
+			              r.seq, Hex(r.addr).c_str(), r.size);
+		}
+		index += line;
+	}
+	if (FILE* f = std::fopen((job.dir + "/guesttex.txt").c_str(), "wb")) {
+		std::fwrite(index.data(), 1, index.size(), f);
+		std::fclose(f);
+	}
+	std::printf("NHL27GUESTTEX: %u/%zu sampled textures dumped (%" PRIu64 " bytes) -> %s/guesttex.txt\n",
+	            written, job.guesttex.size(), bytes, job.dir.c_str());
+	std::fflush(stdout);
+}
+
 // 3D volume: per-channel min/max/mean/nonzero over all voxels, a few voxel samples, z-slice PNGs.
 void ProcessVolume(Pending& p, const std::string& dir, std::string& log, std::string& buflog) {
 	const auto&    t   = p.target;
@@ -854,8 +969,20 @@ void ProcessOne(Pending& p, const std::string& dir, std::string& log, std::strin
 	const std::string b = base;
 	char line[768];
 	if (!d.ok) {
-		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s UNSUPPORTED (not decoded)\n",
-		              p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
+		// No PNG decode for this format: keep the raw readback bytes instead of
+		// discarding them, so the target's content survives for offline analysis.
+		const std::string f      = b + ".bin";
+		std::string       suffix = " (raw write failed)";
+		if (FILE* out = std::fopen(f.c_str(), "wb")) {
+			if (std::fwrite(p.mapped, 1, static_cast<size_t>(p.size), out) ==
+			    static_cast<size_t>(p.size)) {
+				suffix = " -> " + std::filesystem::path(f).filename().string();
+			}
+			std::fclose(out);
+		}
+		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s UNSUPPORTED (not decoded)%s\n",
+		              p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h,
+		              vk::to_string(t.format).c_str(), suffix.c_str());
 		log += line;
 		return;
 	}
@@ -934,6 +1061,17 @@ void ProcessOne(Pending& p, const std::string& dir, std::string& log, std::strin
 			WriteMapped(f, d, [&](const float* px, float& r, float& g, float& bl) {
 				r = g = bl = px[3] * as;
 			});
+			note(f);
+		}
+	}
+	if (d.kind == Kind::Int) {
+		// Integer targets (material-ID buffers, lighting masks) lose their exact
+		// values in the normalized PNG; keep the raw readback bytes alongside it
+		// so individual pixel values stay readable offline.
+		const std::string f = b + ".bin";
+		if (FILE* out = std::fopen(f.c_str(), "wb")) {
+			std::fwrite(p.mapped, 1, static_cast<size_t>(p.size), out);
+			std::fclose(out);
 			note(f);
 		}
 	}
@@ -1167,6 +1305,9 @@ void BeginCapture(CommandBuffer& buffer) {
 	g_buflog.clear();
 	g_seen_vol.clear();
 	g_seen_buf.clear();
+	g_guesttex.clear();
+	g_seen_guesttex.clear();
+	g_guesttex_bytes = 0;
 	g_capturing = true;
 	g_active.store(true, std::memory_order_relaxed);
 	std::printf("NHL27FRAMEDUMP: capturing frame -> %s\n", g_dir.c_str());
@@ -1200,6 +1341,7 @@ void ProcessJob(CaptureJob& job) {
 	}
 	job.pending.clear();
 	ProcessBuffers(job.bufpending, job.buflog, job.dir);
+	ProcessGuestTex(job);
 	if (job.bufreq_leftover != 0) {
 		job.buflog += "NOTE: " + std::to_string(job.bufreq_leftover) +
 		              " buffer requests were never flushed\n";
@@ -1257,6 +1399,7 @@ void FinishCapture(CommandBuffer& buffer) {
 	CaptureJob job;
 	job.pending = std::move(g_pending);
 	job.bufpending = std::move(g_bufpending);
+	job.guesttex = std::move(g_guesttex);
 	job.draws = std::move(g_log);
 	job.buflog = std::move(g_buflog);
 	job.dir = g_dir;
@@ -1266,6 +1409,9 @@ void FinishCapture(CommandBuffer& buffer) {
 	g_log.clear();
 	g_pending.clear();
 	g_bufpending.clear();
+	g_guesttex.clear();
+	g_seen_guesttex.clear();
+	g_guesttex_bytes = 0;
 	g_buflog.clear();
 	g_bufreq.clear();
 	g_targets.clear();
@@ -1400,6 +1546,14 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	}
 	for (int i = 0; i < 3; i++) AppendImages(s, ("vs_img" + std::to_string(i)).c_str(), draw.vs_images[i]);
 	AppendImages(s, "ps_img", draw.ps_images);
+	for (int i = 0; i < 3; i++) {
+		if (draw.vs_images[i] != nullptr) {
+			for (const auto& im : *draw.vs_images[i]) CollectGuestTex(seq, im);
+		}
+	}
+	if (draw.ps_images != nullptr) {
+		for (const auto& im : *draw.ps_images) CollectGuestTex(seq, im);
+	}
 	g_log += s;
 	if (draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {
 		CaptureBindings(*draw.ps_bindings, seq, draw.ps_hash);
@@ -1480,6 +1634,11 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 		     (u.storage ? " STORAGE" : " sampled") + (u.written ? " WRITTEN" : "") + "\n";
 	}
 	g_log += s;
+	for (size_t i = 0; i < images.size(); i++) {
+		const auto& u = images[i];
+		if (u.binding == nullptr || u.storage) continue;
+		CollectGuestTex(seq, *u.binding);
+	}
 	for (size_t i = 0; i < images.size(); i++) {
 		const auto& u = images[i];
 		if (u.binding == nullptr || !u.written || !u.storage) continue;

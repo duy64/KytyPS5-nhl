@@ -89,7 +89,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "DLSS SDK clone failed" }
           git -C $dir sparse-checkout set include lib/Windows_x86_64/x64 lib/Windows_x86_64/rel
           if ($LASTEXITCODE -ne 0) { throw "DLSS SDK sparse checkout failed" }
-          $dll = Join-Path $dir "lib\\Windows_x86_64\\rel\\nvngx_dlss.dll"
+          $dll = Join-Path $dir "lib\Windows_x86_64\rel\nvngx_dlss.dll"
           if (-not (Test-Path $dll)) {
             throw "nvngx_dlss.dll is missing from the SDK clone"
           }
@@ -104,7 +104,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "XeSS SDK clone failed" }
           git -C $dir sparse-checkout set inc lib bin
           if ($LASTEXITCODE -ne 0) { throw "XeSS SDK sparse checkout failed" }
-          $dll = Join-Path $dir "bin\\libxess.dll"
+          $dll = Join-Path $dir "bin\libxess.dll"
           if (-not (Test-Path $dll)) {
             throw "libxess.dll is missing from the SDK clone"
           }

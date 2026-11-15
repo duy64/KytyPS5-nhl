@@ -212,6 +212,18 @@ struct DlssBridge::Impl {
 		if (FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))) {
 			return Fail("no DXGI adapter with the Vulkan device's LUID");
 		}
+		DXGI_ADAPTER_DESC1 adapter_desc {};
+		if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+			char adapter_name[128] {};
+			WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, adapter_name,
+			                    static_cast<int>(sizeof(adapter_name)), nullptr, nullptr);
+			std::printf("NHL27DLSS diag adapter=\"%s\" luid=%08x:%08x vendor=0x%04x device=0x%04x\n",
+			            adapter_name, static_cast<unsigned int>(adapter_desc.AdapterLuid.HighPart),
+			            static_cast<unsigned int>(adapter_desc.AdapterLuid.LowPart),
+			            static_cast<unsigned int>(adapter_desc.VendorId),
+			            static_cast<unsigned int>(adapter_desc.DeviceId));
+			std::fflush(stdout);
+		}
 		if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)))) {
 			return Fail("D3D12CreateDevice");
 		}
@@ -269,6 +281,10 @@ struct DlssBridge::Impl {
 		const std::wstring data_path = AppDirectory();
 		const auto inited = NVSDK_NGX_D3D12_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
 		                                                        data_path.c_str(), device.Get(), nullptr);
+		std::printf("NHL27DLSS diag ngx_init result=%d (0x%08x) project_id=%s engine_type=%d\n",
+		            static_cast<int>(inited), static_cast<unsigned int>(inited), kProjectId,
+		            static_cast<int>(NVSDK_NGX_ENGINE_TYPE_CUSTOM));
+		std::fflush(stdout);
 		if (inited != NVSDK_NGX_Result_Success) {
 			return Fail("NVSDK_NGX_D3D12_Init_with_ProjectID returned " + std::to_string(inited));
 		}
@@ -277,6 +293,22 @@ struct DlssBridge::Impl {
 		    capability_params == nullptr) {
 			return Fail("NVSDK_NGX_D3D12_GetCapabilityParameters");
 		}
+		// Diagnostics (#174): dump every SuperSampling capability value NGX reports, so one
+		// tester log shows whether the gate is the adapter, the driver, or per-app
+		// availability. Values left at the sentinel were not populated by NGX.
+		unsigned int diag_available = 0xFFFFFFFFu, diag_needs_driver = 0xFFFFFFFFu;
+		unsigned int diag_min_major = 0xFFFFFFFFu, diag_min_minor = 0xFFFFFFFFu;
+		int          diag_feature_init = 0x7FFFFFFF;
+		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &diag_available);
+		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &diag_needs_driver);
+		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMajor, &diag_min_major);
+		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &diag_min_minor);
+		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &diag_feature_init);
+		std::printf("NHL27DLSS diag caps supersampling_available=%u needs_updated_driver=%u "
+		            "min_driver_version=%u.%u feature_init_result=%d (0x%08x)\n",
+		            diag_available, diag_needs_driver, diag_min_major, diag_min_minor, diag_feature_init,
+		            static_cast<unsigned int>(diag_feature_init));
+		std::fflush(stdout);
 		unsigned int available = 0, needs_driver = 0;
 		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &available);
 		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);

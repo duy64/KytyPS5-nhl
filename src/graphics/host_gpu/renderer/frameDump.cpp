@@ -1000,6 +1000,57 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 		return;
 	}
 	const uint64_t size = static_cast<uint64_t>(t.w) * t.h * bpp * t.slices;
+	using S = vk::PipelineStageFlagBits2;
+	using A = vk::AccessFlagBits2;
+	// State refresh: a target read back three or more times in one capture keeps only its FIRST
+	// state and its LATEST state. The latest state's staging buffer is reused in place — the
+	// copies are recorded in stream order, so the buffer ends up holding the newest state at no
+	// extra pending bytes. Without this, a target written dozens of times in one frame (the
+	// scene target, ~30 states) burns the whole readback budget and the frame's last passes —
+	// the composition/UI stage — are all skipped.
+	{
+		uint32_t matches = 0;
+		Pending* latest  = nullptr;
+		for (auto& p : g_pending) {
+			if (p.target.image == t.image && p.target.mip == t.mip && p.target.layer == t.layer &&
+			    p.target.copy_aspect == t.copy_aspect && p.label == label) {
+				if (++matches == 2) latest = &p;
+			}
+		}
+		if (latest != nullptr && latest->size == size) {
+			// The previous copy into this buffer must complete before the refresh copy
+			// overwrites it (write-after-write within the same stream).
+			vk::BufferMemoryBarrier2 bb {};
+			bb.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+			bb.srcAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+			bb.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+			bb.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+			bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			bb.buffer              = latest->buffer;
+			bb.offset              = 0;
+			bb.size                = VK_WHOLE_SIZE;
+			vk::DependencyInfo dep {};
+			dep.bufferMemoryBarrierCount = 1;
+			dep.pBufferMemoryBarriers    = &bb;
+			cmd.pipelineBarrier2(dep);
+			BarrierImage(cmd, t, t.layout, vk::ImageLayout::eTransferSrcOptimal, S::eAllCommands,
+			             A::eMemoryWrite, S::eTransfer, A::eTransferRead);
+			vk::BufferImageCopy copy {};
+			copy.imageSubresource = {t.copy_aspect, t.mip, t.layer, 1};
+			copy.imageExtent      = vk::Extent3D {t.w, t.h, t.slices};
+			cmd.copyImageToBuffer(t.image, vk::ImageLayout::eTransferSrcOptimal, latest->buffer, 1, &copy);
+			BarrierImage(cmd, t, vk::ImageLayout::eTransferSrcOptimal, t.layout, S::eTransfer, A::eTransferRead,
+			             S::eAllCommands, A::eMemoryRead | A::eMemoryWrite);
+			std::snprintf(line, sizeof(line),
+			              "IMG seq=%u %s addr=0x%s %ux%u REFRESH (latest state reuses the readback slot of seq=%u)\n",
+			              seq, label, Hex(t.addr).c_str(), t.w, t.h, latest->seq);
+			g_log += line;
+			latest->seq    = seq;
+			latest->target = t;
+			return;
+		}
+	}
 	if (g_pending_bytes + size > kMaxPendingBytes) {
 		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u SKIPPED (readback memory cap)\n", seq,
 		              label, Hex(t.addr).c_str(), t.w, t.h);
@@ -1023,8 +1074,6 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 	g_images++;
 	g_pending_bytes += size;
 
-	using S = vk::PipelineStageFlagBits2;
-	using A = vk::AccessFlagBits2;
 	BarrierImage(cmd, t, t.layout, vk::ImageLayout::eTransferSrcOptimal, S::eAllCommands,
 	             A::eMemoryWrite, S::eTransfer, A::eTransferRead);
 	vk::BufferImageCopy copy {};

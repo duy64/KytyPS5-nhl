@@ -968,6 +968,15 @@ bool Nhl27Fsr3::Enabled() {
 		return value && std::strcmp(value, "1") == 0;
 	}();
 	return enabled;
+#elif defined(KYTY_ENABLE_FSR4)
+	// Bridge builds carry no FSR 3 SDK backend; KYTY_FSR4=1 switches the
+	// interceptor on so the D3D12 bridge gets its frames. FSR 4 is tried
+	// first each frame; the FSR 3 shadow record stays unavailable here.
+	static const bool enabled = [] {
+		const auto* value = std::getenv("KYTY_FSR4");
+		return value && std::strcmp(value, "1") == 0;
+	}();
+	return enabled;
 #else
 	return false;
 #endif

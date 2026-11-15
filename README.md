@@ -482,6 +482,9 @@ This fork builds on other people's work:
 - **pargi** — the shipped configuration change lowering the debug loop cap.
 - **Artyom Zabroda** — the TrackingSpinLock optimization (TTAS with cached thread ID), via MatusRiedl/KytyPS5-nhl27-enhanced.
 - **superkeka** — GPU interrupt coalescing, via MatusRiedl/KytyPS5-nhl27-enhanced.
+- **AMD FidelityFX SDK 2.4** — FSR 4 upscaling (Vulkan→D3D12 bridge), © AMD.
+- **NVIDIA DLSS SDK 310.9.16** — DLSS Super Resolution via NGX, © NVIDIA Corporation.
+- **Intel XeSS SDK 3.0.2** — XeSS Super Resolution, © Intel Corporation.
 
 ## License
 

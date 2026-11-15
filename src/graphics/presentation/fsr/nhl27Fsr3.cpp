@@ -2,6 +2,8 @@
 #include "graphics/presentation/fsr/nhl27Fsr3Constants.h"
 #include "graphics/presentation/fsr/fsr3.h"
 #include "graphics/presentation/fsr/fsr4Bridge.h"
+#include "graphics/presentation/fsr/dlssBridge.h"
+#include "graphics/presentation/fsr/xessBridge.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -103,6 +105,11 @@ struct Nhl27Fsr3::Impl {
 	// KYTY_FSR4=1: FSR 4 through the D3D12 bridge in place of FSR 3.1 (falls back to 3.1 when unusable).
 	std::unique_ptr<Fsr4Bridge> bridge;
 	uint64_t fsr4_frames = 0, fsr4_failed = 0;
+	// KYTY_DLSS=1 / KYTY_XESS=1: DLSS / XeSS through their D3D12 bridges, tried before FSR 4
+	// (each falls back to the next backend when unusable).
+	std::unique_ptr<DlssBridge> dlss_bridge;
+	std::unique_ptr<XessBridge> xess_bridge;
+	uint64_t dlss_frames = 0, dlss_failed = 0, xess_frames = 0, xess_failed = 0;
 	// KYTY_FSR4_GUARD=1: reactive mask for FSR 4 (gpu_tiler_fsr_ghost_guard.comp), marking pixels whose
 	// last-frame colour no longer fits the current picture, so FSR 4 drops its history there.
 	struct GuardBuffer {
@@ -142,6 +149,8 @@ struct Nhl27Fsr3::Impl {
 	}
 	~Impl() {
 		// RenderContext shuts down/drains the scheduler before RenderExecutor's owner dies.
+		dlss_bridge.reset();
+		xess_bridge.reset();
 		bridge.reset();
 		ReleaseImages();
 		if (constants) vmaDestroyBuffer(graphics.allocator, constants, constants_alloc);
@@ -429,6 +438,20 @@ struct Nhl27Fsr3::Impl {
 	static bool Fsr4Enabled() {
 		static const bool enabled = [] {
 			const char* value = std::getenv("KYTY_FSR4");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
+	static bool DlssEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_DLSS");
+			return value != nullptr && std::strcmp(value, "1") == 0;
+		}();
+		return enabled;
+	}
+	static bool XessEnabled() {
+		static const bool enabled = [] {
+			const char* value = std::getenv("KYTY_XESS");
 			return value != nullptr && std::strcmp(value, "1") == 0;
 		}();
 		return enabled;
@@ -726,6 +749,224 @@ struct Nhl27Fsr3::Impl {
 		++fsr4_frames;
 		return true;
 	}
+	// DLSS for this frame through the D3D12 bridge. Records like RecordFsr4 (inputs -> shared
+	// images, submit, D3D12, output copy into the guest image, submit again), without the ghost
+	// guard: DLSS takes no bias mask here. False = DLSS did not take the frame (try the next backend).
+	bool RecordDlss(RenderContext& context, CommandBuffer& command, const TextureBinding& target,
+					const Fsr3Frame& frame) {
+		auto& scheduler = context.GetCommandScheduler();
+		if (!dlss_bridge) {
+			dlss_bridge = std::make_unique<DlssBridge>(graphics);
+			std::printf("NHL27DLSS status=%s\n", dlss_bridge->Status().c_str());
+			std::fflush(stdout);
+		}
+		if (!dlss_bridge->Usable()) return false;
+		const vk::Extent2D render = frame.render_size, display = frame.output_size;
+		if (dlss_bridge->NeedsRecreate(render, display)) {
+			// Old shared images may still be used by queued Vulkan work.
+			scheduler.Wait(scheduler.CurrentTick());
+			InvalidateRedundantBinds();
+		}
+		if (!dlss_bridge->Ensure(render, display)) return false;
+		const bool fresh = dlss_bridge->Fresh();
+		dlss_bridge->ClearFresh();
+		const uint32_t family = graphics.queue_family;
+		constexpr uint32_t ignored = VK_QUEUE_FAMILY_IGNORED, external = VK_QUEUE_FAMILY_EXTERNAL;
+		auto recorder = command.Handle();
+		MemoryBarrier(recorder);
+		for (int i = 0; i < 3; ++i) {
+			auto& owned = images[i];
+			const vk::Image shared = dlss_bridge->Image(i);
+			ImageBarrier(recorder, owned.resource.image, owned.layout, vk::ImageLayout::eTransferSrcOptimal);
+			SharedBarrier(recorder, shared, fresh ? vk::ImageLayout::eUndefined : vk::ImageLayout::eGeneral,
+						  vk::ImageLayout::eGeneral, fresh ? ignored : external, fresh ? ignored : family);
+			vk::ImageCopy copy {};
+			copy.srcSubresource = copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.extent = vk::Extent3D {render.width, render.height, 1};
+			recorder.copyImage(owned.resource.image, vk::ImageLayout::eTransferSrcOptimal, shared,
+							   vk::ImageLayout::eGeneral, 1, &copy);
+			SharedBarrier(recorder, shared, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, family, external);
+			ImageBarrier(recorder, owned.resource.image, vk::ImageLayout::eTransferSrcOptimal, owned.layout);
+		}
+		if (fresh) {
+			// The output belongs to D3D12 between frames.
+			const vk::Image output = dlss_bridge->Image(DlssBridge::Output);
+			SharedBarrier(recorder, output, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral, ignored, ignored);
+			SharedBarrier(recorder, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, family, external);
+		}
+		const auto [inputs_ready, upscaled] = dlss_bridge->NextValues();
+		SubmitInfo signal {};
+		signal.AddSignal(dlss_bridge->Semaphore(), inputs_ready);
+		scheduler.Flush(signal);
+		InvalidateRedundantBinds();
+		DlssParams params {};
+		params.jitter_x = frame.jitter_x;
+		params.jitter_y = frame.jitter_y;
+		params.motion_scale_x = frame.motion_scale_x;
+		params.motion_scale_y = frame.motion_scale_y;
+		params.near_plane = frame.near_plane;
+		params.far_plane = frame.far_plane;
+		params.vertical_fov = frame.vertical_fov;
+		params.delta_ms = frame.delta_ms;
+		params.pre_exposure = frame.pre_exposure;
+		params.reset = frame.reset;
+		const auto result = dlss_bridge->Dispatch(params, inputs_ready, upscaled);
+		if (result == DlssBridge::Result::NotQueued) {
+			++dlss_failed;
+			return false;
+		}
+		const bool ok = result == DlssBridge::Result::Upscaled;
+		last_recorded.store(ok, std::memory_order_release);
+		auto after = command.Handle();
+		if (ok && PresentEnabled() && PresentTarget(context, target)) {
+			const auto& guest = context.GetTextureCache().GetImage(target.image_id);
+			const vk::Image output = dlss_bridge->Image(DlssBridge::Output);
+			SharedBarrier(after, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, external, family);
+			SharedBarrier(after, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal, ignored,
+						  ignored);
+			ImageBarrier(after, guest.backing.image, target.layout, vk::ImageLayout::eTransferDstOptimal);
+			vk::ImageCopy copy {};
+			copy.srcSubresource = copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.extent = vk::Extent3D {display.width, display.height, 1};
+			after.copyImage(output, vk::ImageLayout::eTransferSrcOptimal, guest.backing.image,
+							vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+			ImageBarrier(after, guest.backing.image, vk::ImageLayout::eTransferDstOptimal, target.layout);
+			SharedBarrier(after, output, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral, ignored,
+						  ignored);
+			SharedBarrier(after, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, family, external);
+			const auto count = presented.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (count <= 3 || count % 600 == 0) {
+				std::printf("NHL27DLSS status=presented count=%llu\n", static_cast<unsigned long long>(count));
+				std::fflush(stdout);
+			}
+		} else if (ok && PresentEnabled() && (++present_skips <= 8 || present_skips % 600 == 0)) {
+			std::printf("NHL27DLSS status=present-skip reason=guest-output-layout count=%llu\n",
+						static_cast<unsigned long long>(present_skips));
+			std::fflush(stdout);
+		}
+		SubmitInfo wait {};
+		wait.AddWait(dlss_bridge->Semaphore(), upscaled);
+		scheduler.Flush(wait);
+		InvalidateRedundantBinds();
+		if (!ok) ++dlss_failed;
+		++dlss_frames;
+		return true;
+	}
+	// XeSS for this frame through the D3D12 bridge. Records like RecordDlss, except the colour
+	// snapshot is converted into the shared colour image with a blit: the snapshot is B10G11R11
+	// but XeSS needs its input colour format to equal its output format (R16G16B16A16).
+	// False = XeSS did not take the frame (try the next backend).
+	bool RecordXess(RenderContext& context, CommandBuffer& command, const TextureBinding& target,
+					const Fsr3Frame& frame) {
+		auto& scheduler = context.GetCommandScheduler();
+		if (!xess_bridge) {
+			xess_bridge = std::make_unique<XessBridge>(graphics);
+			std::printf("NHL27XESS status=%s\n", xess_bridge->Status().c_str());
+			std::fflush(stdout);
+		}
+		if (!xess_bridge->Usable()) return false;
+		const vk::Extent2D render = frame.render_size, display = frame.output_size;
+		if (xess_bridge->NeedsRecreate(render, display)) {
+			// Old shared images may still be used by queued Vulkan work.
+			scheduler.Wait(scheduler.CurrentTick());
+			InvalidateRedundantBinds();
+		}
+		if (!xess_bridge->Ensure(render, display)) return false;
+		const bool fresh = xess_bridge->Fresh();
+		xess_bridge->ClearFresh();
+		const uint32_t family = graphics.queue_family;
+		constexpr uint32_t ignored = VK_QUEUE_FAMILY_IGNORED, external = VK_QUEUE_FAMILY_EXTERNAL;
+		auto recorder = command.Handle();
+		MemoryBarrier(recorder);
+		for (int i = 0; i < 3; ++i) {
+			auto& owned = images[i];
+			const vk::Image shared = xess_bridge->Image(i);
+			ImageBarrier(recorder, owned.resource.image, owned.layout, vk::ImageLayout::eTransferSrcOptimal);
+			SharedBarrier(recorder, shared, fresh ? vk::ImageLayout::eUndefined : vk::ImageLayout::eGeneral,
+						  vk::ImageLayout::eGeneral, fresh ? ignored : external, fresh ? ignored : family);
+			if (i == XessBridge::Color) {
+				vk::ImageBlit blit {};
+				blit.srcSubresource = blit.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+				blit.srcOffsets[0] = vk::Offset3D {0, 0, 0};
+				blit.srcOffsets[1] = vk::Offset3D {int32_t(render.width), int32_t(render.height), 1};
+				blit.dstOffsets[0] = vk::Offset3D {0, 0, 0};
+				blit.dstOffsets[1] = vk::Offset3D {int32_t(render.width), int32_t(render.height), 1};
+				recorder.blitImage(owned.resource.image, vk::ImageLayout::eTransferSrcOptimal, shared,
+								   vk::ImageLayout::eGeneral, 1, &blit, vk::Filter::eLinear);
+			} else {
+				vk::ImageCopy copy {};
+				copy.srcSubresource = copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+				copy.extent = vk::Extent3D {render.width, render.height, 1};
+				recorder.copyImage(owned.resource.image, vk::ImageLayout::eTransferSrcOptimal, shared,
+								   vk::ImageLayout::eGeneral, 1, &copy);
+			}
+			SharedBarrier(recorder, shared, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, family, external);
+			ImageBarrier(recorder, owned.resource.image, vk::ImageLayout::eTransferSrcOptimal, owned.layout);
+		}
+		if (fresh) {
+			// The output belongs to D3D12 between frames.
+			const vk::Image output = xess_bridge->Image(XessBridge::Output);
+			SharedBarrier(recorder, output, vk::ImageLayout::eUndefined, vk::ImageLayout::eGeneral, ignored, ignored);
+			SharedBarrier(recorder, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, family, external);
+		}
+		const auto [inputs_ready, upscaled] = xess_bridge->NextValues();
+		SubmitInfo signal {};
+		signal.AddSignal(xess_bridge->Semaphore(), inputs_ready);
+		scheduler.Flush(signal);
+		InvalidateRedundantBinds();
+		XessParams params {};
+		params.jitter_x = frame.jitter_x;
+		params.jitter_y = frame.jitter_y;
+		params.motion_scale_x = frame.motion_scale_x;
+		params.motion_scale_y = frame.motion_scale_y;
+		params.near_plane = frame.near_plane;
+		params.far_plane = frame.far_plane;
+		params.vertical_fov = frame.vertical_fov;
+		params.delta_ms = frame.delta_ms;
+		params.pre_exposure = frame.pre_exposure;
+		params.reset = frame.reset;
+		const auto result = xess_bridge->Dispatch(params, inputs_ready, upscaled);
+		if (result == XessBridge::Result::NotQueued) {
+			++xess_failed;
+			return false;
+		}
+		const bool ok = result == XessBridge::Result::Upscaled;
+		last_recorded.store(ok, std::memory_order_release);
+		auto after = command.Handle();
+		if (ok && PresentEnabled() && PresentTarget(context, target)) {
+			const auto& guest = context.GetTextureCache().GetImage(target.image_id);
+			const vk::Image output = xess_bridge->Image(XessBridge::Output);
+			SharedBarrier(after, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, external, family);
+			SharedBarrier(after, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eTransferSrcOptimal, ignored,
+						  ignored);
+			ImageBarrier(after, guest.backing.image, target.layout, vk::ImageLayout::eTransferDstOptimal);
+			vk::ImageCopy copy {};
+			copy.srcSubresource = copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+			copy.extent = vk::Extent3D {display.width, display.height, 1};
+			after.copyImage(output, vk::ImageLayout::eTransferSrcOptimal, guest.backing.image,
+							vk::ImageLayout::eTransferDstOptimal, 1, &copy);
+			ImageBarrier(after, guest.backing.image, vk::ImageLayout::eTransferDstOptimal, target.layout);
+			SharedBarrier(after, output, vk::ImageLayout::eTransferSrcOptimal, vk::ImageLayout::eGeneral, ignored,
+						  ignored);
+			SharedBarrier(after, output, vk::ImageLayout::eGeneral, vk::ImageLayout::eGeneral, family, external);
+			const auto count = presented.fetch_add(1, std::memory_order_relaxed) + 1;
+			if (count <= 3 || count % 600 == 0) {
+				std::printf("NHL27XESS status=presented count=%llu\n", static_cast<unsigned long long>(count));
+				std::fflush(stdout);
+			}
+		} else if (ok && PresentEnabled() && (++present_skips <= 8 || present_skips % 600 == 0)) {
+			std::printf("NHL27XESS status=present-skip reason=guest-output-layout count=%llu\n",
+						static_cast<unsigned long long>(present_skips));
+			std::fflush(stdout);
+		}
+		SubmitInfo wait {};
+		wait.AddWait(xess_bridge->Semaphore(), upscaled);
+		scheduler.Flush(wait);
+		InvalidateRedundantBinds();
+		if (!ok) ++xess_failed;
+		++xess_frames;
+		return true;
+	}
 	bool AccumulationEdges(const std::vector<TextureBinding>& b) const {
 		return stage == 3 && b.size() == 8 && reactive[6].Matches(b[0]) && prepare[4].Matches(b[1]) &&
 			prepare[3].Matches(b[4]) && reactive[7].Matches(b[5]) &&
@@ -968,13 +1209,17 @@ bool Nhl27Fsr3::Enabled() {
 		return value && std::strcmp(value, "1") == 0;
 	}();
 	return enabled;
-#elif defined(KYTY_ENABLE_FSR4)
-	// Bridge builds carry no FSR 3 SDK backend; KYTY_FSR4=1 switches the
-	// interceptor on so the D3D12 bridge gets its frames. FSR 4 is tried
-	// first each frame; the FSR 3 shadow record stays unavailable here.
+#elif defined(KYTY_ENABLE_FSR4) || defined(KYTY_ENABLE_DLSS) || defined(KYTY_ENABLE_XESS)
+	// Bridge builds carry no FSR 3 SDK backend; any bridge switch (KYTY_DLSS /
+	// KYTY_XESS / KYTY_FSR4) turns the interceptor on so the selected bridge gets its
+	// frames. Per frame the first usable backend in DLSS > XeSS > FSR 4 order takes
+	// the frame; the FSR 3 shadow record stays unavailable here.
 	static const bool enabled = [] {
-		const auto* value = std::getenv("KYTY_FSR4");
-		return value && std::strcmp(value, "1") == 0;
+		for (const char* name : {"KYTY_DLSS", "KYTY_XESS", "KYTY_FSR4"}) {
+			const auto* value = std::getenv(name);
+			if (value && std::strcmp(value, "1") == 0) return true;
+		}
+		return false;
 	}();
 	return enabled;
 #else
@@ -1127,8 +1372,15 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 		const auto guest_frame = c.Frame();
 		auto* state = m.get();
 		state->last_recorded.store(false, std::memory_order_release);
+		bool taken = false;
+		if (Impl::DlssEnabled()) {
+			taken = m->RecordDlss(context, command, b[7], frame);
+		}
+		if (!taken && Impl::XessEnabled()) {
+			taken = m->RecordXess(context, command, b[7], frame);
+		}
 		bool fsr4_done = false;
-		if (Impl::Fsr4Enabled()) {
+		if (!taken && Impl::Fsr4Enabled()) {
 			// KYTY_FSR4_JITTER_PREV=1 (test): hand FSR 4 the block's previous-frame jitter (w30/w31).
 			static const bool jitter_prev = [] {
 				const char* value = std::getenv("KYTY_FSR4_JITTER_PREV");
@@ -1145,7 +1397,7 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 			}
 			fsr4_done = m->RecordFsr4(context, command, b[7], fsr4_frame);
 		}
-		if (!fsr4_done) {
+		if (!taken && !fsr4_done) {
 		auto recorder = command.Handle();
 		for (size_t i = 3; i < m->images.size(); ++i) {
 			auto& owned = m->images[i];
@@ -1213,7 +1465,7 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 				std::fflush(stdout);
 			}
 		}
-		} // !fsr4_done
+		} // !taken && !fsr4_done
 		InvalidateRedundantBinds();
 		g_compute_pipeline_epoch.fetch_add(1, std::memory_order_relaxed);
 		NoteShaderWork();
@@ -1228,7 +1480,8 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 			std::printf("NHL27FSR3GAME status=stats frames=%llu dirty_reads=%llu mismatches=%llu "
 						"replaced=%llu cleaned=%llu fsr4_frames=%llu fsr4_failed=%llu guarded=%llu "
 						"resets=%llu cut=%llu missed=%llu counter=%llu jitter=%llu soft_skipped=%llu cpu_us_per_frame=%.0f "
-						"flush_us=%.0f d3d_us=%.0f chain_skipped=%llu\n", static_cast<unsigned long long>(m->serial),
+						"flush_us=%.0f d3d_us=%.0f chain_skipped=%llu dlss_frames=%llu dlss_failed=%llu "
+						"xess_frames=%llu xess_failed=%llu\n", static_cast<unsigned long long>(m->serial),
 						static_cast<unsigned long long>(m->dirty_reads),
 						static_cast<unsigned long long>(m->clean_mismatches),
 						static_cast<unsigned long long>(m->replaced),
@@ -1242,7 +1495,11 @@ void Nhl27Fsr3::OnDispatch(RenderContext& context, CommandBuffer& command, uint6
 						static_cast<unsigned long long>(m->reset_reasons[size_t(Nhl27ResetReason::JitterMismatch)]),
 						static_cast<unsigned long long>(m->soft_skipped), double(m->cpu_ns_total) / 600e3,
 						double(m->cpu_ns_flush) / 600e3, double(m->cpu_ns_d3d) / 600e3,
-						static_cast<unsigned long long>(m->chain_skipped));
+						static_cast<unsigned long long>(m->chain_skipped),
+						static_cast<unsigned long long>(m->dlss_frames),
+						static_cast<unsigned long long>(m->dlss_failed),
+						static_cast<unsigned long long>(m->xess_frames),
+						static_cast<unsigned long long>(m->xess_failed));
 			m->cpu_ns_total = m->cpu_ns_flush = m->cpu_ns_d3d = 0;
 			std::fflush(stdout);
 		}

@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
 #include <condition_variable>
 #include <queue>
@@ -114,15 +115,34 @@ std::set<std::string>    g_seen_buf;
 // Sampled textures are never read back from the GPU (the dump saves render
 // targets and written storage images only), so what a shader actually sampled
 // is the dump's blind spot. For every unique sampled binding of the captured
-// frame whose guest data is at most 1 MiB, the download worker copies the RAW
-// GUEST BYTES out of guest memory (LibKernel::Memory::TryReadBacking, which
-// fails cleanly on unmapped/short ranges) into a .bin next to the PNGs,
-// indexed by guesttex.txt. That is what lets a capture answer "what bytes does
-// the game hold at this texture's address" (e.g. the Bc7 logo textures)
-// offline. The copies run in the worker, not on the game thread; guest memory
-// may have moved on by then, which is acceptable for the streamed/static
-// assets this targets. Separate byte budget from the GPU readback staging:
-// these are plain host file writes, no staging allocations are held.
+// frame, the download worker copies the RAW GUEST BYTES out of guest memory
+// (LibKernel::Memory::TryReadBacking, which fails cleanly on unmapped/short
+// ranges) into a .bin next to the PNGs, indexed by guesttex.txt. That is what
+// lets a capture answer "what bytes does the game hold at this texture's
+// address" (e.g. the Bc7 logo textures) offline. The copies run in the worker,
+// not on the game thread; guest memory may have moved on by then, which is
+// acceptable for the streamed/static assets this targets. Separate byte budget
+// from the GPU readback staging: these are plain host file writes, no staging
+// allocations are held.
+//
+// Two collection blind spots are covered on top of the in-frame bindings:
+//  - Textures uploaded BEFORE the captured frame (e.g. a hub photo uploaded
+//    while a menu loads, then only composited by later frames): OnDraw and
+//    OnDispatch run only during a capture (their call sites gate on
+//    FrameDump::Active()), so bindings alone can never see them. Instead the
+//    texture cache reports every guest texture upload to a session record
+//    (NoteTextureUpload), and FinishCapture merges the record into the dump.
+//    Merged entries keep seq 0: no draw of the captured frame bound them.
+//    The record lives for the whole session (a dump does NOT clear it) and
+//    holds descriptors only, never bytes; the worker reads the guest bytes
+//    at dump time exactly like for in-frame bindings.
+//  - Late-frame starvation: collection order is draw order, so a byte budget
+//    spent first-come on early multi-megabyte textures used to cut off the
+//    small UI textures bound late (leaders-board logos at draws ~4500-6300).
+//    Collection therefore takes every eligible descriptor, and the worker
+//    admits candidates SMALLEST FIRST under the byte/count budgets, writing
+//    the rest as SKIPPED (over guesttex budget) index lines, so a small
+//    texture is recorded whenever it fits at all.
 struct GuestTexReq {
 	uint64_t    addr      = 0;
 	uint64_t    size      = 0;
@@ -136,9 +156,21 @@ struct GuestTexReq {
 std::vector<GuestTexReq>                g_guesttex;
 std::set<std::pair<uint64_t, uint64_t>> g_seen_guesttex; // (address, size)
 uint64_t                                g_guesttex_bytes = 0;
-constexpr uint64_t kGuestTexMaxSize  = 1ull << 20;  // per texture
-constexpr uint64_t kGuestTexMaxBytes = 64ull << 20; // per capture
-constexpr size_t   kGuestTexMaxCount = 512;
+constexpr uint64_t kGuestTexMaxSize    = 64ull << 20;  // per texture
+constexpr uint64_t kGuestTexMaxBytes   = 512ull << 20; // per capture (worker admission)
+constexpr size_t   kGuestTexMaxCount   = 4096;         // files per capture (worker admission)
+constexpr size_t   kGuestTexMaxCollect = 8192;         // candidate descriptors per capture
+
+// Session record of guest texture uploads (descriptors only), keyed by guest
+// address: a re-upload at the same address replaces the entry. Fed by
+// NoteTextureUpload under its own mutex — the texture cache calls it with the
+// cache lock held, so it must never wait on g_mutex. Once the record is full,
+// existing addresses can still be replaced but new ones are dropped (logged
+// once), so the record favours the textures seen first in the session.
+std::map<uint64_t, GuestTexReq> g_guesttex_session;
+std::mutex                      g_guesttex_session_mutex;
+constexpr size_t                kGuestTexSessionMax       = 16384;
+bool                            g_guesttex_session_full   = false; // under g_guesttex_session_mutex
 
 // ---- async download: finished captures are handed to a worker thread ----
 // The flip thread records a capture and waits only for the GPU copies
@@ -148,6 +180,7 @@ struct CaptureJob {
 	std::vector<Pending>    pending;    // staging buffers, moved out of g_pending
 	std::vector<BufPending> bufpending; // moved out of g_bufpending
 	std::vector<GuestTexReq> guesttex;  // moved out of g_guesttex (NHL27GUESTTEX)
+	size_t                  guesttex_session = 0; // guesttex entries merged from the session record
 	std::string             draws;      // moved out of g_log (draw/dispatch lines)
 	std::string             buflog;     // moved out of g_buflog
 	std::string             dir;        // copied from g_dir
@@ -754,7 +787,9 @@ std::string Hex(uint64_t v) {
 }
 
 // Records one sampled binding for the guest-byte dump (see GuestTexReq).
-// Called with g_mutex held.
+// Called with g_mutex held. No byte budget here: admission under the budget
+// happens smallest-first in the worker (ProcessGuestTex), so a big texture
+// bound early cannot starve the small ones bound late.
 void CollectGuestTex(uint32_t seq, const TextureBinding& b) {
 	const auto& info = b.desc.info;
 	if (b.desc.type != TextureCache::BindingType::Texture) return;
@@ -762,7 +797,7 @@ void CollectGuestTex(uint32_t seq, const TextureBinding& b) {
 	const uint64_t size = info.data.size;
 	if (addr == 0 || size == 0 || size > kGuestTexMaxSize) return;
 	if (!info.data.Valid()) return;
-	if (g_guesttex.size() >= kGuestTexMaxCount || g_guesttex_bytes + size > kGuestTexMaxBytes) return;
+	if (g_guesttex.size() >= kGuestTexMaxCollect) return;
 	if (!g_seen_guesttex.insert(std::make_pair(addr, size)).second) return;
 	GuestTexReq r;
 	r.addr      = addr;
@@ -781,21 +816,56 @@ void CollectGuestTex(uint32_t seq, const TextureBinding& b) {
 }
 
 // Worker side of the guest sampled-texture dump: reads the guest bytes for
-// each recorded binding and writes them as .bin files plus the guesttex.txt
+// each admitted candidate and writes them as .bin files plus the guesttex.txt
 // index. Runs on the download worker thread (ProcessJob).
 void ProcessGuestTex(CaptureJob& job) {
 	if (job.guesttex.empty()) return;
+	// Admission under the byte/count budgets, SMALLEST FIRST: collection order
+	// is draw order, so first-come admission let early multi-megabyte textures
+	// starve the small UI textures bound late in the frame. Candidates that do
+	// not fit are still listed in the index as SKIPPED (over guesttex budget).
+	std::vector<size_t> order(job.guesttex.size());
+	for (size_t i = 0; i < order.size(); i++) order[i] = i;
+	std::sort(order.begin(), order.end(), [&job](size_t a, size_t b) {
+		if (job.guesttex[a].size != job.guesttex[b].size) return job.guesttex[a].size < job.guesttex[b].size;
+		return a < b;
+	});
+	std::vector<bool> admit(job.guesttex.size(), false);
+	uint64_t          total_bytes = 0;
+	uint64_t          admit_bytes = 0;
+	size_t            admit_count = 0;
+	for (const size_t i : order) {
+		const auto& r = job.guesttex[i];
+		total_bytes += r.size;
+		if (admit_count >= kGuestTexMaxCount || admit_bytes + r.size > kGuestTexMaxBytes) continue;
+		admit[i] = true;
+		admit_count++;
+		admit_bytes += r.size;
+	}
+	const size_t   skipped_budget       = job.guesttex.size() - admit_count;
+	const uint64_t skipped_budget_bytes = total_bytes - admit_bytes;
 	std::string          index;
-	uint32_t             written = 0;
-	uint64_t             bytes   = 0;
+	uint32_t             written       = 0;
+	uint32_t             skipped_read  = 0;
+	uint32_t             skipped_write = 0;
+	uint64_t             bytes         = 0;
 	std::vector<uint8_t> data;
-	for (const auto& r : job.guesttex) {
+	for (size_t i = 0; i < job.guesttex.size(); i++) {
+		const auto& r = job.guesttex[i];
+		char line[768];
+		if (!admit[i]) {
+			std::snprintf(line, sizeof(line),
+			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " SKIPPED (over guesttex budget)\n",
+			              r.seq, Hex(r.addr).c_str(), r.size);
+			index += line;
+			continue;
+		}
 		char fname[320];
 		std::snprintf(fname, sizeof(fname), "guesttex_%05u_%s_%ux%ux%u_g%u_%s.bin", r.seq,
 		              Hex(r.addr).c_str(), r.w, r.h, r.d, r.guest_fmt, r.vk_fmt.c_str());
-		char line[768];
 		data.assign(static_cast<size_t>(r.size), 0);
 		if (!LibKernel::Memory::TryReadBacking(r.addr, data.data(), r.size)) {
+			skipped_read++;
 			std::snprintf(line, sizeof(line),
 			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " SKIPPED (guest read failed)\n",
 			              r.seq, Hex(r.addr).c_str(), r.size);
@@ -814,6 +884,7 @@ void ProcessGuestTex(CaptureJob& job) {
 			              r.seq, Hex(r.addr).c_str(), r.size, r.guest_fmt, r.vk_fmt.c_str(), r.w, r.h, r.d,
 			              r.levels, r.layers, r.tile_mode, fname);
 		} else {
+			skipped_write++;
 			std::snprintf(line, sizeof(line),
 			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " SKIPPED (file write failed)\n",
 			              r.seq, Hex(r.addr).c_str(), r.size);
@@ -826,6 +897,10 @@ void ProcessGuestTex(CaptureJob& job) {
 	}
 	std::printf("NHL27GUESTTEX: %u/%zu sampled textures dumped (%" PRIu64 " bytes) -> %s/guesttex.txt\n",
 	            written, job.guesttex.size(), bytes, job.dir.c_str());
+	std::printf("NHL27GUESTTEX: candidates=%zu session=%zu recorded=%u (%" PRIu64 " bytes) "
+	            "skipped_budget=%zu (%" PRIu64 " bytes) skipped_read=%u skipped_write=%u\n",
+	            job.guesttex.size(), job.guesttex_session, written, bytes, skipped_budget,
+	            skipped_budget_bytes, skipped_read, skipped_write);
 	std::fflush(stdout);
 }
 
@@ -1400,6 +1475,22 @@ void FinishCapture(CommandBuffer& buffer) {
 	job.pending = std::move(g_pending);
 	job.bufpending = std::move(g_bufpending);
 	job.guesttex = std::move(g_guesttex);
+	// Merge the session record of guest texture uploads (NoteTextureUpload):
+	// textures uploaded before this frame (e.g. during a menu load) that no
+	// draw of this frame bound. In-frame entries win; merged entries keep
+	// seq 0. The record itself is NOT cleared: it covers the whole session.
+	{
+		std::set<uint64_t> have;
+		for (const auto& r : job.guesttex) have.insert(r.addr);
+		std::lock_guard session_lock(g_guesttex_session_mutex);
+		for (const auto& [addr, r] : g_guesttex_session) {
+			if (job.guesttex.size() >= kGuestTexMaxCollect) break;
+			if (have.insert(addr).second) {
+				job.guesttex.push_back(r);
+				job.guesttex_session++;
+			}
+		}
+	}
 	job.draws = std::move(g_log);
 	job.buflog = std::move(g_buflog);
 	job.dir = g_dir;
@@ -1455,6 +1546,48 @@ void Request() {
 	g_request.store(true);
 	std::printf("NHL27FRAMEDUMP: F2 - will capture the next complete frame\n");
 	std::fflush(stdout);
+}
+
+// Session record for the guesttex dump (see the NHL27GUESTTEX comment block):
+// the texture cache calls this on every guest texture upload, so textures
+// uploaded before a captured frame are dump candidates too. Descriptors only;
+// the worker reads the guest bytes at dump time. Takes only the record's own
+// mutex — callers may hold the texture cache lock, so this must never wait on
+// g_mutex or do any I/O beyond the one-time "record full" line.
+void NoteTextureUpload(const ImageInfo& info) {
+	const uint64_t addr = info.data.address;
+	const uint64_t size = info.data.size;
+	if (addr == 0 || size == 0 || size > kGuestTexMaxSize) return;
+	if (!info.data.Valid()) return;
+	GuestTexReq r;
+	r.addr      = addr;
+	r.size      = size;
+	r.seq       = 0; // not bound by a draw of the captured frame (FinishCapture merge)
+	r.guest_fmt = static_cast<uint32_t>(info.guest_format);
+	r.vk_fmt    = vk::to_string(info.pixel_format);
+	r.w         = info.extent.width;
+	r.h         = info.extent.height;
+	r.d         = info.extent.depth;
+	r.levels    = info.resources.levels;
+	r.layers    = info.resources.layers;
+	r.tile_mode = static_cast<uint32_t>(info.tile_mode);
+	std::lock_guard lock(g_guesttex_session_mutex);
+	const auto      it = g_guesttex_session.find(addr);
+	if (it != g_guesttex_session.end()) {
+		it->second = std::move(r); // a re-upload at the same address replaces the entry
+		return;
+	}
+	if (g_guesttex_session.size() >= kGuestTexSessionMax) {
+		if (!g_guesttex_session_full) {
+			g_guesttex_session_full = true;
+			std::printf("NHL27GUESTTEX: session record full (%zu entries); new uploads are no "
+			            "longer recorded\n",
+			            kGuestTexSessionMax);
+			std::fflush(stdout);
+		}
+		return;
+	}
+	g_guesttex_session.emplace(addr, std::move(r));
 }
 
 void Shutdown() {

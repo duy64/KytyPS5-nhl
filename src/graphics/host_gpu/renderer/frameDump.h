@@ -24,6 +24,7 @@ namespace Libs::Graphics {
 
 struct TextureBinding;
 struct PreparedBindings;
+struct ImageInfo;
 
 namespace FrameDump {
 
@@ -38,6 +39,13 @@ extern std::atomic<bool> g_active;
 
 // F2 in the game window: capture the next complete guest frame.
 void Request();
+
+// Session record for the guesttex dump: the texture cache calls this whenever a guest
+// texture's bytes are (re)uploaded to a host image, so an F2 dump can also include
+// textures uploaded before the captured frame (e.g. a hub photo uploaded while a menu
+// loads and only composited afterwards). Callers gate on Enabled(); the record holds
+// descriptors only (never bytes) and lives for the whole session.
+void NoteTextureUpload(const ImageInfo& info);
 
 // Joins the capture download worker thread (if one was ever started); called
 // from the renderer destructor so an in-flight download is abandoned promptly

@@ -117,6 +117,30 @@ std::wstring AppDirectory() {
 	return dir;
 }
 
+// NGX log sink (the LoggingInfo half of the FeatureCommonInfo passed at init):
+// forwards NGX's own messages to the emulator log so they land in last-run.log next
+// to the NHL27DLSS lines. NGX may call this from any thread; printf is safe for that.
+void NVSDK_CONV NgxLogCallback(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
+	std::printf("NHL27DLSS ngx-log %s\n", message != nullptr ? message : "");
+	std::fflush(stdout);
+}
+
+// Name for an NVSDK_NGX_Result value, so the diag caps line is self-explanatory in a
+// tester log (FeatureInitResult is the discriminator between the remaining theories).
+const char* NgxResultName(unsigned int result) {
+	switch (result) {
+		case NVSDK_NGX_Result_Success: return "Success";
+		case NVSDK_NGX_Result_FAIL_FeatureNotSupported: return "FeatureNotSupported";
+		case NVSDK_NGX_Result_FAIL_PlatformError: return "PlatformError";
+		case NVSDK_NGX_Result_FAIL_FeatureNotFound: return "FeatureNotFound";
+		case NVSDK_NGX_Result_FAIL_UnableToInitializeFeature: return "UnableToInitializeFeature";
+		case NVSDK_NGX_Result_FAIL_OutOfDate: return "OutOfDate";
+		case NVSDK_NGX_Result_FAIL_UnableToWriteToAppDataPath: return "UnableToWriteToAppDataPath";
+		case NVSDK_NGX_Result_FAIL_Denied: return "Denied";
+	}
+	return "Unknown";
+}
+
 struct Format {
 	DXGI_FORMAT dxgi;
 	VkFormat    vk;
@@ -277,10 +301,17 @@ struct DlssBridge::Impl {
 
 		// NGX itself: the driver-side NGX Core loads the signed nvngx_dlss.dll from the
 		// emulator's folder (installed there by CMake). The data path holds NGX logs and
-		// temporary files and must be writable.
-		const std::wstring data_path = AppDirectory();
+		// temporary files and must be writable. The FeatureCommonInfo names that same
+		// folder explicitly and registers the log callback: a nullptr info leaves the
+		// feature-DLL discovery to the default search only and gives NGX no log voice,
+		// while both working NGX integrations (hilals' bridge, upstream KytyPS5) pass it.
+		const std::wstring          data_path = AppDirectory();
+		const wchar_t*              feature_path = data_path.c_str();
+		NVSDK_NGX_FeatureCommonInfo feature_info {};
+		feature_info.PathListInfo = {&feature_path, 1};
+		feature_info.LoggingInfo  = {NgxLogCallback, NVSDK_NGX_LOGGING_LEVEL_VERBOSE, false};
 		const auto inited = NVSDK_NGX_D3D12_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
-		                                                        data_path.c_str(), device.Get(), nullptr);
+		                                                        data_path.c_str(), device.Get(), &feature_info);
 		std::printf("NHL27DLSS diag ngx_init result=%d (0x%08x) project_id=%s engine_type=%d\n",
 		            static_cast<int>(inited), static_cast<unsigned int>(inited), kProjectId,
 		            static_cast<int>(NVSDK_NGX_ENGINE_TYPE_CUSTOM));
@@ -305,9 +336,10 @@ struct DlssBridge::Impl {
 		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_MinDriverVersionMinor, &diag_min_minor);
 		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_FeatureInitResult, &diag_feature_init);
 		std::printf("NHL27DLSS diag caps supersampling_available=%u needs_updated_driver=%u "
-		            "min_driver_version=%u.%u feature_init_result=%d (0x%08x)\n",
+		            "min_driver_version=%u.%u feature_init_result=%d (0x%08x %s)\n",
 		            diag_available, diag_needs_driver, diag_min_major, diag_min_minor, diag_feature_init,
-		            static_cast<unsigned int>(diag_feature_init));
+		            static_cast<unsigned int>(diag_feature_init),
+		            NgxResultName(static_cast<unsigned int>(diag_feature_init)));
 		std::fflush(stdout);
 		unsigned int available = 0, needs_driver = 0;
 		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &available);

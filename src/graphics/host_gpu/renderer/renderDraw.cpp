@@ -2195,6 +2195,17 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			FrameDump::TraceWrite("draw-rt", d.address, d.address + d.size, "draw", crumb_ps);
 		}
 	}
+	{
+		// NHL27PRESENT: feed the present-stage diagnostic every draw (no-op unless a
+		// colour target is a known flip buffer).
+		uint64_t pd_targets[RENDER_COLOR_ATTACHMENTS_MAX];
+		uint32_t pd_count = 0;
+		for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {
+			pd_targets[pd_count++] = state.colors[i].desc.info.data.address;
+		}
+		PresentDiag::NoteDraw(pd_targets, pd_count, state.ps_active,
+		                      state.ps_active && bindings.pixel ? &bindings.pixel->images : nullptr);
+	}
 	if (FrameDump::Active()) {
 		FrameDump::TargetRef color_refs[RENDER_COLOR_ATTACHMENTS_MAX];
 		for (uint32_t i = 0; i < state.color_count && i < RENDER_COLOR_ATTACHMENTS_MAX; i++) {

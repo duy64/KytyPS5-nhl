@@ -127,6 +127,25 @@ void TraceDispatch(uint64_t cs_hash, uint32_t gx, uint32_t gy, uint32_t gz, cons
                    std::span<const uint8_t> image_written);
 
 } // namespace FrameDump
+
+// NHL27PRESENT: present-stage diagnostic for the two open present defects (whole-frame
+// R/B swap on B-first frames; dark transitions whose final present draws bind only null
+// textures). Always on and logging only -- it never changes rendering. The flip hook
+// records each presented buffer (address + format, learned by role from video-out, never
+// hardcoded) and the draw hook records the last draw into a presented buffer, so a flip
+// can report a present-format change, a final present draw that bound only null
+// textures, and any non-identity component swizzle on a view that draw sampled.
+namespace PresentDiag {
+
+// Called from the renderer's draw recording for every draw. Cheap no-op unless one of
+// the colour targets is a known flip buffer. ps_images may be null.
+void NoteDraw(const uint64_t* color_targets, uint32_t color_target_count, bool ps_active,
+              const std::vector<TextureBinding>* ps_images);
+
+// Called when a video-out flip is prepared, with the buffer being presented.
+void NoteFlip(uint64_t buffer_address, vk::Format format);
+
+} // namespace PresentDiag
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_FRAMEDUMP_H_

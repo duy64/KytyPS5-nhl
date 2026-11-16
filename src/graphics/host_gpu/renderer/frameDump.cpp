@@ -1919,3 +1919,263 @@ void TraceWrite(const char* what, uint64_t begin, uint64_t end, const char* kind
 }
 
 } // namespace Libs::Graphics::FrameDump
+
+// NHL27PRESENT present-stage diagnostic (see frameDump.h). Logging only: nothing in
+// this namespace reads back pixels, touches descriptors or alters any rendering state.
+namespace Libs::Graphics::PresentDiag {
+
+namespace {
+
+constexpr size_t kMaxFlipBuffers = 8;
+constexpr size_t kMaxSampled     = 16;
+constexpr size_t kMaxSwizzleSeen = 32;
+constexpr uint64_t kSummaryEvery = 600;
+
+std::mutex g_pd_mutex;
+
+// Flip buffer addresses for the NoteDraw fast path (mirrors g_pd_buffers under the mutex).
+std::atomic<uint64_t> g_pd_flip_addrs[kMaxFlipBuffers] {};
+std::atomic<uint32_t> g_pd_flip_addr_count {0};
+// Ordinal of every recorded draw; a present draw's index within its frame is derived
+// against the ordinal snapshot taken at the previous flip.
+std::atomic<uint64_t> g_pd_draw_ordinal {0};
+
+struct SampledView {
+	uint64_t             addr        = 0;
+	vk::Format           view_format = vk::Format::eUndefined;
+	vk::ComponentMapping mapping {};
+};
+
+struct LastDraw {
+	bool     valid         = false;
+	uint64_t flips_at_draw = 0; // Flip counter value when the draw was recorded.
+	uint64_t draw_index    = 0; // Ordinal among the draws of its guest frame (1-based).
+	bool     ps_active     = false;
+	bool     all_null      = false;
+	uint32_t slots         = 0;
+	std::array<SampledView, kMaxSampled> sampled {};
+	uint32_t sampled_count = 0;
+};
+
+struct FlipBuffer {
+	uint64_t addr = 0;
+	LastDraw last {};
+};
+
+std::array<FlipBuffer, kMaxFlipBuffers> g_pd_buffers {};
+uint64_t                                g_pd_flips           = 0;
+uint64_t                                g_pd_ordinal_at_flip = 0;
+vk::Format                              g_pd_last_format     = vk::Format::eUndefined;
+bool                                    g_pd_have_format     = false;
+uint64_t                                g_pd_stat_format_flips = 0;
+uint64_t                                g_pd_stat_swizzle      = 0;
+uint64_t                                g_pd_stat_null_frames  = 0;
+uint64_t                                g_pd_summary_from      = 1;
+
+struct SwizzleSeen {
+	uint64_t             addr = 0;
+	vk::ComponentMapping mapping {};
+	bool                 used = false;
+};
+std::array<SwizzleSeen, kMaxSwizzleSeen> g_pd_swizzle_seen {};
+size_t                                   g_pd_swizzle_next = 0;
+
+std::string FormatText(vk::Format format) {
+	auto name = vk::to_string(format);
+	if (format == vk::Format::eA2R10G10B10UnormPack32) {
+		name += " (R-first)";
+	} else if (format == vk::Format::eA2B10G10R10UnormPack32) {
+		name += " (B-first)";
+	}
+	return name;
+}
+
+char SwizzleChar(vk::ComponentSwizzle swizzle, char own) {
+	switch (swizzle) {
+		case vk::ComponentSwizzle::eIdentity: return own;
+		case vk::ComponentSwizzle::eZero: return '0';
+		case vk::ComponentSwizzle::eOne: return '1';
+		case vk::ComponentSwizzle::eR: return 'r';
+		case vk::ComponentSwizzle::eG: return 'g';
+		case vk::ComponentSwizzle::eB: return 'b';
+		case vk::ComponentSwizzle::eA: return 'a';
+		default: return '?';
+	}
+}
+
+// The mapping as four source letters (identity reads "rgba", an R/B swap "bgra").
+std::string MappingText(const vk::ComponentMapping& mapping) {
+	std::string text;
+	text += SwizzleChar(mapping.r, 'r');
+	text += SwizzleChar(mapping.g, 'g');
+	text += SwizzleChar(mapping.b, 'b');
+	text += SwizzleChar(mapping.a, 'a');
+	return text;
+}
+
+bool IsIdentityMapping(const vk::ComponentMapping& mapping) {
+	const auto own = [](vk::ComponentSwizzle swizzle, vk::ComponentSwizzle channel) {
+		return swizzle == vk::ComponentSwizzle::eIdentity || swizzle == channel;
+	};
+	return own(mapping.r, vk::ComponentSwizzle::eR) && own(mapping.g, vk::ComponentSwizzle::eG) &&
+	       own(mapping.b, vk::ComponentSwizzle::eB) && own(mapping.a, vk::ComponentSwizzle::eA);
+}
+
+} // namespace
+
+void NoteDraw(const uint64_t* color_targets, uint32_t color_target_count, bool ps_active,
+              const std::vector<TextureBinding>* ps_images) {
+	const uint64_t ordinal = g_pd_draw_ordinal.fetch_add(1, std::memory_order_relaxed);
+	const uint32_t known   = g_pd_flip_addr_count.load(std::memory_order_relaxed);
+	if (known == 0 || color_targets == nullptr) {
+		return;
+	}
+	size_t hit = kMaxFlipBuffers;
+	for (uint32_t t = 0; t < color_target_count && hit == kMaxFlipBuffers; t++) {
+		if (color_targets[t] == 0) {
+			continue;
+		}
+		for (uint32_t i = 0; i < known; i++) {
+			if (g_pd_flip_addrs[i].load(std::memory_order_relaxed) == color_targets[t]) {
+				hit = i;
+				break;
+			}
+		}
+	}
+	if (hit == kMaxFlipBuffers) {
+		return;
+	}
+
+	LastDraw rec {};
+	rec.valid     = true;
+	rec.ps_active = ps_active;
+	rec.slots     = ps_images != nullptr ? static_cast<uint32_t>(ps_images->size()) : 0;
+	bool any_bound = false;
+	if (ps_images != nullptr) {
+		for (const auto& im : *ps_images) {
+			const uint64_t addr = im.desc.info.data.address;
+			if (addr == 0) {
+				continue;
+			}
+			any_bound = true;
+			if (rec.sampled_count < kMaxSampled) {
+				auto& s        = rec.sampled[rec.sampled_count++];
+				s.addr         = addr;
+				s.view_format  = im.desc.view_info.format;
+				s.mapping      = im.desc.view_info.mapping;
+			}
+		}
+	}
+	// The dark-transition signature: a pixel-shader draw whose every texture slot
+	// resolved to the null descriptor (guest address 0).
+	rec.all_null = ps_active && !any_bound;
+
+	std::lock_guard lock(g_pd_mutex);
+	rec.flips_at_draw = g_pd_flips;
+	rec.draw_index    = ordinal - g_pd_ordinal_at_flip + 1;
+	g_pd_buffers[hit].last = rec;
+}
+
+void NoteFlip(uint64_t buffer_address, vk::Format format) {
+	std::lock_guard lock(g_pd_mutex);
+
+	// Register the presented buffer (fast-path table + per-buffer draw record).
+	size_t slot = kMaxFlipBuffers;
+	for (size_t i = 0; i < kMaxFlipBuffers; i++) {
+		if (g_pd_buffers[i].addr == buffer_address) {
+			slot = i;
+			break;
+		}
+		if (g_pd_buffers[i].addr == 0 && slot == kMaxFlipBuffers) {
+			slot = i;
+		}
+	}
+	if (slot < kMaxFlipBuffers && g_pd_buffers[slot].addr == 0) {
+		g_pd_buffers[slot].addr = buffer_address;
+		g_pd_flip_addrs[slot].store(buffer_address, std::memory_order_relaxed);
+		uint32_t count = 0;
+		for (const auto& b : g_pd_buffers) {
+			count += b.addr != 0 ? 1u : 0u;
+		}
+		g_pd_flip_addr_count.store(count, std::memory_order_relaxed);
+	}
+
+	g_pd_flips++;
+	const uint64_t frame = g_pd_flips;
+
+	if (!g_pd_have_format) {
+		g_pd_have_format = true;
+		std::printf("NHL27PRESENT format frame=%" PRIu64 " addr=0x%" PRIx64 " initial=%s\n", frame,
+		            buffer_address, FormatText(format).c_str());
+		std::fflush(stdout);
+	} else if (format != g_pd_last_format) {
+		g_pd_stat_format_flips++;
+		std::printf("NHL27PRESENT format frame=%" PRIu64 " addr=0x%" PRIx64 " %s -> %s\n", frame,
+		            buffer_address, FormatText(g_pd_last_format).c_str(), FormatText(format).c_str());
+		std::fflush(stdout);
+	}
+	g_pd_last_format = format;
+
+	// Judge the frame that just ended by the last draw into the buffer being flipped.
+	if (slot < kMaxFlipBuffers) {
+		const auto& last = g_pd_buffers[slot].last;
+		if (last.valid && last.flips_at_draw == frame - 1) {
+			if (last.ps_active && last.all_null) {
+				g_pd_stat_null_frames++;
+				std::printf("NHL27PRESENT nullbind frame=%" PRIu64 " draw=%" PRIu64 " slots=%u addr=0x%" PRIx64
+				            "\n",
+				            frame, last.draw_index, last.slots, buffer_address);
+				std::fflush(stdout);
+			}
+			for (uint32_t i = 0; i < last.sampled_count; i++) {
+				const auto& s    = last.sampled[i];
+				SwizzleSeen* seen = nullptr;
+				for (auto& e : g_pd_swizzle_seen) {
+					if (e.used && e.addr == s.addr) {
+						seen = &e;
+						break;
+					}
+				}
+				if (seen == nullptr) {
+					if (!IsIdentityMapping(s.mapping)) {
+						g_pd_stat_swizzle++;
+						std::printf("NHL27PRESENT swizzle frame=%" PRIu64 " slot=%u addr=0x%" PRIx64
+						            " view=%s map=%s (first seen)\n",
+						            frame, i, s.addr, vk::to_string(s.view_format).c_str(),
+						            MappingText(s.mapping).c_str());
+						std::fflush(stdout);
+					}
+					auto& e   = g_pd_swizzle_seen[g_pd_swizzle_next];
+					e.addr    = s.addr;
+					e.mapping = s.mapping;
+					e.used    = true;
+					g_pd_swizzle_next = (g_pd_swizzle_next + 1) % kMaxSwizzleSeen;
+				} else if (!(seen->mapping == s.mapping)) {
+					g_pd_stat_swizzle++;
+					std::printf("NHL27PRESENT swizzle frame=%" PRIu64 " slot=%u addr=0x%" PRIx64
+					            " view=%s map=%s -> %s\n",
+					            frame, i, s.addr, vk::to_string(s.view_format).c_str(),
+					            MappingText(seen->mapping).c_str(), MappingText(s.mapping).c_str());
+					std::fflush(stdout);
+					seen->mapping = s.mapping;
+				}
+			}
+		}
+	}
+
+	if (frame % kSummaryEvery == 0) {
+		std::printf("NHL27PRESENT summary frame=%" PRIu64 " format_flips=%" PRIu64 " swizzle_events=%" PRIu64
+		            " null_frames=%" PRIu64 " since_frame=%" PRIu64 "\n",
+		            frame, g_pd_stat_format_flips, g_pd_stat_swizzle, g_pd_stat_null_frames,
+		            g_pd_summary_from);
+		std::fflush(stdout);
+		g_pd_stat_format_flips = 0;
+		g_pd_stat_swizzle      = 0;
+		g_pd_stat_null_frames  = 0;
+		g_pd_summary_from      = frame + 1;
+	}
+
+	g_pd_ordinal_at_flip = g_pd_draw_ordinal.load(std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::PresentDiag

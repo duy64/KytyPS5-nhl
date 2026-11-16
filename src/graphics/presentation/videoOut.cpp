@@ -18,6 +18,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1199,6 +1200,8 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
+		// NHL27PRESENT: feed the present-stage diagnostic the buffer being presented.
+		Graphics::PresentDiag::NoteFlip(source_info.data.address, source_info.pixel_format);
 		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
 		if (headset) {
 			g_headset_mirror = true;

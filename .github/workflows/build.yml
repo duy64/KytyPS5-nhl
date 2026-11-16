@@ -179,8 +179,6 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
-    # Disabled by default (no macOS builds). Kept for future re-enable: delete this line.
-    if: false
     needs: metadata
     runs-on: macos-15
 

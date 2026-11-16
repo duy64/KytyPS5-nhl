@@ -127,7 +127,7 @@ void NVSDK_CONV NgxLogCallback(const char* message, NVSDK_NGX_Logging_Level, NVS
 
 // Name for an NVSDK_NGX_Result value, so the diag caps line is self-explanatory in a
 // tester log (FeatureInitResult is the discriminator between the remaining theories).
-const char* NgxResultName(unsigned int result) {
+const char* NgxResultName(NVSDK_NGX_Result result) {
 	switch (result) {
 		case NVSDK_NGX_Result_Success: return "Success";
 		case NVSDK_NGX_Result_FAIL_FeatureNotSupported: return "FeatureNotSupported";
@@ -137,8 +137,8 @@ const char* NgxResultName(unsigned int result) {
 		case NVSDK_NGX_Result_FAIL_OutOfDate: return "OutOfDate";
 		case NVSDK_NGX_Result_FAIL_UnableToWriteToAppDataPath: return "UnableToWriteToAppDataPath";
 		case NVSDK_NGX_Result_FAIL_Denied: return "Denied";
+		default: return "Unknown";
 	}
-	return "Unknown";
 }
 
 struct Format {
@@ -339,7 +339,7 @@ struct DlssBridge::Impl {
 		            "min_driver_version=%u.%u feature_init_result=%d (0x%08x %s)\n",
 		            diag_available, diag_needs_driver, diag_min_major, diag_min_minor, diag_feature_init,
 		            static_cast<unsigned int>(diag_feature_init),
-		            NgxResultName(static_cast<unsigned int>(diag_feature_init)));
+		            NgxResultName(static_cast<NVSDK_NGX_Result>(diag_feature_init)));
 		std::fflush(stdout);
 		unsigned int available = 0, needs_driver = 0;
 		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_Available, &available);

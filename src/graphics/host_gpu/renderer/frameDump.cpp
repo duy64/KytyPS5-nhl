@@ -139,10 +139,10 @@ std::set<std::string>    g_seen_buf;
 //  - Late-frame starvation: collection order is draw order, so a byte budget
 //    spent first-come on early multi-megabyte textures used to cut off the
 //    small UI textures bound late (leaders-board logos at draws ~4500-6300).
-//    Collection therefore takes every eligible descriptor, and the worker
-//    admits candidates SMALLEST FIRST under the byte/count budgets, writing
-//    the rest as SKIPPED (over guesttex budget) index lines, so a small
-//    texture is recorded whenever it fits at all.
+//    Collection therefore takes every eligible descriptor; the worker
+//    admits in-frame candidates SMALLEST FIRST, then session-record
+//    candidates in first-upload order, under the byte/count budgets,
+//    writing the rest as SKIPPED (over guesttex budget) index lines.
 struct GuestTexReq {
 	uint64_t    addr      = 0;
 	uint64_t    size      = 0;
@@ -152,6 +152,7 @@ struct GuestTexReq {
 	uint32_t    w = 0, h = 0, d = 0;
 	uint32_t    levels = 0, layers = 0;
 	uint32_t    tile_mode = 0;
+	uint32_t    upload_order = 0; // session record: order of the first upload at this address
 };
 std::vector<GuestTexReq>                g_guesttex;
 std::set<std::pair<uint64_t, uint64_t>> g_seen_guesttex; // (address, size)
@@ -162,7 +163,10 @@ constexpr size_t   kGuestTexMaxCount   = 4096;         // files per capture (wor
 constexpr size_t   kGuestTexMaxCollect = 8192;         // candidate descriptors per capture
 
 // Session record of guest texture uploads (descriptors only), keyed by guest
-// address: a re-upload at the same address replaces the entry. Fed by
+// address: a re-upload at the same address replaces the entry but keeps its
+// first-upload order (GuestTexReq::upload_order), which the worker's
+// admission uses to reach early uploads (e.g. a hub photo taken during a
+// menu load) before the thousands of small uploads that follow them. Fed by
 // NoteTextureUpload under its own mutex — the texture cache calls it with the
 // cache lock held, so it must never wait on g_mutex. Once the record is full,
 // existing addresses can still be replaced but new ones are dropped (logged
@@ -171,6 +175,7 @@ std::map<uint64_t, GuestTexReq> g_guesttex_session;
 std::mutex                      g_guesttex_session_mutex;
 constexpr size_t                kGuestTexSessionMax       = 16384;
 bool                            g_guesttex_session_full   = false; // under g_guesttex_session_mutex
+uint32_t                        g_guesttex_session_uploads = 0;    // under g_guesttex_session_mutex
 
 // ---- async download: finished captures are handed to a worker thread ----
 // The flip thread records a capture and waits only for the GPU copies
@@ -820,16 +825,34 @@ void CollectGuestTex(uint32_t seq, const TextureBinding& b) {
 // index. Runs on the download worker thread (ProcessJob).
 void ProcessGuestTex(CaptureJob& job) {
 	if (job.guesttex.empty()) return;
-	// Admission under the byte/count budgets, SMALLEST FIRST: collection order
-	// is draw order, so first-come admission let early multi-megabyte textures
-	// starve the small UI textures bound late in the frame. Candidates that do
-	// not fit are still listed in the index as SKIPPED (over guesttex budget).
-	std::vector<size_t> order(job.guesttex.size());
-	for (size_t i = 0; i < order.size(); i++) order[i] = i;
+	// Admission under the byte/count budgets, in two classes. In-frame
+	// candidates (seq != 0) go first, SMALLEST FIRST: collection order is
+	// draw order, so first-come admission let early multi-megabyte textures
+	// starve the small UI textures bound late in the frame. Session-record
+	// candidates (seq == 0) follow in UPLOAD ORDER (first upload at their
+	// address): the textures the record exists for were uploaded early —
+	// a hub photo during a menu load — and thousands of later small uploads
+	// would bury them under any size order. Candidates that do not fit are
+	// still listed in the index as SKIPPED (over guesttex budget).
+	std::vector<size_t> order;
+	order.reserve(job.guesttex.size());
+	for (size_t i = 0; i < job.guesttex.size(); i++) {
+		if (job.guesttex[i].seq != 0) order.push_back(i);
+	}
 	std::sort(order.begin(), order.end(), [&job](size_t a, size_t b) {
 		if (job.guesttex[a].size != job.guesttex[b].size) return job.guesttex[a].size < job.guesttex[b].size;
 		return a < b;
 	});
+	std::vector<size_t> session;
+	for (size_t i = 0; i < job.guesttex.size(); i++) {
+		if (job.guesttex[i].seq == 0) session.push_back(i);
+	}
+	std::sort(session.begin(), session.end(), [&job](size_t a, size_t b) {
+		if (job.guesttex[a].upload_order != job.guesttex[b].upload_order)
+			return job.guesttex[a].upload_order < job.guesttex[b].upload_order;
+		return a < b;
+	});
+	order.insert(order.end(), session.begin(), session.end());
 	std::vector<bool> admit(job.guesttex.size(), false);
 	uint64_t          total_bytes = 0;
 	uint64_t          admit_bytes = 0;
@@ -1574,7 +1597,8 @@ void NoteTextureUpload(const ImageInfo& info) {
 	std::lock_guard lock(g_guesttex_session_mutex);
 	const auto      it = g_guesttex_session.find(addr);
 	if (it != g_guesttex_session.end()) {
-		it->second = std::move(r); // a re-upload at the same address replaces the entry
+		r.upload_order = it->second.upload_order; // first-upload order survives replacement
+		it->second     = std::move(r); // a re-upload at the same address replaces the entry
 		return;
 	}
 	if (g_guesttex_session.size() >= kGuestTexSessionMax) {
@@ -1587,6 +1611,7 @@ void NoteTextureUpload(const ImageInfo& info) {
 		}
 		return;
 	}
+	r.upload_order = g_guesttex_session_uploads++;
 	g_guesttex_session.emplace(addr, std::move(r));
 }
 

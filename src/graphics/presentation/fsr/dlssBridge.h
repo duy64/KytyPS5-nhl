@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -23,31 +24,38 @@ struct DlssParams {
 // DLSS Super Resolution for the Vulkan renderer (KYTY_DLSS=1, Windows, builds with
 // KYTY_ENABLE_DLSS).
 //
-// NGX ships DLSS for DirectX 12, so this runs it on a small D3D12 device on the same
-// graphics card, exactly like the FSR 4 bridge: five images are shared between the two
-// APIs (D3D12 resources imported into Vulkan): colour, depth, motion and an unused
-// reactive slot at render size, output at display size. A D3D12 fence imported as a
-// Vulkan timeline semaphore orders the work on the GPU:
-//   Vulkan copies the inputs in and signals `wait_value` -> D3D12 waits for it, runs DLSS
-//   and signals `signal_value` -> the next Vulkan submission waits for that before copying
-//   the output.
-// Shared images stay in VK_IMAGE_LAYOUT_GENERAL on the Vulkan side and are released to /
-// acquired from VK_QUEUE_FAMILY_EXTERNAL around the D3D12 work.
+// Since build #179 NGX runs through its Vulkan API on the emulator's own instance,
+// physical device and device -- the ones that render and present the game. (The D3D12
+// bridge used before initialized NGX on a private side device that never rendered;
+// NGX answered SuperSampling_Available=1 there but feature creation died with
+// PlatformError when the DLSS feature tried to create its kernels on that device --
+// Falcon's #176 log. Both working DLSS integrations, hilals' bbport bridge for
+// nhl24pc and upstream KytyPS5's DLSS, use Vulkan NGX on the rendering device.)
+//
+// The bridge owns five plain Vulkan images (colour, depth, motion and an unused
+// reactive slot at render size, output at display size), each with a view for NGX.
+// The caller copies the inputs in, releases the images to VK_QUEUE_FAMILY_EXTERNAL
+// and signals the bridge timeline semaphore; Dispatch() then records the NGX
+// evaluation into a bridge command buffer -- acquiring the images back from
+// VK_QUEUE_FAMILY_EXTERNAL -- and submits it on the graphics queue between the
+// caller's two submissions, waiting for the first timeline value and signalling the
+// second, after releasing the images to VK_QUEUE_FAMILY_EXTERNAL again so the caller
+// can acquire the output. The images stay in VK_IMAGE_LAYOUT_GENERAL throughout.
 class DlssBridge final {
 public:
 	enum ImageIndex : int { Color = 0, Depth = 1, Motion = 2, Output = 3, Reactive = 4, Count = 5 };
 
 	explicit DlssBridge(GraphicContext& graphics);
-	~DlssBridge(); // The Vulkan owner must have finished all work that uses the shared images.
+	~DlssBridge(); // The Vulkan owner must have finished all work that uses the bridge images.
 	DlssBridge(const DlssBridge&)            = delete;
 	DlssBridge& operator=(const DlssBridge&) = delete;
 
 	// False once anything failed; Status() says what. The caller then falls back.
 	[[nodiscard]] bool Usable() const;
 	[[nodiscard]] const std::string& Status() const;
-	// True when Ensure() would recreate the shared images (the caller waits for Vulkan first).
+	// True when Ensure() would recreate the bridge images (the caller waits for Vulkan first).
 	[[nodiscard]] bool NeedsRecreate(vk::Extent2D render, vk::Extent2D display) const;
-	// Creates (or recreates) the shared images and the DLSS feature for these sizes.
+	// Creates (or recreates) the bridge images and the DLSS feature for these sizes.
 	[[nodiscard]] bool Ensure(vk::Extent2D render, vk::Extent2D display);
 	// True for the first frame after Ensure() created the images (their Vulkan layout is undefined).
 	[[nodiscard]] bool Fresh() const;
@@ -55,10 +63,10 @@ public:
 
 	[[nodiscard]] vk::Image Image(int index) const;
 	[[nodiscard]] vk::Semaphore Semaphore() const;
-	// The two timeline values for the next frame: first = Vulkan signals, second = D3D12 signals.
+	// The two timeline values for the next frame: first = Vulkan signals, second = the bridge signals.
 	[[nodiscard]] std::pair<uint64_t, uint64_t> NextValues();
 
-	// Queues the D3D12 work: wait for wait_value, DLSS, signal signal_value.
+	// Queues the NGX evaluation: wait for wait_value, DLSS, signal signal_value.
 	enum class Result {
 		NotQueued, // nothing will signal signal_value: the caller must not wait for it
 		Failed,    // signal_value will be signalled, but the output holds no new frame
@@ -70,5 +78,16 @@ private:
 	struct Impl;
 	std::unique_ptr<Impl> m;
 };
+
+// NGX needs its own Vulkan extensions on the instance and device it initializes
+// against, so window creation calls these while building the extension lists. Both
+// honour the same KYTY_DLSS=1 gate as the interception and are no-ops in builds
+// without DLSS (or when NGX cannot be queried, e.g. no NVIDIA driver): the bridge
+// then simply fails its capability check at run time and the caller falls back.
+void DlssAppendInstanceExtensions(std::vector<const char*>& extensions,
+                                  const std::vector<vk::ExtensionProperties>& available);
+void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
+                                const std::vector<vk::ExtensionProperties>& available,
+                                std::vector<const char*>& extensions);
 
 } // namespace Libs::Graphics

@@ -2,6 +2,7 @@
 
 #include "graphics/host_gpu/graphicContext.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -16,15 +17,11 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#include <d3d12.h>
-#include <dxgi1_6.h>
-#include <wrl/client.h>
-#include <vulkan/vulkan_win32.h>
+
 #include "nvsdk_ngx.h"
 #include "nvsdk_ngx_params.h"
-#include "nvsdk_ngx_helpers_d3d.h"
-#pragma comment(lib, "d3d12.lib")
-#pragma comment(lib, "dxgi.lib")
+#include "nvsdk_ngx_vk.h"
+#include "nvsdk_ngx_helpers_vk.h"
 #else
 #define KYTY_DLSS_BRIDGE 0
 #endif
@@ -33,7 +30,6 @@ namespace Libs::Graphics {
 
 #if KYTY_DLSS_BRIDGE
 namespace {
-using Microsoft::WRL::ComPtr;
 
 // Self-generated NGX project ID for KyTy (the driver only checks that it is GUID-like;
 // NVSDK_NGX_ENGINE_TYPE_CUSTOM is the documented path without an NVIDIA-issued app ID).
@@ -109,10 +105,10 @@ NVSDK_NGX_PerfQuality_Value PickQuality(float ratio) {
 }
 
 std::wstring AppDirectory() {
-	wchar_t path[MAX_PATH] {};
-	const DWORD n = GetModuleFileNameW(nullptr, path, MAX_PATH);
+	wchar_t      path[MAX_PATH] {};
+	const DWORD  n = GetModuleFileNameW(nullptr, path, MAX_PATH);
 	std::wstring dir(path, n);
-	const auto slash = dir.find_last_of(L"\\/");
+	const auto   slash = dir.find_last_of(L"\\/");
 	if (slash != std::wstring::npos) dir.resize(slash + 1);
 	return dir;
 }
@@ -141,17 +137,46 @@ const char* NgxResultName(NVSDK_NGX_Result result) {
 	}
 }
 
-struct Format {
-	DXGI_FORMAT dxgi;
-	VkFormat    vk;
+// Bridge image formats, unchanged from the D3D12 bridge: guest colour is B10G11R11,
+// depth float, motion RG16F, output RGBA16F, reactive R8.
+constexpr std::array<VkFormat, DlssBridge::Count> kFormats = {VK_FORMAT_B10G11R11_UFLOAT_PACK32, VK_FORMAT_R32_SFLOAT,
+                                                              VK_FORMAT_R16G16_SFLOAT,
+                                                              VK_FORMAT_R16G16B16A16_SFLOAT, VK_FORMAT_R8_UNORM};
+
+// The same KYTY_DLSS=1 gate as the guest FSR 3.1 interception (nhl27Fsr3.cpp), read
+// directly: window creation happens before any bridge exists.
+bool DlssWanted() {
+	const char* value = std::getenv("KYTY_DLSS");
+	return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+// The one NGX feature description shared by the window-creation extension queries
+// (which must run before NGX is initialized) and by Init(): same project ID, data
+// path and FeatureCommonInfo, so the extensions enabled at device creation always
+// match the feature NGX is later asked to create.
+struct NgxDiscovery {
+	std::wstring                   data_path    = AppDirectory();
+	const wchar_t*                 feature_path = data_path.c_str();
+	NVSDK_NGX_FeatureCommonInfo    common {};
+	NVSDK_NGX_FeatureDiscoveryInfo info {};
+
+	NgxDiscovery() {
+		common.PathListInfo            = {&feature_path, 1};
+		common.LoggingInfo             = {NgxLogCallback, NVSDK_NGX_LOGGING_LEVEL_VERBOSE, false};
+		info.SDKVersion                = NVSDK_NGX_Version_API;
+		info.FeatureID                 = NVSDK_NGX_Feature_SuperSampling;
+		info.Identifier.IdentifierType = NVSDK_NGX_Application_Identifier_Type_Project_Id;
+		info.Identifier.v.ProjectDesc  = {kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0"};
+		info.ApplicationDataPath       = data_path.c_str();
+		info.FeatureInfo               = &common;
+	}
 };
-constexpr std::array<Format, DlssBridge::Count> kFormats {{
-    {DXGI_FORMAT_R11G11B10_FLOAT, VK_FORMAT_B10G11R11_UFLOAT_PACK32},
-    {DXGI_FORMAT_R32_FLOAT, VK_FORMAT_R32_SFLOAT},
-    {DXGI_FORMAT_R16G16_FLOAT, VK_FORMAT_R16G16_SFLOAT},
-    {DXGI_FORMAT_R16G16B16A16_FLOAT, VK_FORMAT_R16G16B16A16_SFLOAT},
-    {DXGI_FORMAT_R8_UNORM, VK_FORMAT_R8_UNORM},
-}};
+
+const NgxDiscovery& Discovery() {
+	static const NgxDiscovery discovery;
+	return discovery;
+}
+
 } // namespace
 #endif
 
@@ -176,46 +201,39 @@ struct DlssBridge::Impl {
 #if KYTY_DLSS_BRIDGE
 	static constexpr int Ring = 3;
 	struct Shared {
-		ComPtr<ID3D12Resource> resource;
-		VkImage                image  = VK_NULL_HANDLE;
-		VkDeviceMemory         memory = VK_NULL_HANDLE;
+		VkImage               image  = VK_NULL_HANDLE;
+		VkDeviceMemory        memory = VK_NULL_HANDLE;
+		VkImageView           view   = VK_NULL_HANDLE;
+		NVSDK_NGX_Resource_VK resource {};
 	};
 
-	ComPtr<ID3D12Device>                             device;
-	ComPtr<ID3D12CommandQueue>                       queue;
-	std::array<ComPtr<ID3D12CommandAllocator>, Ring> allocators;
-	std::array<uint64_t, Ring>                       allocator_value {};
-	ComPtr<ID3D12GraphicsCommandList>                list;
-	int                                              ring = 0;
-	ComPtr<ID3D12Fence>                              fence;
-	HANDLE                                           event = nullptr;
-	VkSemaphore                                      semaphore = VK_NULL_HANDLE;
-	std::array<Shared, Count>                        shared {};
-	uint64_t                                         last_signal = 0;
-	uint64_t                                         dispatched  = 0;
-	PFN_vkGetMemoryWin32HandlePropertiesKHR          get_handle_properties = nullptr;
-	PFN_vkImportSemaphoreWin32HandleKHR              import_semaphore      = nullptr;
+	VkCommandPool                     pool          = VK_NULL_HANDLE;
+	std::array<VkCommandBuffer, Ring> buffers {};
+	VkCommandBuffer                   create_buffer = VK_NULL_HANDLE;
+	std::array<uint64_t, Ring>        buffer_value {};
+	int                               ring = 0;
+	VkSemaphore                       semaphore = VK_NULL_HANDLE;
+	std::array<Shared, Count>         shared {};
+	uint64_t                          last_signal = 0;
+	uint64_t                          dispatched  = 0;
 
-	// NGX state (one instance for this D3D12 device).
-	bool                  ngx_ready = false;
-	NVSDK_NGX_Parameter*  capability_params = nullptr;
-	NVSDK_NGX_Parameter*  params            = nullptr;
-	NVSDK_NGX_Handle*     feature           = nullptr;
-	NVSDK_NGX_PerfQuality_Value quality     = NVSDK_NGX_PerfQuality_Value_MaxQuality;
+	// NGX state (one instance for the rendering device).
+	bool                        ngx_ready         = false;
+	NVSDK_NGX_Parameter*        capability_params = nullptr;
+	NVSDK_NGX_Parameter*        params            = nullptr;
+	NVSDK_NGX_Handle*           feature           = nullptr;
+	NVSDK_NGX_PerfQuality_Value quality           = NVSDK_NGX_PerfQuality_Value_MaxQuality;
 
-	[[nodiscard]] VkDevice Vk() const { return static_cast<VkDevice>(graphics.device); }
+	[[nodiscard]] VkDevice Vk() const {
+		return static_cast<VkDevice>(graphics.device);
+	}
 
 	bool Init() {
 		const VkDevice vk_device = Vk();
-		get_handle_properties = reinterpret_cast<PFN_vkGetMemoryWin32HandlePropertiesKHR>(
-		    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(vk_device, "vkGetMemoryWin32HandlePropertiesKHR"));
-		import_semaphore = reinterpret_cast<PFN_vkImportSemaphoreWin32HandleKHR>(
-		    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr(vk_device, "vkImportSemaphoreWin32HandleKHR"));
-		if (get_handle_properties == nullptr || import_semaphore == nullptr) {
-			return Fail("VK_KHR_external_memory_win32 / VK_KHR_external_semaphore_win32 not enabled");
-		}
 
-		// The D3D12 device must be on the same graphics card as the Vulkan device.
+		// The adapter NGX will initialize against is the Vulkan physical device
+		// itself now (no second device to match by LUID); the LUID is still printed
+		// so the line ties to the Windows adapter list in the same log.
 		VkPhysicalDeviceIDProperties id {};
 		id.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
 		VkPhysicalDeviceProperties2 properties {};
@@ -228,76 +246,12 @@ struct DlssBridge::Impl {
 		}
 		LUID luid {};
 		std::memcpy(&luid, id.deviceLUID, sizeof(luid));
-		ComPtr<IDXGIFactory4> factory;
-		if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) {
-			return Fail("CreateDXGIFactory1");
-		}
-		ComPtr<IDXGIAdapter1> adapter;
-		if (FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))) {
-			return Fail("no DXGI adapter with the Vulkan device's LUID");
-		}
-		DXGI_ADAPTER_DESC1 adapter_desc {};
-		if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
-			char adapter_name[128] {};
-			WideCharToMultiByte(CP_UTF8, 0, adapter_desc.Description, -1, adapter_name,
-			                    static_cast<int>(sizeof(adapter_name)), nullptr, nullptr);
-			std::printf("NHL27DLSS diag adapter=\"%s\" luid=%08x:%08x vendor=0x%04x device=0x%04x\n",
-			            adapter_name, static_cast<unsigned int>(adapter_desc.AdapterLuid.HighPart),
-			            static_cast<unsigned int>(adapter_desc.AdapterLuid.LowPart),
-			            static_cast<unsigned int>(adapter_desc.VendorId),
-			            static_cast<unsigned int>(adapter_desc.DeviceId));
-			std::fflush(stdout);
-		}
-		if (FAILED(D3D12CreateDevice(adapter.Get(), D3D_FEATURE_LEVEL_12_0, IID_PPV_ARGS(&device)))) {
-			return Fail("D3D12CreateDevice");
-		}
-		D3D12_COMMAND_QUEUE_DESC queue_desc {};
-		queue_desc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-		if (FAILED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue)))) {
-			return Fail("CreateCommandQueue");
-		}
-		for (auto& allocator: allocators) {
-			if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator)))) {
-				return Fail("CreateCommandAllocator");
-			}
-		}
-		if (FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocators[0].Get(), nullptr,
-		                                     IID_PPV_ARGS(&list))) ||
-		    FAILED(list->Close())) {
-			return Fail("CreateCommandList");
-		}
-		event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-
-		// Shared fence -> Vulkan timeline semaphore.
-		if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence)))) {
-			return Fail("CreateFence");
-		}
-		HANDLE fence_handle = nullptr;
-		if (FAILED(device->CreateSharedHandle(fence.Get(), nullptr, GENERIC_ALL, nullptr, &fence_handle))) {
-			return Fail("CreateSharedHandle(fence)");
-		}
-		VkSemaphoreTypeCreateInfo timeline {};
-		timeline.sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
-		timeline.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
-		timeline.initialValue  = 0;
-		VkSemaphoreCreateInfo semaphore_info {};
-		semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
-		semaphore_info.pNext = &timeline;
-		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateSemaphore(vk_device, &semaphore_info, nullptr, &semaphore) !=
-		    VK_SUCCESS) {
-			CloseHandle(fence_handle);
-			return Fail("vkCreateSemaphore");
-		}
-		VkImportSemaphoreWin32HandleInfoKHR import {};
-		import.sType      = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR;
-		import.semaphore  = semaphore;
-		import.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
-		import.handle     = fence_handle;
-		const VkResult imported = import_semaphore(vk_device, &import);
-		CloseHandle(fence_handle);
-		if (imported != VK_SUCCESS) {
-			return Fail("vkImportSemaphoreWin32HandleKHR");
-		}
+		const auto& device_properties = graphics.physical_device_properties;
+		std::printf("NHL27DLSS diag adapter=\"%s\" luid=%08x:%08x vendor=0x%04x device=0x%04x\n",
+		            device_properties.deviceName.data(), static_cast<unsigned int>(luid.HighPart),
+		            static_cast<unsigned int>(luid.LowPart), static_cast<unsigned int>(device_properties.vendorID),
+		            static_cast<unsigned int>(device_properties.deviceID));
+		std::fflush(stdout);
 
 		// NGX itself: the driver-side NGX Core loads the signed nvngx_dlss.dll from the
 		// emulator's folder (installed there by CMake). The data path holds NGX logs and
@@ -305,24 +259,25 @@ struct DlssBridge::Impl {
 		// folder explicitly and registers the log callback: a nullptr info leaves the
 		// feature-DLL discovery to the default search only and gives NGX no log voice,
 		// while both working NGX integrations (hilals' bridge, upstream KytyPS5) pass it.
-		const std::wstring          data_path = AppDirectory();
-		const wchar_t*              feature_path = data_path.c_str();
-		NVSDK_NGX_FeatureCommonInfo feature_info {};
-		feature_info.PathListInfo = {&feature_path, 1};
-		feature_info.LoggingInfo  = {NgxLogCallback, NVSDK_NGX_LOGGING_LEVEL_VERBOSE, false};
-		const auto inited = NVSDK_NGX_D3D12_Init_with_ProjectID(kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0",
-		                                                        data_path.c_str(), device.Get(), &feature_info);
+		// The discovery description is shared with the window-creation extension
+		// queries, so the device was created with the extensions this feature needs.
+		const auto& discovery = Discovery();
+		const auto  inited    = NVSDK_NGX_VULKAN_Init_with_ProjectID(
+            kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, "1.0", discovery.data_path.c_str(),
+            static_cast<VkInstance>(graphics.instance), static_cast<VkPhysicalDevice>(graphics.physical_device),
+            vk_device, VULKAN_HPP_DEFAULT_DISPATCHER.vkGetInstanceProcAddr,
+            VULKAN_HPP_DEFAULT_DISPATCHER.vkGetDeviceProcAddr, &discovery.common);
 		std::printf("NHL27DLSS diag ngx_init result=%d (0x%08x) project_id=%s engine_type=%d\n",
 		            static_cast<int>(inited), static_cast<unsigned int>(inited), kProjectId,
 		            static_cast<int>(NVSDK_NGX_ENGINE_TYPE_CUSTOM));
 		std::fflush(stdout);
 		if (inited != NVSDK_NGX_Result_Success) {
-			return Fail("NVSDK_NGX_D3D12_Init_with_ProjectID returned " + std::to_string(inited));
+			return Fail("NVSDK_NGX_VULKAN_Init_with_ProjectID returned " + std::to_string(inited));
 		}
 		ngx_ready = true;
-		if (NVSDK_NGX_D3D12_GetCapabilityParameters(&capability_params) != NVSDK_NGX_Result_Success ||
+		if (NVSDK_NGX_VULKAN_GetCapabilityParameters(&capability_params) != NVSDK_NGX_Result_Success ||
 		    capability_params == nullptr) {
-			return Fail("NVSDK_NGX_D3D12_GetCapabilityParameters");
+			return Fail("NVSDK_NGX_VULKAN_GetCapabilityParameters");
 		}
 		// Diagnostics (#174): dump every SuperSampling capability value NGX reports, so one
 		// tester log shows whether the gate is the adapter, the driver, or per-app
@@ -346,132 +301,140 @@ struct DlssBridge::Impl {
 		capability_params->Get(NVSDK_NGX_Parameter_SuperSampling_NeedsUpdatedDriver, &needs_driver);
 		if (available == 0) {
 			return Fail(needs_driver != 0 ? "DLSS needs a newer NVIDIA driver"
-			                              : "DLSS Super Sampling is not available on this GPU");
+		                              : "DLSS Super Sampling is not available on this GPU");
 		}
-		if (NVSDK_NGX_D3D12_AllocateParameters(&params) != NVSDK_NGX_Result_Success || params == nullptr) {
-			return Fail("NVSDK_NGX_D3D12_AllocateParameters");
+		if (NVSDK_NGX_VULKAN_AllocateParameters(&params) != NVSDK_NGX_Result_Success || params == nullptr) {
+			return Fail("NVSDK_NGX_VULKAN_AllocateParameters");
 		}
 		(void)GetTuning();
+
+		VkCommandPoolCreateInfo pool_info {};
+		pool_info.sType            = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+		pool_info.flags            = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+		pool_info.queueFamilyIndex = graphics.queue_family;
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateCommandPool(vk_device, &pool_info, nullptr, &pool) != VK_SUCCESS) {
+			return Fail("vkCreateCommandPool");
+		}
+		std::array<VkCommandBuffer, Ring + 1> allocated {};
+		VkCommandBufferAllocateInfo           alloc_info {};
+		alloc_info.sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		alloc_info.commandPool        = pool;
+		alloc_info.level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		alloc_info.commandBufferCount = static_cast<uint32_t>(allocated.size());
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateCommandBuffers(vk_device, &alloc_info, allocated.data()) !=
+		    VK_SUCCESS) {
+			return Fail("vkAllocateCommandBuffers");
+		}
+		std::copy(allocated.begin(), allocated.begin() + Ring, buffers.begin());
+		create_buffer = allocated[Ring];
+
+		// A plain timeline semaphore orders the bridge with the caller (the D3D12
+		// bridge imported its fence into one; on one device no import is needed).
+		VkSemaphoreTypeCreateInfo timeline {};
+		timeline.sType         = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+		timeline.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+		timeline.initialValue  = 0;
+		VkSemaphoreCreateInfo semaphore_info {};
+		semaphore_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO;
+		semaphore_info.pNext = &timeline;
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateSemaphore(vk_device, &semaphore_info, nullptr, &semaphore) !=
+		    VK_SUCCESS) {
+			return Fail("vkCreateSemaphore");
+		}
 		status = "DLSS ready";
 		return true;
 	}
 
 	void WaitIdle() {
-		if (fence && last_signal != 0 && fence->GetCompletedValue() < last_signal) {
-			fence->SetEventOnCompletion(last_signal, event);
-			WaitForSingleObject(event, 5000);
+		if (semaphore != VK_NULL_HANDLE && last_signal != 0) {
+			VkSemaphoreWaitInfo wait {};
+			wait.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+			wait.semaphoreCount = 1;
+			wait.pSemaphores    = &semaphore;
+			wait.pValues        = &last_signal;
+			VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitSemaphores(Vk(), &wait, 5000000000ull);
 		}
 	}
 
 	void Release() {
 		WaitIdle();
 		if (feature != nullptr) {
-			NVSDK_NGX_D3D12_ReleaseFeature(feature);
+			NVSDK_NGX_VULKAN_ReleaseFeature(feature);
 			feature = nullptr;
 		}
 		const VkDevice vk_device = Vk();
 		for (auto& s: shared) {
+			if (s.view != VK_NULL_HANDLE) VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImageView(vk_device, s.view, nullptr);
 			if (s.image != VK_NULL_HANDLE) VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyImage(vk_device, s.image, nullptr);
 			if (s.memory != VK_NULL_HANDLE) VULKAN_HPP_DEFAULT_DISPATCHER.vkFreeMemory(vk_device, s.memory, nullptr);
 			s = {};
 		}
-		render  = {};
-		display = {};
+		render  = vk::Extent2D {};
+		display = vk::Extent2D {};
 	}
 
-	bool CreateShared(int index, vk::Extent2D extent) {
-		auto& s = shared[index];
-		D3D12_RESOURCE_DESC desc {};
-		desc.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-		desc.Width            = extent.width;
-		desc.Height           = extent.height;
-		desc.DepthOrArraySize = 1;
-		desc.MipLevels        = 1;
-		desc.Format           = kFormats[index].dxgi;
-		desc.SampleDesc.Count = 1;
-		desc.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		desc.Flags            = index == Output ? D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS : D3D12_RESOURCE_FLAG_NONE;
-		D3D12_HEAP_PROPERTIES heap {};
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-		if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &desc, D3D12_RESOURCE_STATE_COMMON,
-		                                           nullptr, IID_PPV_ARGS(&s.resource)))) {
-			return Fail("CreateCommittedResource(shared)");
-		}
-		HANDLE handle = nullptr;
-		if (FAILED(device->CreateSharedHandle(s.resource.Get(), nullptr, GENERIC_ALL, nullptr, &handle))) {
-			return Fail("CreateSharedHandle(image)");
-		}
+	bool CreateImage(int index, vk::Extent2D extent) {
+		auto&          s         = shared[index];
 		const VkDevice vk_device = Vk();
-		VkExternalMemoryImageCreateInfo external {};
-		external.sType       = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
-		external.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
 		VkImageCreateInfo info {};
 		info.sType         = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-		info.pNext         = &external;
 		info.imageType     = VK_IMAGE_TYPE_2D;
-		info.format        = kFormats[index].vk;
+		info.format        = kFormats[index];
 		info.extent        = {extent.width, extent.height, 1};
 		info.mipLevels     = 1;
 		info.arrayLayers   = 1;
 		info.samples       = VK_SAMPLE_COUNT_1_BIT;
 		info.tiling        = VK_IMAGE_TILING_OPTIMAL;
 		info.usage         = index == Output ? (VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_STORAGE_BIT)
-		                                     : VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+		                                     : (VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
 		info.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
 		info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateImage(vk_device, &info, nullptr, &s.image) != VK_SUCCESS) {
-			CloseHandle(handle);
-			return Fail("vkCreateImage(external)");
+			return Fail("vkCreateImage");
 		}
 		VkMemoryRequirements requirements {};
 		VULKAN_HPP_DEFAULT_DISPATCHER.vkGetImageMemoryRequirements(vk_device, s.image, &requirements);
-		VkMemoryWin32HandlePropertiesKHR handle_properties {};
-		handle_properties.sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR;
-		uint32_t type_bits      = requirements.memoryTypeBits;
-		if (get_handle_properties(vk_device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT, handle,
-		                          &handle_properties) == VK_SUCCESS &&
-		    (handle_properties.memoryTypeBits & type_bits) != 0) {
-			type_bits &= handle_properties.memoryTypeBits;
-		}
 		VkPhysicalDeviceMemoryProperties memory_properties {};
 		VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceMemoryProperties(
 		    static_cast<VkPhysicalDevice>(graphics.physical_device), &memory_properties);
 		uint32_t type = UINT32_MAX;
 		for (uint32_t i = 0; i < memory_properties.memoryTypeCount && type == UINT32_MAX; ++i) {
-			if ((type_bits & (1u << i)) != 0 &&
+			if ((requirements.memoryTypeBits & (1u << i)) != 0 &&
 			    (memory_properties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) {
 				type = i;
 			}
 		}
 		for (uint32_t i = 0; i < memory_properties.memoryTypeCount && type == UINT32_MAX; ++i) {
-			if ((type_bits & (1u << i)) != 0) type = i;
+			if ((requirements.memoryTypeBits & (1u << i)) != 0) type = i;
 		}
 		if (type == UINT32_MAX) {
-			CloseHandle(handle);
-			return Fail("no memory type for the shared image");
+			return Fail("no memory type for the bridge image");
 		}
-		VkMemoryDedicatedAllocateInfo dedicated {};
-		dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
-		dedicated.image = s.image;
-		VkImportMemoryWin32HandleInfoKHR import {};
-		import.sType      = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
-		import.pNext      = &dedicated;
-		import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT;
-		import.handle     = handle;
 		VkMemoryAllocateInfo allocate {};
 		allocate.sType           = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-		allocate.pNext           = &import;
 		allocate.allocationSize  = requirements.size;
 		allocate.memoryTypeIndex = type;
-		const VkResult allocated =
-		    VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(vk_device, &allocate, nullptr, &s.memory);
-		CloseHandle(handle);
-		if (allocated != VK_SUCCESS) {
-			return Fail("vkAllocateMemory(import D3D12 resource)");
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkAllocateMemory(vk_device, &allocate, nullptr, &s.memory) != VK_SUCCESS) {
+			return Fail("vkAllocateMemory");
 		}
 		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkBindImageMemory(vk_device, s.image, s.memory, 0) != VK_SUCCESS) {
-			return Fail("vkBindImageMemory(shared)");
+			return Fail("vkBindImageMemory");
 		}
+		VkImageSubresourceRange range {};
+		range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		range.levelCount = 1;
+		range.layerCount = 1;
+		VkImageViewCreateInfo view_info {};
+		view_info.sType            = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+		view_info.image            = s.image;
+		view_info.viewType         = VK_IMAGE_VIEW_TYPE_2D;
+		view_info.format           = kFormats[index];
+		view_info.subresourceRange = range;
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateImageView(vk_device, &view_info, nullptr, &s.view) != VK_SUCCESS) {
+			return Fail("vkCreateImageView");
+		}
+		s.resource = NVSDK_NGX_Create_ImageView_Resource_VK(s.view, s.image, range, kFormats[index], extent.width,
+		                                                    extent.height, index == Output);
 		return true;
 	}
 
@@ -480,7 +443,7 @@ struct DlssBridge::Impl {
 		if (render == new_render && display == new_display && feature != nullptr) return true;
 		Release();
 		for (int i = 0; i < Count; ++i) {
-			if (!CreateShared(i, i == Output ? new_display : new_render)) return false;
+			if (!CreateImage(i, i == Output ? new_display : new_render)) return false;
 		}
 		const float ratio = float(new_display.width) / float(new_render.width);
 		quality           = PickQuality(ratio);
@@ -495,31 +458,49 @@ struct DlssBridge::Impl {
 		                              NVSDK_NGX_DLSS_Feature_Flags_DepthInverted |
 		                              (GetTuning().auto_exposure ? NVSDK_NGX_DLSS_Feature_Flags_AutoExposure : 0);
 		create.InEnableOutputSubrects = false;
-		// CreateFeature records into a command list that must run on the queue; Ensure is
+		// CreateFeature records into a command buffer that must run on the queue; Ensure is
 		// only called with the Vulkan scheduler drained, so a CPU fence wait is fine here.
-		auto& allocator = allocators[0];
-		if (allocator_value[0] != 0 && fence->GetCompletedValue() < allocator_value[0]) {
-			fence->SetEventOnCompletion(allocator_value[0], event);
-			WaitForSingleObject(event, 5000);
+		const VkDevice vk_device = Vk();
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkResetCommandBuffer(create_buffer, 0) != VK_SUCCESS) {
+			return Fail("vkResetCommandBuffer (create)");
 		}
-		if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) {
-			return Fail("command list reset (create)");
+		VkCommandBufferBeginInfo begin {};
+		begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkBeginCommandBuffer(create_buffer, &begin) != VK_SUCCESS) {
+			return Fail("vkBeginCommandBuffer (create)");
 		}
-		const auto created = NGX_D3D12_CREATE_DLSS_EXT(list.Get(), 1, 1, &feature, params, &create);
-		if (FAILED(list->Close())) {
-			return Fail("command list close (create)");
+		const auto created = NGX_VULKAN_CREATE_DLSS_EXT1(vk_device, create_buffer, 1, 1, &feature, params, &create);
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkEndCommandBuffer(create_buffer) != VK_SUCCESS) {
+			return Fail("vkEndCommandBuffer (create)");
 		}
-		ID3D12CommandList* lists[] = {list.Get()};
-		queue->ExecuteCommandLists(1, lists);
-		const uint64_t create_value = ++value;
-		queue->Signal(fence.Get(), create_value);
-		allocator_value[0] = create_value;
-		last_signal        = create_value;
-		fence->SetEventOnCompletion(create_value, event);
-		WaitForSingleObject(event, 30000);
+		VkFence           fence = VK_NULL_HANDLE;
+		VkFenceCreateInfo fence_info {};
+		fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkCreateFence(vk_device, &fence_info, nullptr, &fence) != VK_SUCCESS) {
+			return Fail("vkCreateFence (create)");
+		}
+		VkSubmitInfo submit {};
+		submit.sType              = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submit.commandBufferCount = 1;
+		submit.pCommandBuffers    = &create_buffer;
+		VkResult submitted        = VK_ERROR_INITIALIZATION_FAILED;
+		{
+			Common::LockGuard lock(graphics.queue_mutex);
+			submitted = VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit(static_cast<VkQueue>(graphics.queue), 1, &submit,
+			                                                        fence);
+		}
+		VkResult waited = VK_ERROR_INITIALIZATION_FAILED;
+		if (submitted == VK_SUCCESS) {
+			waited = VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitForFences(vk_device, 1, &fence, VK_TRUE, 30000000000ull);
+		}
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyFence(vk_device, fence, nullptr);
+		if (submitted != VK_SUCCESS || waited != VK_SUCCESS) {
+			return Fail("DLSS feature creation submission failed");
+		}
 		if (created != NVSDK_NGX_Result_Success || feature == nullptr) {
 			feature = nullptr;
-			return Fail("NVSDK_NGX_D3D12_CreateFeature(SuperSampling) returned " + std::to_string(created));
+			return Fail("NVSDK_NGX_VULKAN_CreateFeature(SuperSampling) returned " + std::to_string(created));
 		}
 		status = std::string("DLSS bridge: quality ") + QualityName(quality);
 		std::printf("NHL27DLSS status=created provider=DLSS-NGX render=%ux%u display=%ux%u quality=%s\n",
@@ -534,39 +515,58 @@ struct DlssBridge::Impl {
 
 	Result Dispatch(const DlssParams& p, uint64_t wait_value, uint64_t signal_value) {
 		if (failed || feature == nullptr) return Result::NotQueued;
-		auto& allocator = allocators[ring];
-		if (allocator_value[ring] != 0 && fence->GetCompletedValue() < allocator_value[ring]) {
-			fence->SetEventOnCompletion(allocator_value[ring], event);
-			WaitForSingleObject(event, 5000);
+		const VkDevice vk_device = Vk();
+		if (buffer_value[ring] != 0) {
+			VkSemaphoreWaitInfo wait {};
+			wait.sType          = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+			wait.semaphoreCount = 1;
+			wait.pSemaphores    = &semaphore;
+			wait.pValues        = &buffer_value[ring];
+			if (VULKAN_HPP_DEFAULT_DISPATCHER.vkWaitSemaphores(vk_device, &wait, 5000000000ull) != VK_SUCCESS) {
+				Fail("vkWaitSemaphores (command buffer ring)");
+				return Result::NotQueued;
+			}
 		}
-		if (FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), nullptr))) {
-			Fail("command list reset");
+		const VkCommandBuffer cmd = buffers[ring];
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkResetCommandBuffer(cmd, 0) != VK_SUCCESS) {
+			Fail("vkResetCommandBuffer");
 			return Result::NotQueued;
 		}
-		// DLSS expects its inputs in NON_PIXEL_SHADER_RESOURCE and the output as a UAV;
-		// between frames the shared images stay in COMMON, which Vulkan sees as
-		// VK_IMAGE_LAYOUT_GENERAL. NGX restores the states it was given after evaluating.
-		const auto transition = [this](bool to_dlss) {
-			std::array<D3D12_RESOURCE_BARRIER, Count> barriers {};
-			for (int i = 0; i < Count; ++i) {
-				const auto used = i == Output ? D3D12_RESOURCE_STATE_UNORDERED_ACCESS
-				                              : D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-				auto& b                  = barriers[i];
-				b.Type                   = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-				b.Transition.pResource   = shared[i].resource.Get();
-				b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-				b.Transition.StateBefore = to_dlss ? D3D12_RESOURCE_STATE_COMMON : used;
-				b.Transition.StateAfter  = to_dlss ? used : D3D12_RESOURCE_STATE_COMMON;
-			}
-			list->ResourceBarrier(Count, barriers.data());
-		};
-		transition(true);
-		const auto& tuning             = GetTuning();
-		NVSDK_NGX_D3D12_DLSS_Eval_Params eval {};
-		eval.Feature.pInColor          = shared[Color].resource.Get();
-		eval.Feature.pInOutput         = shared[Output].resource.Get();
-		eval.pInDepth                  = shared[Depth].resource.Get();
-		eval.pInMotionVectors          = shared[Motion].resource.Get();
+		VkCommandBufferBeginInfo begin {};
+		begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+		begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkBeginCommandBuffer(cmd, &begin) != VK_SUCCESS) {
+			Fail("vkBeginCommandBuffer");
+			return Result::NotQueued;
+		}
+		// The caller released the images to VK_QUEUE_FAMILY_EXTERNAL after copying the
+		// inputs in; acquire the ones NGX reads and writes, evaluate, and release them
+		// back so the caller can acquire the output. The reactive slot is never passed
+		// to NGX (no reactive mask in this version), so it needs no transfer. Layouts
+		// stay VK_IMAGE_LAYOUT_GENERAL throughout, as on the D3D12 bridge.
+		constexpr std::array<int, 4>                  used = {Color, Depth, Motion, Output};
+		std::array<VkImageMemoryBarrier, used.size()> barriers {};
+		for (size_t i = 0; i < used.size(); ++i) {
+			auto& barrier               = barriers[i];
+			barrier.sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+			barrier.oldLayout           = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.newLayout           = VK_IMAGE_LAYOUT_GENERAL;
+			barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+			barrier.dstQueueFamilyIndex = graphics.queue_family;
+			barrier.image               = shared[used[i]].image;
+			barrier.subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+			barrier.dstAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+		}
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+		                                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+		                                                   nullptr, static_cast<uint32_t>(barriers.size()),
+		                                                   barriers.data());
+		const auto&                   tuning = GetTuning();
+		NVSDK_NGX_VK_DLSS_Eval_Params eval {};
+		eval.Feature.pInColor          = &shared[Color].resource;
+		eval.Feature.pInOutput         = &shared[Output].resource;
+		eval.pInDepth                  = &shared[Depth].resource;
+		eval.pInMotionVectors          = &shared[Motion].resource;
 		eval.InJitterOffsetX           = p.jitter_x * tuning.jitter_x;
 		eval.InJitterOffsetY           = p.jitter_y * tuning.jitter_y;
 		eval.InRenderSubrectDimensions = {render.width, render.height};
@@ -575,24 +575,56 @@ struct DlssBridge::Impl {
 		eval.InMVScaleY                = p.motion_scale_y * tuning.mv_y;
 		eval.InPreExposure             = tuning.unit_pre_exposure ? 1.0f : p.pre_exposure;
 		eval.InFrameTimeDeltaInMsec    = p.delta_ms;
-		const auto result              = NGX_D3D12_EVALUATE_DLSS_EXT(list.Get(), feature, params, &eval);
-		transition(false);
-		if (FAILED(list->Close())) {
-			Fail("command list close");
+		const auto result              = NGX_VULKAN_EVALUATE_DLSS_EXT(cmd, feature, params, &eval);
+		for (auto& barrier: barriers) {
+			barrier.srcAccessMask       = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+			barrier.dstAccessMask       = 0;
+			barrier.srcQueueFamilyIndex = graphics.queue_family;
+			barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
+		}
+		VULKAN_HPP_DEFAULT_DISPATCHER.vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+		                                                   VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0,
+		                                                   nullptr, static_cast<uint32_t>(barriers.size()),
+		                                                   barriers.data());
+		if (VULKAN_HPP_DEFAULT_DISPATCHER.vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+			Fail("vkEndCommandBuffer");
 			return Result::NotQueued;
 		}
-		// Even when DLSS refused the frame, the Vulkan side waits for signal_value: always signal it.
-		queue->Wait(fence.Get(), wait_value);
-		if (result == NVSDK_NGX_Result_Success) {
-			ID3D12CommandList* lists[] = {list.Get()};
-			queue->ExecuteCommandLists(1, lists);
+		// Even when DLSS refused the frame, the Vulkan side waits for signal_value:
+		// always signal it (with no command buffer when the evaluation failed, like
+		// the D3D12 bridge skipping ExecuteCommandLists).
+		VkTimelineSemaphoreSubmitInfo timeline {};
+		timeline.sType                     = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+		timeline.waitSemaphoreValueCount   = 1;
+		timeline.pWaitSemaphoreValues      = &wait_value;
+		timeline.signalSemaphoreValueCount = 1;
+		timeline.pSignalSemaphoreValues    = &signal_value;
+		const VkPipelineStageFlags wait_stage = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
+		VkSubmitInfo               submit {};
+		submit.sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		submit.pNext                = &timeline;
+		submit.waitSemaphoreCount   = 1;
+		submit.pWaitSemaphores      = &semaphore;
+		submit.pWaitDstStageMask    = &wait_stage;
+		submit.commandBufferCount   = result == NVSDK_NGX_Result_Success ? 1u : 0u;
+		submit.pCommandBuffers      = &cmd;
+		submit.signalSemaphoreCount = 1;
+		submit.pSignalSemaphores    = &semaphore;
+		VkResult submitted          = VK_ERROR_INITIALIZATION_FAILED;
+		{
+			Common::LockGuard lock(graphics.queue_mutex);
+			submitted = VULKAN_HPP_DEFAULT_DISPATCHER.vkQueueSubmit(static_cast<VkQueue>(graphics.queue), 1, &submit,
+			                                                        VK_NULL_HANDLE);
 		}
-		queue->Signal(fence.Get(), signal_value);
-		allocator_value[ring] = signal_value;
-		ring                  = (ring + 1) % Ring;
-		last_signal           = signal_value;
+		if (submitted != VK_SUCCESS) {
+			Fail("vkQueueSubmit");
+			return Result::NotQueued;
+		}
+		buffer_value[ring] = signal_value;
+		ring               = (ring + 1) % Ring;
+		last_signal        = signal_value;
 		if (result != NVSDK_NGX_Result_Success) {
-			Fail("NVSDK_NGX_D3D12_EvaluateFeature returned " + std::to_string(result));
+			Fail("NVSDK_NGX_VULKAN_EvaluateFeature returned " + std::to_string(result));
 			return Result::Failed;
 		}
 		if (++dispatched <= 24 || dispatched % 600 == 0) {
@@ -610,28 +642,25 @@ struct DlssBridge::Impl {
 	void Shutdown() {
 		Release();
 		if (params != nullptr) {
-			NVSDK_NGX_D3D12_DestroyParameters(params);
+			NVSDK_NGX_VULKAN_DestroyParameters(params);
 			params = nullptr;
 		}
 		if (capability_params != nullptr) {
-			NVSDK_NGX_D3D12_DestroyParameters(capability_params);
+			NVSDK_NGX_VULKAN_DestroyParameters(capability_params);
 			capability_params = nullptr;
 		}
 		if (ngx_ready) {
-			NVSDK_NGX_D3D12_Shutdown1(device.Get());
+			NVSDK_NGX_VULKAN_Shutdown1(Vk());
 			ngx_ready = false;
 		}
 		if (semaphore != VK_NULL_HANDLE) {
 			VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroySemaphore(Vk(), semaphore, nullptr);
 			semaphore = VK_NULL_HANDLE;
 		}
-		if (event != nullptr) CloseHandle(event);
-		event = nullptr;
-		list.Reset();
-		for (auto& allocator: allocators) allocator.Reset();
-		queue.Reset();
-		fence.Reset();
-		device.Reset();
+		if (pool != VK_NULL_HANDLE) {
+			VULKAN_HPP_DEFAULT_DISPATCHER.vkDestroyCommandPool(Vk(), pool, nullptr);
+			pool = VK_NULL_HANDLE;
+		}
 	}
 #endif
 };
@@ -716,6 +745,86 @@ DlssBridge::Result DlssBridge::Dispatch(const DlssParams& params, uint64_t wait_
 	(void)wait_value;
 	(void)signal_value;
 	return Result::NotQueued;
+#endif
+}
+
+#if KYTY_DLSS_BRIDGE
+namespace {
+
+// Appends the NGX-required extension names the driver actually exposes and that are
+// not already enabled (the filter upstream KytyPS5's DLSS applies to the same
+// lists). The strings point into NGX's own storage and stay valid for the process.
+void AppendNgxExtensions(const VkExtensionProperties* required, uint32_t count,
+                         const std::vector<vk::ExtensionProperties>& available,
+                         std::vector<const char*>& extensions) {
+	for (uint32_t i = 0; i < count; ++i) {
+		const char* name = required[i].extensionName;
+		const bool  exposed =
+		    std::any_of(available.begin(), available.end(), [name](const vk::ExtensionProperties& e) {
+			    return std::strcmp(e.extensionName.data(), name) == 0;
+		    });
+		const bool present = std::any_of(extensions.begin(), extensions.end(), [name](const char* e) {
+			return std::strcmp(e, name) == 0;
+		});
+		if (exposed && !present) {
+			extensions.push_back(name);
+		}
+	}
+}
+
+} // namespace
+#endif
+
+void DlssAppendInstanceExtensions(std::vector<const char*>& extensions,
+                                  const std::vector<vk::ExtensionProperties>& available) {
+#if KYTY_DLSS_BRIDGE
+	if (!DlssWanted()) {
+		return;
+	}
+	uint32_t               count    = 0;
+	VkExtensionProperties* required = nullptr;
+	if (NVSDK_NGX_VULKAN_GetFeatureInstanceExtensionRequirements(&Discovery().info, &count, &required) !=
+	    NVSDK_NGX_Result_Success) {
+		return;
+	}
+	AppendNgxExtensions(required, count, available, extensions);
+#else
+	(void)extensions;
+	(void)available;
+#endif
+}
+
+void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physical,
+                                const std::vector<vk::ExtensionProperties>& available,
+                                std::vector<const char*>& extensions) {
+#if KYTY_DLSS_BRIDGE
+	if (!DlssWanted()) {
+		return;
+	}
+	const auto vk_instance = static_cast<VkInstance>(instance);
+	const auto vk_physical = static_cast<VkPhysicalDevice>(physical);
+	NVSDK_NGX_FeatureRequirement requirement {};
+	const auto                   req_result =
+	    NVSDK_NGX_VULKAN_GetFeatureRequirements(vk_instance, vk_physical, &Discovery().info, &requirement);
+	uint32_t               count    = 0;
+	VkExtensionProperties* required = nullptr;
+	const auto             ext_result = NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
+        vk_instance, vk_physical, &Discovery().info, &count, &required);
+	// The "vk" line doubles as the build marker: its presence in a log (and in the
+	// binary) proves the Vulkan NGX path is the compiled one.
+	std::printf("NHL27DLSS vk requirements result=%d feature_supported=%u min_hw_arch=%u extensions result=%d "
+	            "count=%u\n",
+	            static_cast<int>(req_result), static_cast<unsigned>(requirement.FeatureSupported),
+	            requirement.MinHWArchitecture, static_cast<int>(ext_result), count);
+	std::fflush(stdout);
+	if (ext_result == NVSDK_NGX_Result_Success) {
+		AppendNgxExtensions(required, count, available, extensions);
+	}
+#else
+	(void)instance;
+	(void)physical;
+	(void)available;
+	(void)extensions;
 #endif
 }
 

@@ -1,4 +1,15 @@
-# Test-KytyBuild.ps1 - v43 (2026-11-14)
+# Test-KytyBuild.ps1 - v44 (2026-11-16)
+# v44: OneOCR (the Windows 11 Snipping Tool OCR engine) replaces the old
+# OCR engine for screen reading (user request 2026-11-16). OneOCR reads
+# the game UI text more accurately and needs no separate install: the
+# script stages oneocr.dll, oneocr.onemodel and onnxruntime.dll from
+# the Snipping Tool package (or a oneocr folder next to the script)
+# into a oneocr-bin folder next to the script and calls the engine
+# in-process. Get-ShotText keeps its contract (1080p downscale first,
+# plain text out, empty string on any failure), so navigation degrades
+# to blind exactly as before when the engine is missing.
+# Tesseract is no longer used or required.
+#
 # v43: run 0816 (build 158, v42) ANSWERED the collapse question: full
 # cfgGlobal env, idle at the Hub - 978 FPS samples, median 109 fps
 # (min 55.9, max 240, every 100 s bucket 94-113), fault cost median
@@ -202,7 +213,7 @@
 # loop never backed out. XFactor is now a recognized kind; the nav loop
 # presses Circle to return to the hub.
 #
-# v28 downscales screenshots to 1080p before OCR. Tesseract on a full
+# v28 downscales screenshots to 1080p before OCR. OCR on a full
 # 3840x2160 image is slow and CPU-heavy, and it starves the emulator:
 # in the 1316 run the FPS collapsed from 60 to 5-6 during Versus
 # navigation, when the script runs OCR on every nav shot, and never
@@ -309,7 +320,7 @@
 #    so a genuinely stuck game still fails instead of waiting forever.
 #
 # v17 efficiency: the gameplay OCR check ran every 6 cycles (about every
-# 30 seconds), and each check runs Tesseract, which costs CPU and slows
+# 30 seconds), and each check runs OCR, which costs CPU and slows
 # the game a little. The check only needs to catch Pause, a return to a
 # menu (game over), or a long Unknown streak - none of which need a
 # 30-second response. v17 runs it every 12 cycles (about every minute),
@@ -432,7 +443,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 43
+$TestScriptVersion = 44
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -505,14 +516,190 @@ Start-Transcript -Path $TranscriptPath -Force | Out-Null
 Write-Host ("out:   " + $OutDir)
 Write-Host ("game:  " + $GamePath)
 
-# Tesseract OCR (for reading the screen). Found once, reused everywhere.
-$script:TesseractExe = $null
-foreach ($cand in @("C:\Program Files\Tesseract-OCR\tesseract.exe",
-                    "C:\Program Files (x86)\Tesseract-OCR\tesseract.exe")) {
-    if (Test-Path $cand) { $script:TesseractExe = $cand; break }
+# OneOCR (for reading the screen). The engine ships with the Windows 11
+# Snipping Tool; its files are staged once into a oneocr-bin folder next
+# to this script and reused on every run. Staging sources, in order:
+# a oneocr folder next to the script, then the Snipping Tool package.
+# Found once, reused everywhere.
+$script:OneOcrBinDir = $null
+$oneOcrScriptDir = $PSScriptRoot
+if (-not $oneOcrScriptDir) { $oneOcrScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path }
+$oneOcrBinDir = Join-Path $oneOcrScriptDir "oneocr-bin"
+$oneOcrRequired = @("oneocr.dll", "oneocr.onemodel", "onnxruntime.dll")
+$oneOcrSources = @()
+$oneOcrSources += (Join-Path $oneOcrScriptDir "oneocr")
+try {
+    $snipPkg = Get-AppxPackage Microsoft.ScreenSketch -ErrorAction Stop
+    if ($snipPkg) { $oneOcrSources += (Join-Path $snipPkg.InstallLocation "SnippingTool") }
+} catch { }
+foreach ($srcDir in $oneOcrSources) {
+    if (-not $srcDir) { continue }
+    $missing = @($oneOcrRequired | Where-Object { -not (Test-Path (Join-Path $oneOcrBinDir $_)) })
+    if ($missing.Count -eq 0) { break }
+    if (-not (Test-Path $srcDir)) { continue }
+    try {
+        if (-not (Test-Path $oneOcrBinDir)) { New-Item -ItemType Directory -Force -Path $oneOcrBinDir | Out-Null }
+        foreach ($name in $missing) {
+            $srcFile = Join-Path $srcDir $name
+            if (Test-Path $srcFile) { Copy-Item -Path $srcFile -Destination $oneOcrBinDir -Force -ErrorAction Stop }
+        }
+        $extras = @(Get-ChildItem -Path $srcDir -Filter "opencv_world*.dll" -ErrorAction SilentlyContinue)
+        foreach ($extra in $extras) {
+            if (-not (Test-Path (Join-Path $oneOcrBinDir $extra.Name))) {
+                Copy-Item -Path $extra.FullName -Destination $oneOcrBinDir -Force -ErrorAction SilentlyContinue
+            }
+        }
+    } catch {
+        Write-Warning ("OneOCR staging from " + $srcDir + " failed: " + $_.Exception.Message)
+    }
 }
-if ($script:TesseractExe) { Write-Host ("ocr:   " + $script:TesseractExe) }
-else { Write-Warning "Tesseract not found; navigation runs blind (Cross/Options only)." }
+$oneOcrMissing = @($oneOcrRequired | Where-Object { -not (Test-Path (Join-Path $oneOcrBinDir $_)) })
+if ($oneOcrMissing.Count -eq 0) {
+    $script:OneOcrBinDir = $oneOcrBinDir
+    # The engine resolves its companion DLLs (onnxruntime, opencv) from
+    # its own folder: put that folder first on the PATH, mirroring the
+    # reference loader.
+    $env:PATH = $oneOcrBinDir + ";" + $env:PATH
+    Write-Host ("ocr:   OneOCR staged in " + $oneOcrBinDir)
+} else {
+    Write-Warning "OneOCR not found; navigation runs blind (Cross/Options only)."
+}
+
+# In-process OneOCR wrapper (P/Invoke, compiled once). Signatures, the
+# image struct layout and the model key are ported from the reference
+# ctypes implementation (github.com/Cecilia-pj/win11_oneocr_py, after
+# github.com/b1tg/win11-oneocr): every entry point returns an int64
+# result code (0 = success) and handles are int64; the image is a
+# 32-byte struct (t, col, row, unk as int32, then step and data_ptr as
+# int64) over 4-channel 8-bit pixels (t = 3, step = width * 4).
+$OneOcrCode = @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+public static class KytyOneOcr {
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Img {
+        public int t;
+        public int col;
+        public int row;
+        public int _unk;
+        public long step;
+        public long data_ptr;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool SetDllDirectoryW(string lpPathName);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long CreateOcrInitOptions(out long ctx);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long OcrInitOptionsSetUseModelDelayLoad(long ctx, byte useDelayLoad);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long CreateOcrPipeline(IntPtr modelPath, IntPtr key, long ctx, out long pipeline);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long CreateOcrProcessOptions(out long opt);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long OcrProcessOptionsSetMaxRecognitionLineCount(long opt, long count);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long RunOcrPipeline(long pipeline, ref Img img, long opt, out long instance);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long GetOcrLineCount(long instance, out long count);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long GetOcrLine(long instance, long index, out long line);
+
+    [DllImport("oneocr.dll", CallingConvention = CallingConvention.Cdecl)]
+    private static extern long GetOcrLineContent(long line, out long contentPtr);
+
+    private static long _pipeline = 0;
+    private static long _processOptions = 0;
+    private static bool _initFailed = false;
+
+    private static IntPtr Utf8Z(string s) {
+        byte[] b = Encoding.UTF8.GetBytes(s);
+        IntPtr p = Marshal.AllocHGlobal(b.Length + 1);
+        Marshal.Copy(b, 0, p, b.Length);
+        Marshal.WriteByte(p, b.Length, 0);
+        return p;
+    }
+
+    public static bool Init(string binDir) {
+        if (_pipeline != 0) return true;
+        if (_initFailed) return false;
+        try {
+            SetDllDirectoryW(binDir);
+            long ctx;
+            if (CreateOcrInitOptions(out ctx) != 0) { _initFailed = true; return false; }
+            if (OcrInitOptionsSetUseModelDelayLoad(ctx, 0) != 0) { _initFailed = true; return false; }
+            IntPtr model = Utf8Z(System.IO.Path.Combine(binDir, "oneocr.onemodel"));
+            IntPtr key = Utf8Z("kj)TGtrK>f]b[Piow.gU+nC@s\"\"\"\"\"\"4");
+            long pipeline;
+            long res = CreateOcrPipeline(model, key, ctx, out pipeline);
+            Marshal.FreeHGlobal(model);
+            Marshal.FreeHGlobal(key);
+            if (res != 0 || pipeline == 0) { _initFailed = true; return false; }
+            long opt;
+            if (CreateOcrProcessOptions(out opt) != 0) { _initFailed = true; return false; }
+            if (OcrProcessOptionsSetMaxRecognitionLineCount(opt, 1000) != 0) { _initFailed = true; return false; }
+            _pipeline = pipeline;
+            _processOptions = opt;
+            return true;
+        } catch {
+            _initFailed = true;
+            return false;
+        }
+    }
+
+    public static string Recognize(byte[] bgra, int width, int height) {
+        if (_pipeline == 0) return "";
+        GCHandle h = GCHandle.Alloc(bgra, GCHandleType.Pinned);
+        try {
+            Img img = new Img();
+            img.t = 3;
+            img.col = width;
+            img.row = height;
+            img._unk = 0;
+            img.step = (long)width * 4;
+            img.data_ptr = h.AddrOfPinnedObject().ToInt64();
+            long instance;
+            if (RunOcrPipeline(_pipeline, ref img, _processOptions, out instance) != 0) return "";
+            long count;
+            if (GetOcrLineCount(instance, out count) != 0) return "";
+            StringBuilder sb = new StringBuilder();
+            for (long i = 0; i < count; i++) {
+                long line;
+                if (GetOcrLine(instance, i, out line) != 0 || line == 0) continue;
+                long contentPtr;
+                if (GetOcrLineContent(line, out contentPtr) != 0 || contentPtr == 0) continue;
+                IntPtr p = new IntPtr(contentPtr);
+                int len = 0;
+                while (Marshal.ReadByte(p, len) != 0) len++;
+                byte[] buf = new byte[len];
+                Marshal.Copy(p, buf, 0, len);
+                if (sb.Length > 0) sb.Append("\n");
+                sb.Append(Encoding.UTF8.GetString(buf));
+            }
+            return sb.ToString();
+        } finally {
+            h.Free();
+        }
+    }
+}
+'@
+if ($script:OneOcrBinDir) {
+    try { Add-Type -TypeDefinition $OneOcrCode -ErrorAction Stop }
+    catch {
+        Write-Warning ("OneOCR wrapper failed to compile: " + $_.Exception.Message)
+        $script:OneOcrBinDir = $null
+    }
+}
 
 # Scripted-input file the emulator watches (KYTY_INPUT_FILE). The emulator
 # reads it, then DELETES it, and re-polls every 100 ms. Lines are
@@ -820,13 +1007,12 @@ function Save-SampledBins {
     return $copied
 }
 
-# OCR a screenshot to text (empty string when Tesseract is missing).
+# OCR a screenshot to text (empty string when OneOCR is unavailable).
 function Get-ShotText {
     param([string]$ShotPath)
-    if (-not $script:TesseractExe) { return "" }
+    if (-not $script:OneOcrBinDir) { return "" }
     if (-not (Test-Path $ShotPath)) { return "" }
-    $tmp = Join-Path $OutDir "ocr-tmp.txt"
-    # v28: downscale the 4K screenshot to 1080p before OCR. Tesseract on
+    # v28: downscale the 4K screenshot to 1080p before OCR. OCR on
     # a full 3840x2160 image is slow and CPU-heavy, and it starves the
     # emulator: in the 1316 run the FPS collapsed from 60 to 5-6 during
     # Versus navigation, when the script runs OCR on every nav shot, and
@@ -848,8 +1034,27 @@ function Get-ShotText {
         $ShotPath = $smallPath
     } catch { }
     try {
-        & $script:TesseractExe $ShotPath $tmp.Replace(".txt", "") --psm 6 2>$null | Out-Null
-        if (Test-Path $tmp) { return (Get-Content $tmp -Raw -ErrorAction SilentlyContinue) }
+        if (-not [KytyOneOcr]::Init($script:OneOcrBinDir)) { return "" }
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $srcBmp = [System.Drawing.Bitmap]::FromFile($ShotPath)
+        # Convert into a fresh 32bpp ARGB bitmap: its memory layout is
+        # B,G,R,A per pixel with a stride of exactly width * 4, which is
+        # the layout the engine expects (t = 3, step = width * 4).
+        $bmp = New-Object System.Drawing.Bitmap($srcBmp.Width, $srcBmp.Height, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+        $g2 = [System.Drawing.Graphics]::FromImage($bmp)
+        $g2.DrawImage($srcBmp, 0, 0, $srcBmp.Width, $srcBmp.Height)
+        $g2.Dispose()
+        $srcBmp.Dispose()
+        try {
+            $rect = New-Object System.Drawing.Rectangle(0, 0, $bmp.Width, $bmp.Height)
+            $bits = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+            try {
+                if ($bits.Stride -ne ($bmp.Width * 4)) { return "" }
+                $bytes = New-Object byte[] ($bits.Stride * $bmp.Height)
+                [System.Runtime.InteropServices.Marshal]::Copy($bits.Scan0, $bytes, 0, $bytes.Length)
+            } finally { $bmp.UnlockBits($bits) }
+            return [KytyOneOcr]::Recognize($bytes, $bmp.Width, $bmp.Height)
+        } finally { $bmp.Dispose() }
     } catch { }
     return ""
 }
@@ -1684,7 +1889,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
         # Every 12 cycles (about a minute), OCR-check the screen from a
         # fast screen capture and react. The frame-dump data shot below is
         # separate; this check only needs to read the screen state.
-        # (v17: was every 6 cycles; Tesseract every 30 seconds cost CPU
+        # (v17: was every 6 cycles; OCR every 30 seconds cost CPU
         # and slowed the game for no benefit - Pause/menu/game-over do
         # not need a 30-second response.)
         if (($cycle % 12) -eq 0) {

@@ -286,6 +286,7 @@ jobs:
           install -d -m 755 "$app_dir/Contents/Frameworks" "$app_dir/Contents/Resources"
           install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
           install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
+          codesign --force --sign - --timestamp=none "$app_dir/Contents/MacOS/kyty_updater"
           codesign --force --sign - --timestamp=none "$app_dir"
 
       - name: Verify artifacts

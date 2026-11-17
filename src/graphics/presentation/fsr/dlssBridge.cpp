@@ -817,7 +817,8 @@ void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physic
 	            static_cast<int>(req_result), static_cast<unsigned>(requirement.FeatureSupported),
 	            requirement.MinHWArchitecture, static_cast<int>(ext_result), count);
 	std::fflush(stdout);
-	if (ext_result == NVSDK_NGX_Result_Success) {
+	if (req_result == NVSDK_NGX_Result_Success && requirement.FeatureSupported != 0 &&
+	    ext_result == NVSDK_NGX_Result_Success) {
 		AppendNgxExtensions(required, count, available, extensions);
 	}
 #else

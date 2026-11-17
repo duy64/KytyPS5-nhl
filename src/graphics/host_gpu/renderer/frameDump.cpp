@@ -1920,6 +1920,11 @@ void TraceWrite(const char* what, uint64_t begin, uint64_t end, const char* kind
 
 } // namespace Libs::Graphics::FrameDump
 
+namespace Libs::Graphics {
+// NHL27SAMPLE sample-path diagnostic summary (defined in imageView.cpp; logging only).
+void SampleDiagPrintSummary(uint64_t frame);
+} // namespace Libs::Graphics
+
 // NHL27PRESENT present-stage diagnostic (see frameDump.h). Logging only: nothing in
 // this namespace reads back pixels, touches descriptors or alters any rendering state.
 namespace Libs::Graphics::PresentDiag {
@@ -2173,6 +2178,7 @@ void NoteFlip(uint64_t buffer_address, vk::Format format) {
 		g_pd_stat_swizzle      = 0;
 		g_pd_stat_null_frames  = 0;
 		g_pd_summary_from      = frame + 1;
+		SampleDiagPrintSummary(frame);
 	}
 
 	g_pd_ordinal_at_flip = g_pd_draw_ordinal.load(std::memory_order_relaxed);

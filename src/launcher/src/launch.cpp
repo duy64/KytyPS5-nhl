@@ -350,7 +350,7 @@ bool SupportedEmuOptions(const std::string& exe, std::set<std::string>& options)
 		return false;
 	}
 	const std::string key =
-	    exe + "|" + std::to_string(size) + "|" + std::to_string(mtime.time_since_epoch().count());
+	    exe + "|" + std::to_string(size) + "|" + std::to_string(static_cast<long long>(mtime.time_since_epoch().count()));
 	{
 		std::lock_guard lock(mutex);
 		const auto      it = cache.find(key);

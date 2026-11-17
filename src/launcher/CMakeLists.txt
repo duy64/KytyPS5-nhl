@@ -124,11 +124,12 @@ if(APPLE)
 	# The monitor size (platform.cpp).
 	target_link_libraries(launcher PRIVATE "-framework CoreGraphics")
 	# Slint's Rust core (winit) also references CoreFoundation, Foundation,
-	# AppKit, QuartzCore and the Objective-C runtime, but Corrosion does not
-	# propagate the Rust crates' framework requests into this C++ link (its
-	# required-libs detection returns only System/c/m), so they are named
-	# here; without them the final link fails with undefined symbols.
-	target_link_libraries(launcher PRIVATE "-framework CoreFoundation" "-framework Foundation" "-framework AppKit" "-framework QuartzCore" objc)
+	# AppKit, QuartzCore, Carbon (the HIToolbox keyboard-layout APIs) and the
+	# Objective-C runtime, but Corrosion does not propagate the Rust crates'
+	# framework requests into this C++ link (its required-libs detection
+	# returns only System/c/m), so they are named here; without them the
+	# final link fails with undefined symbols.
+	target_link_libraries(launcher PRIVATE "-framework CoreFoundation" "-framework Foundation" "-framework AppKit" "-framework QuartzCore" "-framework Carbon" objc)
 endif()
 if(UNIX AND NOT APPLE)
 	# The static Slint runtime finds system fonts through fontconfig (libfontconfig1-dev).

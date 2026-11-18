@@ -317,6 +317,21 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 			}
 		};
 
+		// Image view minLod, 64-bit buffer atomics, null descriptors and cull distance are
+		// optional on Metal-backed drivers: MoltenVK implements none of them, and a shader
+		// can only use them by asking for the matching SPIR-V capability. Selection warns
+		// instead of rejecting the only device, and device creation below only requests
+		// what the device reports (upstream KytyPS5 PR #2269).
+		const auto check_optional_feature = [&](vk::Bool32 supported, const char* name) {
+#if defined(__APPLE__)
+			if (supported != VK_TRUE) {
+				LOGF("%s is not supported\n", name);
+			}
+#else
+			check_feature(supported, name);
+#endif
+		};
+
 #if defined(__APPLE__)
 		if (color_write_ext.colorWriteEnable != VK_TRUE) {
 			LOGF("colorWriteEnable is not supported\n");
@@ -324,7 +339,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 #else
 		check_feature(color_write_ext.colorWriteEnable, "colorWriteEnable");
 #endif
-		check_feature(image_view_min_lod.minLod, "image view minLod");
+		check_optional_feature(image_view_min_lod.minLod, "image view minLod");
 
 		check_feature(depth_clip_control.depthClipControl, "depthClipControl");
 #if defined(__APPLE__)
@@ -352,8 +367,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		              required_features12.shaderOutputViewportIndex);
 		check_feature(features12.bufferDeviceAddress, "bufferDeviceAddress",
 		              required_features12.bufferDeviceAddress);
-		check_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics",
-		              required_features12.shaderBufferInt64Atomics);
+		check_optional_feature(features12.shaderBufferInt64Atomics, "shaderBufferInt64Atomics");
 		check_feature(features12.shaderSampledImageArrayNonUniformIndexing,
 		              "shaderSampledImageArrayNonUniformIndexing",
 		              required_features12.shaderSampledImageArrayNonUniformIndexing);
@@ -372,7 +386,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(features12.descriptorBindingPartiallyBound, "descriptorBindingPartiallyBound",
 		              required_features12.descriptorBindingPartiallyBound);
 		check_feature(features13.robustImageAccess, "robustImageAccess");
-		check_feature(robustness2.nullDescriptor, "nullDescriptor");
+		check_optional_feature(robustness2.nullDescriptor, "nullDescriptor");
 		check_feature(features13.dynamicRendering, "dynamicRendering",
 		              required_features13.dynamicRendering);
 		check_feature(features13.synchronization2, "synchronization2",
@@ -380,7 +394,7 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		check_feature(device_features2.features.sampleRateShading, "sampleRateShading");
 		check_feature(device_features2.features.depthBiasClamp, "depthBiasClamp");
 		check_feature(device_features2.features.shaderClipDistance, "shaderClipDistance");
-		check_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
+		check_optional_feature(device_features2.features.shaderCullDistance, "shaderCullDistance");
 		check_feature(device_features2.features.largePoints, "largePoints");
 		check_feature(device_features2.features.multiViewport, "multiViewport");
 		check_feature(device_features2.features.fillModeNonSolid, "fillModeNonSolid");
@@ -638,6 +652,9 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		supported_barycentric.pNext = supported_features2.pNext;
 		supported_features2.pNext   = &supported_barycentric;
 	}
+	vk::PhysicalDeviceImageViewMinLodFeaturesEXT supported_min_lod {};
+	supported_min_lod.pNext   = supported_features2.pNext;
+	supported_features2.pNext = &supported_min_lod;
 	physical_device.getFeatures2(&supported_features2);
 	const bool barycentric_supported =
 	    barycentric_extension && supported_barycentric.fragmentShaderBarycentric == VK_TRUE;
@@ -647,11 +664,24 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+	graphics.image_view_min_lod_enabled         = supported_min_lod.minLod == VK_TRUE;
 
 	auto features12 = WindowContext::RequiredVulkan12Features();
 	features12.shaderSharedInt64Atomics = supported_features12.shaderSharedInt64Atomics;
 	features12.hostQueryReset           = supported_features12.hostQueryReset;
 	features12.drawIndirectCount = supported_features12.drawIndirectCount;
+#if defined(__APPLE__)
+	// Never request 64-bit buffer atomics from a device that does not report them
+	// (MoltenVK reports false); shaders that need them fail per-pipeline instead of
+	// blocking device creation.
+	features12.shaderBufferInt64Atomics = supported_features12.shaderBufferInt64Atomics;
+	// VK_EXT_image_view_min_lod is optional on macOS: request it only when the device
+	// reports it, and unlink the feature struct from the chain when it does not.
+	image_view_min_lod.minLod = supported_min_lod.minLod;
+	if (!graphics.image_view_min_lod_enabled) {
+		depth_clip_control.pNext = nullptr;
+	}
+#endif
 	graphics.native_indirect_enabled = supported_features12.drawIndirectCount &&
 	    supported_features2.features.multiDrawIndirect &&
 	    supported_features2.features.drawIndirectFirstInstance;
@@ -788,7 +818,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	device_features.sampleRateShading                    = VK_TRUE;
 	device_features.depthBiasClamp                       = VK_TRUE;
 	device_features.shaderClipDistance                   = VK_TRUE;
+#if defined(__APPLE__)
+	device_features.shaderCullDistance =
+	    supported_features2.features.shaderCullDistance; // MoltenVK reports false
+#else
 	device_features.shaderCullDistance                   = VK_TRUE;
+#endif
 	device_features.largePoints                          = VK_TRUE;
 	device_features.multiViewport                        = VK_TRUE;
 	device_features.fillModeNonSolid                      = VK_TRUE;
@@ -828,7 +863,11 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 #endif
 	robustness2.robustBufferAccess2 = supported_robustness2.robustBufferAccess2;
 	robustness2.robustImageAccess2  = supported_robustness2.robustImageAccess2;
+#if defined(__APPLE__)
+	robustness2.nullDescriptor      = supported_robustness2.nullDescriptor;
+#else
 	robustness2.nullDescriptor      = VK_TRUE;
+#endif
 
 	auto features13 = WindowContext::RequiredVulkan13Features();
 	features13.pNext = &robustness2;
@@ -1285,8 +1324,13 @@ void WindowContext::CreateVulkan() {
 
 	std::vector<const char*> device_extensions = {
 	    VK_KHR_SWAPCHAIN_EXTENSION_NAME, VK_EXT_DEPTH_CLIP_CONTROL_EXTENSION_NAME,
-	    VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME, VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME,
-	    VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, "VK_KHR_maintenance1"};
+	    VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME, VK_EXT_ROBUSTNESS_2_EXTENSION_NAME,
+	    "VK_KHR_maintenance1"};
+#if !defined(__APPLE__)
+	// VK_EXT_image_view_min_lod is optional on macOS (stock MoltenVK does not advertise
+	// it); on Apple it is enabled after selection only when the driver has it.
+	device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+#endif
 #if KYTY_ENABLE_FSR3
 	// SDK 1.1.4 resolves these KHR aliases even on Vulkan 1.3 devices.
 	device_extensions.push_back(VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME);
@@ -1353,6 +1397,13 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 			graphic_ctx.memory_budget_ext_enabled = true;
 		}
+#if defined(__APPLE__)
+		// Optional on macOS: enable VK_EXT_image_view_min_lod only when the driver
+		// advertises it, so device creation never asks for a missing extension.
+		if (HasExtension(available_extensions, VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME)) {
+			device_extensions.push_back(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
+		}
+#endif
 		for (const auto* extension: {VK_KHR_MAINTENANCE_8_EXTENSION_NAME,
 		                             VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME,
 		                             VK_EXT_PROVOKING_VERTEX_EXTENSION_NAME,

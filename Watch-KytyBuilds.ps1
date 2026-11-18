@@ -1,9 +1,23 @@
-# Watch-KytyBuilds.ps1 - v8 (2026-11-11)
+# Watch-KytyBuilds.ps1 - v9 (2026-11-18)
 # Watches D:\Downloads for new KyTy builds and auto-runs the NHL 27 test
 # (Test-KytyBuild.ps1) for each one. Meant to run on a schedule (every
 # 15 min) via a Windows Scheduled Task. Results are copied to -UploadDir
 # (a Google Drive folder) when set, so they sync and can be reviewed
 # without anyone sending them.
+#
+# v9 monitor sleep/wake (user request, 2026-11-18): the watcher now
+# manages the monitors around test runs. When a pass ends without a
+# test running, the displays are put to sleep if the PC has been idle
+# for at least 10 minutes (GetLastInputInfo), so the screens are not
+# left on all day between ticks. When a test run starts (atlas capture
+# or a build test), the displays are woken and held awake for the whole
+# run with SetThreadExecutionState, because the test navigates by
+# reading the screen; the hold is released when the run ends, and the
+# idle rule applies again from there. The paths where the user is at
+# the PC (emulator already running) or another watcher instance owns a
+# run (lock file held) never touch the displays. Every display call is
+# failure-isolated: if the Windows calls fail, the watcher logs it and
+# behaves exactly like v8.
 #
 # v8 complete-copy gate (2026-11-11): the 1216 and 1516 result folders
 # reached Drive WITHOUT their nav shots, 04-versus.png, 05-ice.png, or
@@ -100,6 +114,117 @@ if ([string]::IsNullOrWhiteSpace($UploadDir)) {
     if (-not [string]::IsNullOrWhiteSpace($UploadDir)) { Write-Host ("Upload dir auto-detected: " + $UploadDir) }
 }
 
+# ---------------------------------------------------------------------------
+# v9 display control: sleep the monitors while the PC sits idle, wake
+# them for a test run and hold them awake until the run ends. All of it
+# is failure-isolated - a display problem must never break a test run,
+# so every helper catches its own errors and carries on.
+$script:DisplayIdleSleepSeconds = 600
+$script:DisplayApiReady = $false
+$script:DisplayKeepAwakeOn = $false
+
+function Initialize-DisplayPower {
+    if ($script:DisplayApiReady) { return $true }
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]"DisplayPowerNative").Type) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class DisplayPowerNative {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LASTINPUTINFO {
+        public uint cbSize;
+        public uint dwTime;
+    }
+    [DllImport("user32.dll")]
+    private static extern bool GetLastInputInfo(ref LASTINPUTINFO plii);
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern uint SetThreadExecutionState(uint esFlags);
+    [DllImport("user32.dll")]
+    private static extern void mouse_event(uint dwFlags, int dx, int dy, uint dwData, IntPtr dwExtraInfo);
+    public static uint LastInputTick() {
+        LASTINPUTINFO info = new LASTINPUTINFO();
+        info.cbSize = (uint)Marshal.SizeOf(typeof(LASTINPUTINFO));
+        return GetLastInputInfo(ref info) ? info.dwTime : 0;
+    }
+    public static uint NowTick() { return (uint)Environment.TickCount; }
+    public static void DisplaysOn() { SendMessage((IntPtr)0xFFFF, 0x0112, (IntPtr)0xF170, (IntPtr)(-1)); }
+    public static void DisplaysOff() { SendMessage((IntPtr)0xFFFF, 0x0112, (IntPtr)0xF170, (IntPtr)2); }
+    public static void JiggleMouse() {
+        mouse_event(0x0001, 2, 0, 0, IntPtr.Zero);
+        mouse_event(0x0001, -2, 0, 0, IntPtr.Zero);
+    }
+    public static void KeepAwake() { SetThreadExecutionState(0x80000000u | 0x00000001u | 0x00000002u); }
+    public static void ClearKeepAwake() { SetThreadExecutionState(0x80000000u); }
+}
+'@ -ErrorAction Stop
+        }
+        $script:DisplayApiReady = $true
+        return $true
+    } catch {
+        Write-Host ("Display control unavailable: " + $_.Exception.Message)
+        return $false
+    }
+}
+
+function Get-UserIdleSeconds {
+    # Seconds since the last keyboard or mouse input. Returns 0 when the
+    # value cannot be read, so an unknown state is treated as "user is
+    # active" and the displays are never put to sleep on a guess.
+    if (-not (Initialize-DisplayPower)) { return 0 }
+    try {
+        $last = [DisplayPowerNative]::LastInputTick()
+        if ($last -eq 0) { return 0 }
+        $now = [DisplayPowerNative]::NowTick()
+        $diff = [int64]$now - [int64]$last
+        if ($diff -lt 0) { $diff += 4294967296 }
+        return [int]($diff / 1000)
+    } catch { return 0 }
+}
+
+function Suspend-DisplaysIfIdle {
+    # Put the displays to sleep when the PC has been idle long enough.
+    try {
+        $idle = Get-UserIdleSeconds
+        if ($idle -ge $script:DisplayIdleSleepSeconds) {
+            if (-not (Initialize-DisplayPower)) { return }
+            [DisplayPowerNative]::DisplaysOff()
+            Write-Host ("Displays put to sleep (PC idle " + $idle + " s).")
+        }
+    } catch {
+        Write-Host ("Display sleep skipped: " + $_.Exception.Message)
+    }
+}
+
+function Start-DisplaySession {
+    # Wake the displays and hold them awake for a test run.
+    try {
+        if (-not (Initialize-DisplayPower)) { return }
+        [DisplayPowerNative]::DisplaysOn()
+        [DisplayPowerNative]::JiggleMouse()
+        [DisplayPowerNative]::KeepAwake()
+        $script:DisplayKeepAwakeOn = $true
+        Write-Host "Displays woken and held awake for the test run."
+    } catch {
+        Write-Host ("Display wake skipped: " + $_.Exception.Message)
+    }
+}
+
+function Stop-DisplaySession {
+    # Release the keep-awake hold, then let the idle rule decide whether
+    # the displays go straight back to sleep.
+    try {
+        if ($script:DisplayApiReady -and $script:DisplayKeepAwakeOn) {
+            [DisplayPowerNative]::ClearKeepAwake()
+            $script:DisplayKeepAwakeOn = $false
+            Write-Host "Display keep-awake released."
+        }
+    } catch { }
+    Suspend-DisplaysIfIdle
+}
+
 # If a test is already running, do nothing. A lock is stale only if the
 # process that created it is no longer running (the watcher was killed or
 # crashed). v6 REMOVED the old 45-minute age rule: a full test runs about
@@ -146,6 +271,7 @@ try {
     if ($newBytes.Length -gt 1000 -and (-not $curBytes -or $newBytes.Length -ne $curBytes.Length -or (Get-FileHash $watcherTmp -Algorithm SHA256).Hash -ne (Get-FileHash $PSCommandPath -Algorithm SHA256).Hash)) {
         Move-Item $watcherTmp $PSCommandPath -Force -ErrorAction Stop
         Write-Host "Watcher updated to the latest version. Exiting so the next tick runs the new copy."
+        Suspend-DisplaysIfIdle
         exit 0
     } else {
         Remove-Item $watcherTmp -Force -ErrorAction SilentlyContinue
@@ -278,6 +404,7 @@ try {
 } catch {
     Write-Host ("Test script download FAILED - will not run with a possibly stale script: " + $_.Exception.Message)
     if (Test-Path $TestScriptTmp) { Remove-Item $TestScriptTmp -Force -ErrorAction SilentlyContinue }
+    Suspend-DisplaysIfIdle
     exit 0
 }
 
@@ -330,6 +457,7 @@ function Invoke-AtlasCapture {
     $stamp = Get-Date -Format "yyyy-MM-dd-HHmm"
     $atlasOut = Join-Path $ResultsRoot ("KyTyTest-" + (Split-Path $atlasBuild -Leaf) + "-atlas-" + $stamp)
     Set-Content -Path $LockFile -Value $PID -Encoding ASCII
+    Start-DisplaySession
     try {
         Write-Host ("Running atlas capture for: " + $atlasBuild)
         $argList = '-NoProfile -ExecutionPolicy Bypass -File "' + $TestScript + '" -BuildDir "' + $atlasBuild + '" -OutDir "' + $atlasOut + '" -AtlasCapture'
@@ -353,6 +481,7 @@ function Invoke-AtlasCapture {
         }
     }
     finally {
+        Stop-DisplaySession
         if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
     }
     return $true
@@ -502,7 +631,7 @@ $target = $null
 foreach ($b in $builds) {
     if (-not (Test-HasConclusiveResult $b.Name)) { $target = $b; break }
 }
-if (-not $target) { Write-Host "No new build to test."; Sync-ResultsToDrive; exit 0 }
+if (-not $target) { Write-Host "No new build to test."; Sync-ResultsToDrive; Suspend-DisplaysIfIdle; exit 0 }
 
 Write-Host ("New build found: " + $target.Name)
 $buildDir = $target.FullName
@@ -510,6 +639,7 @@ $stamp = Get-Date -Format "yyyy-MM-dd-HHmm"
 $outDir = Join-Path $ResultsRoot ("KyTyTest-" + $target.Name + "-" + $stamp)
 
 Set-Content -Path $LockFile -Value $PID -Encoding ASCII
+Start-DisplaySession
 try {
     Write-Host ("Running test for: " + $buildDir)
     $argList = '-NoProfile -ExecutionPolicy Bypass -File "' + $TestScript + '" -BuildDir "' + $buildDir + '" -OutDir "' + $outDir + '"'
@@ -547,6 +677,7 @@ try {
     Sync-ResultsToDrive
 }
 finally {
+    Stop-DisplaySession
     if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
 }
 # Delete old build folders to save disk space. Any build can be

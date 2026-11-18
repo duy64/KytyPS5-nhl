@@ -90,4 +90,10 @@ void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physic
                                 const std::vector<vk::ExtensionProperties>& available,
                                 std::vector<const char*>& extensions);
 
+// True when the early CUDA warm-up (DlssWarmUp, vulkanWindow.cpp) should run: KYTY_DLSS=1 in a DLSS
+// build and KYTY_DLSS_WARMUP not 0.
+bool DlssEarlyWarmUpWanted();
+// Turns DLSS off for this session: the rendering device was created without NGX's extensions.
+void DlssDisable();
+
 } // namespace Libs::Graphics

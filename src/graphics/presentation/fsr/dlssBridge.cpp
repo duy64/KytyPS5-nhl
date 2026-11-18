@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -27,6 +28,11 @@
 #endif
 
 namespace Libs::Graphics {
+
+namespace {
+// Set when the rendering device had to be created without NGX's extensions: no DLSS this session.
+std::atomic<bool> g_dlss_disabled {false};
+} // namespace
 
 #if KYTY_DLSS_BRIDGE
 namespace {
@@ -147,7 +153,7 @@ constexpr std::array<VkFormat, DlssBridge::Count> kFormats = {VK_FORMAT_B10G11R1
 // directly: window creation happens before any bridge exists.
 bool DlssWanted() {
 	const char* value = std::getenv("KYTY_DLSS");
-	return value != nullptr && std::strcmp(value, "1") == 0;
+	return !g_dlss_disabled.load() && value != nullptr && std::strcmp(value, "1") == 0;
 }
 
 // The one NGX feature description shared by the window-creation extension queries
@@ -667,7 +673,11 @@ struct DlssBridge::Impl {
 
 DlssBridge::DlssBridge(GraphicContext& graphics): m(std::make_unique<Impl>(graphics)) {
 #if KYTY_DLSS_BRIDGE
-	m->Init();
+	if (g_dlss_disabled.load()) {
+		m->Fail("the Vulkan device was created without the NGX extensions");
+	} else {
+		m->Init();
+	}
 #else
 	m->Fail("build without KYTY_ENABLE_DLSS (Windows only)");
 #endif
@@ -827,6 +837,19 @@ void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physic
 	(void)available;
 	(void)extensions;
 #endif
+}
+
+bool DlssEarlyWarmUpWanted() {
+#if KYTY_DLSS_BRIDGE
+	const char* warm = std::getenv("KYTY_DLSS_WARMUP");
+	return DlssWanted() && (warm == nullptr || warm[0] != '0');
+#else
+	return false;
+#endif
+}
+
+void DlssDisable() {
+	g_dlss_disabled.store(true);
 }
 
 } // namespace Libs::Graphics

@@ -975,7 +975,31 @@ public:
 		GetSystemInfo(&info);
 		m_granularity = info.dwAllocationGranularity;
 #endif
+		::Libs::Graphics::NvxSelfTest("M2_prereserve");
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+		// Region 0 (below 0x1000000000) holds fixed guest addresses, such as the driver's DMEM base 0xFE0000000
+		// (agc.cpp). It is reserved before the DLSS warm-up, so the CUDA range the warm-up creates cannot land on
+		// it: on an RTX 4080 CUDA took 0x200000000..0x1800000000 and the game exited at boot. Regions 1-2 are
+		// reserved after the warm-up, as before: CUDA fails when the guest already holds every range it wants, and
+		// those regions tolerate holes. KYTY_GUEST_RESERVE_EARLY=0 restores the old order (all after the warm-up).
+		const char* early_env = std::getenv("KYTY_GUEST_RESERVE_EARLY");
+		const bool  early     = early_env == nullptr || std::strcmp(early_env, "0") != 0;
+		if (early) {
+			ReserveGuestRegions(0, 1);
+		}
+		{
+			// KYTY_TEST_VA_BLOCK=<base>:<size> (test only): the free spans of that range are held during the
+			// warm-up and freed right after, so CUDA has to go elsewhere (reproduces a card that places it low).
+			const auto block = HoldTestVaBlock();
+			::Libs::Graphics::DlssWarmUp();
+			ReleaseTestVaBlock(block);
+		}
+		ReserveGuestRegions(early ? 1 : 0, 3);
+		std::printf("NHL27GUESTVA order=%s\n", early ? "region0-first" : "all-after-warmup");
+		std::fflush(stdout);
+#else
 		ReserveGuestRegions();
+#endif
 		m_backing = new GuestBackingStore(backing_size);
 		if (!m_backing->IsAvailable()) {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -1476,7 +1500,61 @@ private:
 	}
 #endif
 
-	void ReserveGuestRegions() {
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	// The free spans of KYTY_TEST_VA_BLOCK=<base>:<size>, reserved; empty without the variable. Test only.
+	static std::vector<std::pair<uint64_t, uint64_t>> HoldTestVaBlock() {
+		std::vector<std::pair<uint64_t, uint64_t>> held;
+		const char*                                spec = std::getenv("KYTY_TEST_VA_BLOCK");
+		if (spec == nullptr || *spec == '\0') {
+			return held;
+		}
+		char*          rest  = nullptr;
+		const uint64_t base  = std::strtoull(spec, &rest, 0);
+		const uint64_t size  = (rest != nullptr && *rest == ':') ? std::strtoull(rest + 1, nullptr, 0) : 0;
+		const uint64_t end   = base + size;
+		uint64_t       next  = base;
+		uint64_t       total = 0;
+		while (size != 0 && next < end) {
+			MEMORY_BASIC_INFORMATION info {};
+			if (VirtualQuery(reinterpret_cast<const void*>(next), &info, sizeof(info)) == 0) {
+				break;
+			}
+			const auto region_base = reinterpret_cast<uint64_t>(info.BaseAddress);
+			const auto region_end  = std::min<uint64_t>(end, region_base + static_cast<uint64_t>(info.RegionSize));
+			const auto start       = AlignUp(std::max(region_base, next), 0x10000u);
+			const auto stop        = AlignDown(region_end, 0x10000u);
+			if (info.State == MEM_FREE && stop > start &&
+			    VirtualAlloc(reinterpret_cast<void*>(start), stop - start, MEM_RESERVE, PAGE_NOACCESS) != nullptr) {
+				held.emplace_back(start, stop - start);
+				total += stop - start;
+			}
+			if (region_end <= next) {
+				break;
+			}
+			next = region_end;
+		}
+		std::printf("NHL27GUESTVA test_block base=0x%016llx size_mib=%llu held_spans=%zu held_mib=%llu\n",
+		            static_cast<unsigned long long>(base), static_cast<unsigned long long>(size >> 20u), held.size(),
+		            static_cast<unsigned long long>(total >> 20u));
+		std::fflush(stdout);
+		return held;
+	}
+
+	static void ReleaseTestVaBlock(const std::vector<std::pair<uint64_t, uint64_t>>& held) {
+		for (const auto& span: held) {
+			VirtualFree(reinterpret_cast<void*>(span.first), 0, MEM_RELEASE);
+		}
+		if (!held.empty()) {
+			std::printf("NHL27GUESTVA test_block released spans=%zu\n", held.size());
+			std::fflush(stdout);
+		}
+	}
+#endif
+
+	// Reserves the guest regions [first, last): 0 = system managed and reserved (fixed addresses), 1 = user,
+	// 2 = extended memory. On Windows the constructor reserves region 0 before the DLSS warm-up and 1-2 after.
+	void ReserveGuestRegions(size_t first = 0, size_t last = 3) {
+
 		const std::array<std::pair<uint64_t, uint64_t>, 3> regions {{
 		    {HOST_SYSTEM_MANAGED_MIN, HOST_SYSTEM_RESERVED_MAX + 1u},
 		    {HOST_USER_MIN, HOST_USER_MAX + 1u},
@@ -1486,8 +1564,9 @@ private:
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 		constexpr uint64_t MinimumRegionSize = 0x1000000;
 		const auto         process           = GetCurrentProcess();
-		for (const auto& [guest_start, guest_end]: regions) {
-			auto next_addr = guest_start;
+		for (size_t index = first; index < last && index < regions.size(); index++) {
+			const auto [guest_start, guest_end] = regions[index];
+			auto next_addr                      = guest_start;
 			while (next_addr < guest_end) {
 				MEMORY_BASIC_INFORMATION info {};
 				if (VirtualQuery(reinterpret_cast<const void*>(next_addr), &info, sizeof(info)) == 0) {
@@ -1522,6 +1601,8 @@ private:
 			}
 		}
 #else
+		(void)first;  // one call with every region off Windows
+		(void)last;
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX && !defined(__APPLE__)
 		std::vector<std::pair<uint64_t, uint64_t>> occupied;
 		FILE*                                      maps = fopen("/proc/self/maps", "r");

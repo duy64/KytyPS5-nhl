@@ -12,6 +12,7 @@
 #include <cerrno>
 #include <set>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cinttypes>
 #include <cmath>
@@ -57,6 +58,8 @@ struct Target {
 	uint32_t             seq = 0;
 	uint32_t             slices = 1; // >1: 3D volume, all z slices are read back
 	bool                 img3d = false; // 3D image bound to a KYTY_DBG_FRAME_DUMP_BUF_PS draw: raw .bin + IMG3D line
+	bool                 relabelled = false; // format holds the registered video-out format, not the creation format
+	vk::Format           created_format = vk::Format::eUndefined; // cache creation format, kept when relabelled
 };
 
 struct Pending {
@@ -1065,7 +1068,14 @@ void ProcessOne(Pending& p, const std::string& dir, std::string& log, std::strin
 	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%u_%s", dir.c_str(), p.seq, p.label.c_str(),
 	              Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
 	const std::string b = base;
-	char line[768];
+	char line[1024];
+	// NHL27FRAMEDUMP label fix: when a flip-buffer target was relabelled, the
+	// IMG lines below carry the registered format in fmt= and this note keeps
+	// the cache creation format on record.
+	const std::string relabel =
+	    t.relabelled ? " relabelled: cache image created as " + vk::to_string(t.created_format) +
+	                       ", decoded with the registered video-out format"
+	                 : "";
 	if (!d.ok) {
 		// No PNG decode for this format: keep the raw readback bytes instead of
 		// discarding them, so the target's content survives for offline analysis.
@@ -1078,9 +1088,9 @@ void ProcessOne(Pending& p, const std::string& dir, std::string& log, std::strin
 			}
 			std::fclose(out);
 		}
-		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s UNSUPPORTED (not decoded)%s\n",
+		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s UNSUPPORTED (not decoded)%s%s\n",
 		              p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h,
-		              vk::to_string(t.format).c_str(), suffix.c_str());
+		              vk::to_string(t.format).c_str(), suffix.c_str(), relabel.c_str());
 		log += line;
 		return;
 	}
@@ -1173,9 +1183,9 @@ void ProcessOne(Pending& p, const std::string& dir, std::string& log, std::strin
 			note(f);
 		}
 	}
-	std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s min=%g max=%g ->%s\n", p.seq,
+	std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s min=%g max=%g ->%s%s\n", p.seq,
 	              p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str(), mn, mx,
-	              files.c_str());
+	              files.c_str(), relabel.c_str());
 	log += line;
 }
 
@@ -1331,6 +1341,61 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 	g_pending.push_back(std::move(p));
 }
 
+// ---- registered video-out formats (NHL27FRAMEDUMP label fix) ----
+// PresentDiag::NoteFlip is fed the REGISTERED format of every flipped buffer
+// (videoOut.cpp passes the registration group's ImageInfo.pixel_format), while
+// a flip buffer's texture-cache image keeps the format of whichever lookup
+// created it first: a guest-descriptor lookup derives A2B10G10R10 for the
+// guest k10_10_10_2UNorm data, the registration derives A2R10G10B10 for this
+// game. The guest bits always follow the registered layout — that is the
+// layout the display path presents them with — so a readback labelled with
+// the creation format decodes with red and blue exchanged. NoteFlip records
+// the registered format per address here (via NoteRegisteredFlipFormat,
+// defined below the anonymous namespace) and MakeTarget decodes flip-buffer
+// targets with it. Labelling only: the readback bytes, the copy and every
+// rendering decision are unchanged. Bounded table, the same trade-off as the
+// present diagnostic's own tables; a never-flipped or evicted address simply
+// keeps its creation-format label, which is the pre-fix behaviour.
+struct FlipFormatSeen {
+	uint64_t   addr   = 0;
+	vk::Format format = vk::Format::eUndefined;
+};
+constexpr size_t kFlipFormatSeenCount = 16;
+std::array<FlipFormatSeen, kFlipFormatSeenCount> g_flip_formats {};
+std::mutex                                       g_flip_formats_mutex;
+
+vk::Format RegisteredFlipFormat(uint64_t addr) {
+	std::lock_guard lock(g_flip_formats_mutex);
+	for (const auto& e : g_flip_formats) {
+		if (e.addr == addr) return e.format;
+	}
+	return vk::Format::eUndefined;
+}
+
+// True when a and b are the same packed family in opposite channel order —
+// the only way a cache creation format and a registered video-out format can
+// legitimately disagree about the same guest bits (the VIDEO_OUT_FORMAT_
+// POLICIES table splits exactly these families by channel order). Anything
+// else (different family, different packing, float formats) is not a label
+// ambiguity and is never relabelled.
+bool FlipFormatChannelOrderPair(vk::Format a, vk::Format b) {
+	const auto family = [](vk::Format f) {
+		switch (f) {
+			case vk::Format::eR8G8B8A8Unorm: case vk::Format::eR8G8B8A8Srgb:
+			case vk::Format::eB8G8R8A8Unorm: case vk::Format::eB8G8R8A8Srgb: return 1;
+			case vk::Format::eA2B10G10R10UnormPack32:
+			case vk::Format::eA2R10G10B10UnormPack32: return 2;
+			default: return 0;
+		}
+	};
+	const auto b_first = [](vk::Format f) {
+		return f == vk::Format::eB8G8R8A8Unorm || f == vk::Format::eB8G8R8A8Srgb ||
+		       f == vk::Format::eA2B10G10R10UnormPack32;
+	};
+	const int fa = family(a), fb = family(b);
+	return fa != 0 && fa == fb && b_first(a) != b_first(b);
+}
+
 bool MakeTarget(RenderContext& ctx, ImageId id, const ImageViewInfo& view, vk::ImageLayout layout,
                 uint64_t addr, Target& out) {
 	if (!id) return false;
@@ -1351,6 +1416,22 @@ bool MakeTarget(RenderContext& ctx, ImageId id, const ImageViewInfo& view, vk::I
 	out.slices  = image.info.IsVolume() ? std::max(image.backing.extent.depth >> out.mip, 1u) : 1u;
 	out.layout  = layout;
 	out.addr    = addr;
+	// NHL27FRAMEDUMP label fix: for a video-out flip buffer, decode the
+	// readback with the REGISTERED format, not the cache image's creation
+	// format (see the table above). Every format-derived field above was
+	// computed from the creation format; the channel-order pairs this fires
+	// on are all non-depth colour formats with identical byte size and
+	// aspects, so those fields are the same under either format — only the
+	// decode label (Target.format) changes.
+	if (addr != 0) {
+		const vk::Format registered = RegisteredFlipFormat(addr);
+		if (registered != vk::Format::eUndefined && registered != out.format &&
+		    FlipFormatChannelOrderPair(out.format, registered)) {
+			out.created_format = out.format;
+			out.format         = registered;
+			out.relabelled     = true;
+		}
+	}
 	return true;
 }
 
@@ -1452,7 +1533,9 @@ void ProcessJob(CaptureJob& job) {
 	}
 	std::string out = "# KytyPS5 frame dump (KYTY_DBG_FRAME_DUMP). Sequence = draw/dispatch order in the frame.\n"
 	                  "# Image files are named <seq>_<rt<slot>|depth|st<slot>>_<guest addr>_<WxH>_<vk format>.png\n"
-	                  "# HDR formats: <name>.png = clamped 0..1 (linear), <name>_exp.png = auto-exposed (p99 luminance) + sRGB.\n\n";
+	                  "# HDR formats: <name>.png = clamped 0..1 (linear), <name>_exp.png = auto-exposed (p99 luminance) + sRGB.\n"
+	                  "# Flip-buffer targets are decoded and named with the registered video-out format; when that differs\n"
+	                  "# from the cache image's creation format, the IMG line notes the creation format (\"relabelled\").\n\n";
 	out += job.draws;
 	out += "\n# ---- images ----\n";
 	out += log;
@@ -1551,6 +1634,28 @@ void FinishCapture(CommandBuffer& buffer) {
 }
 
 } // namespace
+
+// NHL27FRAMEDUMP label fix: PresentDiag::NoteFlip records the registered
+// video-out format of each flipped buffer here so MakeTarget can label
+// flip-buffer readbacks with it (see the table above MakeTarget). Called on
+// every flip; updates the address's entry in place. Labelling only — nothing
+// here touches a view, a mapping or any rendering state.
+void NoteRegisteredFlipFormat(uint64_t addr, vk::Format format) {
+	if (addr == 0 || format == vk::Format::eUndefined) return;
+	std::lock_guard lock(g_flip_formats_mutex);
+	FlipFormatSeen* free_slot = nullptr;
+	for (auto& e : g_flip_formats) {
+		if (e.addr == addr) {
+			e.format = format;
+			return;
+		}
+		if (e.addr == 0 && free_slot == nullptr) free_slot = &e;
+	}
+	if (free_slot != nullptr) {
+		free_slot->addr   = addr;
+		free_slot->format = format;
+	}
+}
 
 bool Enabled() noexcept {
 	static const bool enabled = [] {
@@ -2104,6 +2209,11 @@ void NoteFlip(uint64_t buffer_address, vk::Format format) {
 		}
 		g_pd_flip_addr_count.store(count, std::memory_order_relaxed);
 	}
+
+	// NHL27FRAMEDUMP label fix: hand the registered format to the frame dump,
+	// which decodes flip-buffer readbacks with it instead of the cache image's
+	// creation format (see FrameDump::NoteRegisteredFlipFormat).
+	FrameDump::NoteRegisteredFlipFormat(buffer_address, format);
 
 	g_pd_flips++;
 	const uint64_t frame = g_pd_flips;

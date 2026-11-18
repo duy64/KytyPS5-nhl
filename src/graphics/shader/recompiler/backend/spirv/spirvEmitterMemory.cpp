@@ -20,6 +20,13 @@ uint32_t AndCondition(EmitterState& state, uint32_t lhs, uint32_t rhs) {
 
 uint32_t EmitDsMaskedLaneRead(EmitterState& state, uint32_t source, uint32_t target,
                               uint32_t exec) {
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: the read comes from the invocation's own lane, so the
+		// source itself is the value whenever this lane is the active target.
+		const auto source_active =
+		    AndCondition(state, exec, EmitSubgroupLaneActiveBool(state, target));
+		return Select(state, TypeU32(state), source_active, source, ConstantU32(state, 0));
+	}
 	if (state.lane_count == 2) {
 		target = Binary(state, spv::OpBitwiseAnd, TypeU32(state), target, ConstantU32(state, 31));
 	}
@@ -2015,8 +2022,14 @@ uint32_t EmitAppendConsume(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return value;
 	});
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: the elected first lane is this invocation, so broadcasting
+		// its atomic result is the value itself.
+		state.builder.AddFunction(spv::OpCopyObject, TypeU32(state), result, atomic);
+	} else {
+		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
+		                          ConstantU32(state, spv::ScopeSubgroup), atomic, source_lane);
+	}
 	return result;
 }
 
@@ -2167,6 +2180,16 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto word    = Binary(state, spv::OpShiftRightLogical, TypeU32(state), lane,
 	                            ConstantU32(state, 5));
 	const auto ballot_word = [&](uint32_t predicate) {
+		if (LowerSubgroupConstructs(state)) {
+			// Wave size 1: word 0 of the ballot is the invocation's own predicate
+			// bit; every higher word is zero.
+			const auto bit = Select(state, TypeU32(state), predicate, ConstantU32(state, 1),
+			                        ConstantU32(state, 0));
+			return Select(state, TypeU32(state),
+			              Binary(state, spv::OpIEqual, TypeBool(state), word,
+			                     ConstantU32(state, 0)),
+			              bit, ConstantU32(state, 0));
+		}
 		const auto ballot = state.builder.AllocateId();
 		const auto result = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), ballot,
@@ -2198,8 +2221,14 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                           Binary(state, spv::OpBitwiseOr, TypeU32(state), base,
 	                                  EmitFindUMsb32(state, writers)), lane);
 	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
-	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), source);
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: the shuffle reads the invocation's own lane, so the value
+		// itself is the shuffle result.
+		state.builder.AddFunction(spv::OpCopyObject, TypeU32(state), result, ctx.Arg(inst, 0));
+	} else {
+		state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
+		                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), source);
+	}
 	return Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
 }
 

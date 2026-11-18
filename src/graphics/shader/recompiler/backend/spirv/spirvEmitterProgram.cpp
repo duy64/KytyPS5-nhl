@@ -925,6 +925,16 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 }
 
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: the ballot is the invocation's own predicate in bit 0.
+		const auto bit    = Select(state, TypeU32(state), Def(predicate), ConstantU32(state, 1),
+		                           ConstantU32(state, 0));
+		const auto ballot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), ballot, bit,
+		                          ConstantU32(state, 0), ConstantU32(state, 0),
+		                          ConstantU32(state, 0));
+		return ballot;
+	}
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low         = state.builder.AllocateId();
@@ -948,6 +958,11 @@ uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 }
 
 uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: the first (and only) lane is lane 0; an empty ballot also
+		// reads lane 0, matching the hardware behaviour described below.
+		return ConstantU32(state, 0);
+	}
 	// An empty ballot (EXEC zero) gives lane 0, which V_READFIRSTLANE reads on hardware. FindILsb
 	// returns -1 for zero, unlike BallotFindLSB, whose result is then undefined.
 	const auto first = [&](uint32_t word) {
@@ -969,6 +984,10 @@ uint32_t ValueEmitContext::FirstLane(uint32_t ballot) {
 }
 
 uint32_t ValueEmitContext::Shuffle(const IR::Inst& inst, size_t index, uint32_t lane) {
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: every lane read is the invocation's own value.
+		return Arg(inst, index);
+	}
 	const auto type  = TypeId(state, inst.Arg(index).GetType());
 	const auto scope = ConstantU32(state, spv::ScopeSubgroup);
 	const auto low   = state.builder.AllocateId();

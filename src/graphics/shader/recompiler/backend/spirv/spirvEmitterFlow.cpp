@@ -881,6 +881,10 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 		predicate = Binary(ctx.state, zero ? spv::OpLogicalAnd : spv::OpLogicalOr,
 		                   TypeBool(ctx.state), predicate, ctx.HalfArg(inst, 0, 1));
 	}
+	if (LowerSubgroupConstructs(ctx.state)) {
+		// Wave size 1: Any and All over one lane are the predicate itself.
+		return predicate;
+	}
 	const auto result = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(zero ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
 	                              TypeBool(ctx.state), result,
@@ -904,6 +908,10 @@ uint32_t EmitReadLane(ValueEmitContext& ctx, const IR::Inst& inst) {
 
 uint32_t EmitWaveReduceU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state = ctx.state;
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: a reduce over one lane is the value itself.
+		return ctx.Arg(inst, 0);
+	}
 	spv::Op op  = spv::OpGroupNonUniformUMin;
 	switch (inst.Flags<IR::WaveReduceOp>()) {
 		case IR::WaveReduceOp::UMin: op = spv::OpGroupNonUniformUMin; break;
@@ -925,6 +933,10 @@ uint32_t EmitSubgroupUMinU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto value = ctx.Arg(inst, 0);
 	if (ctx.other_half != nullptr) {
 		value = EmitUMin32(state, ctx.HalfArg(inst, 0, 0), ctx.HalfArg(inst, 0, 1));
+	}
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: the subgroup minimum is the (half-combined) value itself.
+		return value;
 	}
 	const auto result = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformUMin, TypeU32(state), result,

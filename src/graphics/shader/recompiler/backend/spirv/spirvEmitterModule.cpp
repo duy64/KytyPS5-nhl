@@ -647,7 +647,7 @@ void DefineInputs(EmitterState& state) {
 			                            builtin);
 		}
 	}
-	if (state.program.info.subgroup_local_invocation_id) {
+	if (state.program.info.subgroup_local_invocation_id && !LowerSubgroupConstructs(state)) {
 		const auto variable = DefineInterfaceVariable(state, TypeU32(state), spv::StorageClassInput,
 		                                              "gl_SubgroupInvocationID");
 		state.subgroup_local_invocation_id_variable = variable;
@@ -859,22 +859,30 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.image_gather_extended) {
 		state.builder.RequireCapability(spv::CapabilityImageGatherExtended);
 	}
+	// Programs on the MoltenVK scalar-subgroup path emit no GroupNonUniform ops
+	// for the lowered constructs, so they do not require the capabilities for them.
+	const bool lower_subgroup      = LowerSubgroupConstructs(state);
+	const bool subgroup_ballot     = state.program.info.subgroup_ballot && !lower_subgroup;
+	const bool subgroup_vote       = state.program.info.subgroup_vote && !lower_subgroup;
+	const bool subgroup_shuffle    = state.program.info.subgroup_shuffle && !lower_subgroup;
+	const bool subgroup_arithmetic = state.program.info.subgroup_arithmetic && !lower_subgroup;
+	const bool subgroup_local_id   = state.program.info.subgroup_local_invocation_id && !lower_subgroup;
 	if (state.lane_count == 2 || state.program.info.subgroup_barrier ||
-	    state.program.info.subgroup_ballot || state.program.info.subgroup_vote ||
-	    state.program.info.subgroup_shuffle ||
-	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
+	    subgroup_ballot || subgroup_vote ||
+	    subgroup_shuffle ||
+	    subgroup_arithmetic || subgroup_local_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot) {
+	if (state.lane_count == 2 || subgroup_ballot) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
-	if (state.program.info.subgroup_vote) {
+	if (subgroup_vote) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
-	if (state.program.info.subgroup_shuffle) {
+	if (subgroup_shuffle) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformShuffle);
 	}
-	if (state.program.info.subgroup_arithmetic) {
+	if (subgroup_arithmetic) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformArithmetic);
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {

@@ -397,6 +397,11 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state);
 
+// True when this program's subgroup constructs must be lowered to wave-size-1 scalar
+// equivalents: the MoltenVK scalar-subgroup codegen option (shader.h) in a vertex-model
+// stage (Vertex, Local, TessellationEvaluation). Always false when the option is off.
+bool LowerSubgroupConstructs(const EmitterState& state);
+
 uint32_t InputVariableForKind(const EmitterState& state, IR::StageInputKind kind);
 
 const InputBinding* InputBindingForParameter(const EmitterState& state, uint32_t location);

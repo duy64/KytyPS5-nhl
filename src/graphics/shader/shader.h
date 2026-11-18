@@ -32,6 +32,19 @@ inline std::atomic<uint32_t> g_shader_native_fp16_modes {0};
 	return g_shader_native_fp16.load(std::memory_order_relaxed) &&
 	       Common::Experiments::Enabled(Common::Experiments::NativeFp16);
 }
+// Codegen option: scalar lowering of subgroup constructs in vertex-model stages (Vertex,
+// Local, TessellationEvaluation). Metal vertex functions have no simdgroup scope, so on a
+// MoltenVK device (set at device creation in vulkanWindow.cpp; the macOS build always runs
+// on MoltenVK) SPIRV-Cross rejects the SubgroupLocalInvocationId builtin and every
+// GroupNonUniform op in those stages, and pipeline creation fails. With this option the
+// emitter declares neither in vertex-model stages and lowers the constructs to wave-size-1
+// equivalents instead: lane id 0, collectives the identity. Fragment and compute stages are
+// never lowered: their subgroup paths work on MoltenVK and are load-bearing. The option is
+// never set on any other ICD, where codegen is bit-identical to before.
+inline std::atomic<bool> g_shader_moltenvk_scalar_subgroups {false};
+[[nodiscard]] inline bool ShaderMoltenVkScalarSubgroups() {
+	return g_shader_moltenvk_scalar_subgroups.load(std::memory_order_relaxed);
+}
 // Codegen option: experiment ExecSelects (IR::EliminateExecSelects) and its rule set
 // (KYTY_DBG_EXECSEL_MODE, default 16). Part of every stage key: 0 when off.
 [[nodiscard]] inline uint32_t ShaderExecSelects() {

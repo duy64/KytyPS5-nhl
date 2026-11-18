@@ -109,7 +109,23 @@ DppTargetLane EmitDppTargetLane(EmitterState& state, const IR::DppMoveFlags& fla
 	return {subid, ConstantBool(state, true)};
 }
 
+bool LowerSubgroupConstructs(const EmitterState& state) {
+	if (!ShaderMoltenVkScalarSubgroups()) {
+		return false;
+	}
+	switch (state.program.stage) {
+		case ShaderType::Vertex:
+		case ShaderType::Local:
+		case ShaderType::TessellationEvaluation: return true;
+		default: return false;
+	}
+}
+
 uint32_t EmitSubgroupLocalInvocationId(EmitterState& state) {
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: the only lane is lane 0, and the builtin is not declared.
+		return ConstantU32(state, 0);
+	}
 	if (state.subgroup_local_invocation_id_variable == 0) {
 		EXIT("SubgroupLocalInvocationId was not declared before SPIR-V function emission\n");
 	}
@@ -193,6 +209,10 @@ uint32_t EmitVertexParameterComponentU32(EmitterState& state, const InputBinding
 }
 
 uint32_t EmitSubgroupLaneActiveBool(EmitterState& state, uint32_t lane) {
+	if (LowerSubgroupConstructs(state)) {
+		// Wave size 1: only lane 0 exists, and it is active.
+		return Binary(state, spv::OpIEqual, TypeBool(state), lane, ConstantU32(state, 0));
+	}
 	const auto active_ballot = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active_ballot,
 	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));

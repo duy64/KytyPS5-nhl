@@ -683,6 +683,7 @@ static int64_t KernelReadImpl(int d, void* buf, size_t nbytes) {
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Io);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
 
@@ -810,6 +811,7 @@ static int64_t KernelPreadImpl(int d, void* buf, size_t nbytes, int64_t offset) 
 	Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buf),
 	                         std::min<uint64_t>(nbytes, remaining));
 	uint32_t bytes_read = 0;
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Io);
 	file->f.Seek(offset);
 	file->f.Read(buf, static_cast<uint32_t>(nbytes), &bytes_read);
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes_read);
@@ -913,6 +915,7 @@ static int64_t KernelPreadvImpl(int d, const KernelIovec* iov, int iovcnt, int64
 		const auto count = static_cast<uint32_t>(std::min<uint64_t>(buffer.iov_len, remaining));
 		Memory::InvalidateMemory(reinterpret_cast<uint64_t>(buffer.iov_base), count);
 		uint32_t bytes = 0;
+		const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Io);
 		file->f.Read(buffer.iov_base, count, &bytes);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::GuestFileReadBytes, bytes);
 		bytes_read += bytes;

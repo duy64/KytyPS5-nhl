@@ -124,6 +124,20 @@ void MemoryTracker::UnmarkRegionAsGpuModified(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+void MemoryTracker::TakeGpuPagesForCpu(uint64_t vaddr, uint64_t size) {
+	CheckNotInUploadCallback();
+	// Iterate<true>: the CPU claim creates a region that does not exist yet, as
+	// MarkRegionAsCpuModified does (upstream PR 1412).
+	Iterate<true>(vaddr, size, [this](RegionManager* manager, uint64_t offset, uint64_t bytes) {
+		std::scoped_lock lock(manager->lock);
+		const auto       address = manager->GetCpuAddr() + offset;
+		manager->ChangeState<DirtySource::Gpu, false>(address, bytes);
+		QueueCpuDirty(manager);
+		manager->ChangeState<DirtySource::Cpu, true>(address, bytes);
+		m_cpu_generation.fetch_add(1, std::memory_order_release);
+	});
+}
+
 void MemoryTracker::UntrackMemory(uint64_t vaddr, uint64_t size) {
 	CheckNotInUploadCallback();
 	std::vector<RegionManager*> managers;

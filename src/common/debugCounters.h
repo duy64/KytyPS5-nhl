@@ -1,6 +1,8 @@
 #ifndef KYTY_COMMON_DEBUG_COUNTERS_H_
 #define KYTY_COMMON_DEBUG_COUNTERS_H_
 
+#include "common/hitchWhy.h"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
@@ -78,7 +80,9 @@ public:
 	ScopedTimer(Counter count, Counter duration, Peak peak = Peak::Count)
 	    : m_count(count), m_duration(duration), m_peak(peak),
 	      m_start(Enabled() ? std::chrono::steady_clock::now()
-	                        : std::chrono::steady_clock::time_point {}) {}
+	                        : std::chrono::steady_clock::time_point {}),
+	      m_why(WhyCause(duration), duration == Counter::GpuWaitNs ? HitchWhy::Kind::Wait : HitchWhy::Kind::Work,
+	            duration == Counter::GpuWaitNs || WhyCause(duration) != HitchWhy::Cause::None) {}
 	~ScopedTimer() {
 		if (m_start == std::chrono::steady_clock::time_point {} || !Enabled()) {
 			return;
@@ -101,10 +105,21 @@ public:
 	ScopedTimer& operator=(const ScopedTimer&) = delete;
 
 private:
+	// NHL27HITCHWHY (always on, unlike the counters): what a timed event counts as there.
+	[[nodiscard]] static constexpr HitchWhy::Cause WhyCause(Counter duration) noexcept {
+		switch (duration) {
+			case Counter::ShaderCompileNs: return HitchWhy::Cause::Compile;
+			case Counter::PipelineCreateNs: return HitchWhy::Cause::Pipe;
+			case Counter::ColorMetadataReadbackNs: return HitchWhy::Cause::Meta;
+			default: return HitchWhy::Cause::None;
+		}
+	}
+
 	Counter                               m_count;
 	Counter                               m_duration;
 	Peak                                  m_peak;
 	std::chrono::steady_clock::time_point m_start;
+	HitchWhy::Span                        m_why;
 };
 
 [[nodiscard]] inline uint64_t Get(Counter counter) noexcept {

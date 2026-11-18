@@ -1391,6 +1391,7 @@ void CommandScheduler::QueuePriorityOperation(Common::UniqueFunction<void>&& ope
 }
 
 void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
+	Common::HitchWhy::SetRole(Common::HitchWhy::Role::Prio);
 	while (!stop.stop_requested()) {
 		PendingOperation operation;
 		{
@@ -1431,6 +1432,7 @@ void CommandScheduler::DrainPriorityOperations() {
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Kind::Wait);
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
 		const bool active_before_or_at = m_priority_active && m_priority_active_tick <= tick;
@@ -1448,6 +1450,7 @@ void CommandScheduler::RunOperation(Common::UniqueFunction<void>&& operation) {
 }
 
 void CommandScheduler::WaitSubmitted(uint64_t tick) {
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Kind::Wait);
 	while (m_submitted_tick.load(std::memory_order_acquire) < tick) {
 		std::this_thread::yield();
 	}

@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/experiments.h"
+#include "common/hitchWhy.h"
 #include "common/hostException.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -93,6 +94,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			return false;
 		}
 	}
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Fault);
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
 	if (access == PageFaultAccess::Write && CpReadDebugEnabled()) {
 		ProtectStats::NoteWriteFaultPage(fault_vaddr);
@@ -290,6 +292,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Unmap);
 		// Finishing the GPU protects GPU writes to the range. Queued GPU work only reads cached
 		// copies, host-only completions (cache bookkeeping, flips, interrupts) never touch the
 		// range, and completions writing guest memory (downloads) skip what was unmapped since

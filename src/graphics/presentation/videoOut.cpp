@@ -1049,6 +1049,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	pending.push_back(r);
 	request_id = r.id;
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
+	Common::HitchWhy::NoteFlipRequest();
 
 	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1523,6 +1524,7 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	Common::LockGuard lock(ctx->mutex);
 	if (ctx->requested_flip_rate != requested) {
 		Common::Timeline::Mark("flip-rate", static_cast<uint64_t>(requested));
+		Common::HitchWhy::NoteRate(static_cast<int>(requested));
 		// The game picks its frame rate (0 = 60, 1 = 30, 2 = 20 Hz): 60 Hz in play, 30 Hz in menus
 		// and many presentation scenes. With the flip count, a run's fps splits by the rate it
 		// asked for (KytyPS5-tools fps-by-rate.py); a few changes per minute.

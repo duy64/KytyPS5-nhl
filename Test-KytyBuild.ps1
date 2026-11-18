@@ -1,4 +1,18 @@
-# Test-KytyBuild.ps1 - v44 (2026-11-16)
+# Test-KytyBuild.ps1 - v45 (2026-11-17)
+# v45: continuous capture for sparkle/smear detection. Right after the
+# 09/10/11 extended-play shots in STEP 3, the script now records the
+# screen continuously for about 45 seconds (one frame every 500 ms,
+# best effort) using the same Save-ScreenShot mechanism as the other
+# shots. Each frame is downscaled to at most 1280 px wide and saved as
+# a JPEG (f000.jpg, f001.jpg, ...) in a frames subfolder of the result
+# folder, so the sequence rides to Drive with the rest of the results
+# and the analysis side can diff adjacent frames: sparkles show up as
+# high-frequency flicker between frames and smears as directional
+# streaks a single screenshot can miss. The phase is fully wrapped:
+# any failure logs a warning and the run continues and finishes
+# normally. No new inputs are sent during the window and no focus
+# behaviour is added beyond what Save-ScreenShot already does.
+#
 # v44: OneOCR (the Windows 11 Snipping Tool OCR engine) replaces the old
 # OCR engine for screen reading (user request 2026-11-16). OneOCR reads
 # the game UI text more accurately and needs no separate install: the
@@ -443,7 +457,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 44
+$TestScriptVersion = 45
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -961,6 +975,70 @@ function Save-ClipBurst {
         Start-Sleep -Milliseconds 400
     }
     Write-Host ("clip burst " + $script:ClipBurstCount + " done.")
+}
+
+# v45: continuous capture for sparkle/smear detection. Records the
+# screen for about $DurationSec seconds, aiming for one frame every
+# $IntervalMs ms, using Save-ScreenShot (the same capture path as the
+# 01..11 shots: bring the emulator to the front, then CopyFromScreen).
+# Each frame lands as a full-size PNG first, is downscaled to at most
+# 1280 px wide, saved as frames\fNNN.jpg in the result folder, and the
+# PNG is removed. The loop is bounded by a deadline rather than a
+# frame count, so the phase lasts about $DurationSec seconds even if
+# a single capture takes longer than the interval (the effective
+# cadence is then simply slower). Fully self-contained failure
+# handling: a failed frame logs a warning and the loop continues, and
+# the caller also wraps the whole phase, so this can never fail a run.
+function Save-ContinuousFrames {
+    param([int]$DurationSec = 45, [int]$IntervalMs = 500)
+    $framesDir = Join-Path $OutDir "frames"
+    try {
+        if (-not (Test-Path $framesDir)) {
+            New-Item -ItemType Directory -Path $framesDir -Force | Out-Null
+        }
+    } catch {
+        Write-Warning ("Continuous capture: could not create the frames folder: " + $_.Exception.Message)
+        return
+    }
+    Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+    $frameIndex = 0
+    $deadline = (Get-Date).AddSeconds($DurationSec)
+    Write-Host ("Continuous capture: one frame every " + $IntervalMs + " ms for about " + $DurationSec + " s, into " + $framesDir + ".")
+    while ((Get-Date) -lt $deadline) {
+        $iterStart = Get-Date
+        try {
+            $tmpPath = Save-ScreenShot -ShotName "frames\_ctmp.png"
+            if ($tmpPath -and (Test-Path $tmpPath)) {
+                $srcImg = [System.Drawing.Image]::FromFile($tmpPath)
+                try {
+                    $scale = 1.0
+                    if ($srcImg.Width -gt 1280) { $scale = 1280.0 / $srcImg.Width }
+                    $newW = [int]($srcImg.Width * $scale)
+                    $newH = [int]($srcImg.Height * $scale)
+                    $smallBmp = New-Object System.Drawing.Bitmap($newW, $newH)
+                    try {
+                        $sg = [System.Drawing.Graphics]::FromImage($smallBmp)
+                        $sg.DrawImage($srcImg, 0, 0, $newW, $newH)
+                        $sg.Dispose()
+                        $jpgName = ("f{0:D3}.jpg" -f $frameIndex)
+                        $smallBmp.Save((Join-Path $framesDir $jpgName), [System.Drawing.Imaging.ImageFormat]::Jpeg)
+                    } finally {
+                        $smallBmp.Dispose()
+                    }
+                    $frameIndex++
+                } finally {
+                    $srcImg.Dispose()
+                }
+                Remove-Item -Path $tmpPath -Force -ErrorAction SilentlyContinue
+            }
+        } catch {
+            Write-Warning ("Continuous capture: frame failed: " + $_.Exception.Message)
+        }
+        $elapsedMs = [int]((Get-Date) - $iterStart).TotalMilliseconds
+        $remainMs = $IntervalMs - $elapsedMs
+        if ($remainMs -gt 0) { Start-Sleep -Milliseconds $remainMs }
+    }
+    Write-Host ("Continuous capture done: " + $frameIndex + " frames saved in the frames folder.")
 }
 
 # One screenshot by either path: frame dump first, screen capture on failure.
@@ -1821,6 +1899,16 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
         Invoke-InputStage -Lines @("w 2000", "sleep 1000", "j 150", "sleep 4000") -ExtraWaitSec 2
         $gp = Save-ScreenShot -ShotName ("{0:D2}-ice-play-{1}.png" -f (8 + $p), $p)
         Write-Host ("extended play captured: " + $gp)
+    }
+    # v45: continuous capture window, immediately after the 09/10/11
+    # interval shots while the game is still in live gameplay. About
+    # 45 s of frames at 500 ms spacing land in the frames subfolder
+    # for sparkle/smear analysis. No inputs are sent during the
+    # window. Wrapped so a failure here can never fail the run.
+    try {
+        Save-ContinuousFrames
+    } catch {
+        Write-Warning ("Continuous capture phase failed (the run continues): " + $_.Exception.Message)
     }
     # Only claim the shots that were actually taken: v14 claimed
     # "04-versus ... 07 pause menu" unconditionally, but the 1736 run

@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/image/tiler.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/memory.h"
@@ -1503,6 +1504,11 @@ void TextureCache::InitializeImage(ImageId id) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
 		}
 		UploadImage(image, *source, source_offset);
+		// Frame dump session record: remember every uploaded guest texture so
+		// an F2 dump can include textures uploaded before the captured frame.
+		if (FrameDump::Enabled()) {
+			FrameDump::NoteTextureUpload(image.info);
+		}
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {

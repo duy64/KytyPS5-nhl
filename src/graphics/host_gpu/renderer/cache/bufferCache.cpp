@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/pageWriteSeq.h"
 #include "common/experiments.h"
+#include "common/hitchWhy.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -514,6 +515,23 @@ void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 }
 
+void BufferCache::DiscardMemory(uint64_t vaddr, uint64_t size, bool poison) {
+	if (!m_pending_guest_reads.empty()) {
+		FinishPendingGuestReads(vaddr, size);
+	}
+	if (poison) {
+		std::vector<std::pair<uint64_t, uint64_t>> bytes;
+		m_gpu_modified_ranges.ForEachInRange(vaddr, size,
+		                                     [&](uint64_t begin, uint64_t end) { bytes.emplace_back(begin, end); });
+		for (const auto& [begin, end]: bytes) {
+			const std::vector<uint8_t> fill(end - begin, 0xCD);
+			Libs::LibKernel::Memory::WriteBacking(begin, fill.data(), fill.size());
+		}
+	}
+	DiscardGpuModified(vaddr, size);
+	ForgetColorMetadataChecks(vaddr, size);
+}
+
 void BufferCache::ForgetGpuWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0 || !GuestRange {vaddr, size}.Valid()) {
 		return;
@@ -898,6 +916,30 @@ struct ReadbackWaitNote {
 };
 } // namespace
 
+
+// A merge is refused as a whole when any byte of its range has no backing, where a plain publish
+// skips such gaps (TryWriteBacking). The merge does the same here in 4 KiB steps; it used to exit
+// the emulator. Every async download merges (lazy writes on or off), so this applies to both.
+static void MergeBackedPages(uint64_t address, const uint8_t* gpu, const uint8_t* expected, uint64_t bytes) {
+	constexpr uint64_t Page    = 0x1000;
+	const auto         end     = address + bytes;
+	uint64_t           skipped = 0;
+	for (auto at = address; at < end;) {
+		const auto part = std::min(end, (at + Page) & ~(Page - 1)) - at;
+		if (!Libs::LibKernel::Memory::TryMergeBacking(at, gpu + (at - address), expected + (at - address), part)) {
+			skipped += part;
+		}
+		at += part;
+	}
+	static std::atomic<uint32_t> reported {0};
+	if (reported.fetch_add(1, std::memory_order_relaxed) < 16) {
+		std::printf("NHL27MERGESKIP: download 0x%016llx+0x%llx: %llu bytes without backing left out\n",
+		            static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes),
+		            static_cast<unsigned long long>(skipped));
+		std::fflush(stdout);
+	}
+}
+
 template <bool async, bool merge>
 bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	static_assert(async || !merge);
@@ -1069,7 +1111,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 				    if (expected != nullptr) {
 					    // Bytes the CPU stored since the download was queued are newer than the GPU's.
 					    if (!Libs::LibKernel::Memory::TryMergeBacking(address, gpu + skip, expected + skip, bytes)) {
-						    EXIT("BufferCache: merge of a shared-page download failed\n");
+						    MergeBackedPages(address, gpu + skip, expected + skip, bytes);
 					    }
 				    } else {
 					    Libs::LibKernel::Memory::WriteBacking(address, gpu + skip, bytes);
@@ -1445,6 +1487,24 @@ static bool SharedWritesDebug() {
 	return enabled;
 }
 
+// Where a lazy shared write may be taken. One player's game crashed in the Edit / Create Player
+// screens (30 Hz) while scrolling through equipment with lazy writes on, and stopped crashing with
+// them off; the crash was never reproduced and left no log. So by default only play (the game asks
+// for 60 Hz) takes them, and every 30 Hz screen waits for the GPU as with the switch off.
+// KYTY_LAZY_SHARED_WRITES_RATES=all: at any rate, as every build up to v0.10.0 did.
+// KYTY_LAZY_SHARED_WRITES_HOLD_MS=<n>: also for n ms after the game left 60 Hz (replays).
+static bool LazySharedWriteRateOk() {
+	static const bool all_rates = [] {
+		const char* value = std::getenv("KYTY_LAZY_SHARED_WRITES_RATES");
+		return value != nullptr && std::strcmp(value, "all") == 0;
+	}();
+	static const uint64_t hold_ms = [] {
+		const char* value = std::getenv("KYTY_LAZY_SHARED_WRITES_HOLD_MS");
+		return value != nullptr ? std::min<uint64_t>(std::strtoull(value, nullptr, 10), 600000) : 0;
+	}();
+	return all_rates || Common::HitchWhy::InPlay(hold_ms);
+}
+
 bool BufferCache::LazySharedWriteEligible(uint64_t vaddr, uint64_t size) {
 	// The stored bytes must not be GPU-written themselves, and the GPU must own only a few bytes
 	// of each page involved.
@@ -1703,6 +1763,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 		     vaddr, size);
 	}
 	FrameBreakdown::FaultTimer fault_readmem_timer(FrameBreakdown::g_fault_cost.readmem_ns);
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Read);
 	// The pipelined command processor counts as the GPU: its faults (PM4 and register data next to
 	// GPU-written bytes) are served after the operations it emitted, and the sync download waits
 	// only for the writer's submission (KYTY_READBACK_QUEUE). The asynchronous guest-read path
@@ -1771,7 +1832,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			// changes meanwhile, which are newer.
 			const bool lazy = is_write && !on_gpu &&
 			                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
-			                  LazySharedWriteEligible(vaddr, size);
+			                  LazySharedWriteRateOk() && LazySharedWriteEligible(vaddr, size);
 			if (CpReadDebugEnabled()) {
 				g_readback_origin = origin;
 				g_readback_exact  = !is_write                          ? (HasGpuDirtyBytes(vaddr, size) ? 1u : 0u)
@@ -1936,11 +1997,15 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 					            static_cast<unsigned long long>(wend), static_cast<unsigned long long>(tid));
 				}
 			}
-			if (downloaded) {
+			// A write hands its own pages from the GPU to the CPU in one critical section
+			// (TakeGpuPagesForCpu, upstream PR 1412), also when nothing was downloaded. The rest of a
+			// widened download window (WideWriteDownloads, KYTY_READBACK_WINDOW_KIB) is released here;
+			// releasing the write's pages twice is harmless, the second release is the atomic one.
+			if (downloaded && !(is_write && download_vaddr == vaddr && download_size == size)) {
 				m_memory_tracker.UnmarkRegionAsGpuModified(download_vaddr, download_size);
 			}
 			if (is_write) {
-				m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+				m_memory_tracker.TakeGpuPagesForCpu(vaddr, size);
 			}
 		});
 		if (retry_tick == 0) {

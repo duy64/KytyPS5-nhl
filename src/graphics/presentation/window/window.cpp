@@ -511,6 +511,33 @@ void WindowContext::ProcessEvent(double time_s) {
 					if ((event->key.mod & SDL_KMOD_SHIFT) != 0) {
 						TogglePerformanceOverlayDetails();
 					} else {
+						if (!event->key.repeat) {
+							// KYTY_DBG_FRAME_DUMP_LIGHT=1: F2 saves only the presented frame -- one PNG
+							// written by the presenter through its present.trigger path -- instead of
+							// the full frame dump, which reads back every image of the frame and
+							// stalls the game for about a minute at 4K.
+							static const bool light = [] {
+								const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_LIGHT");
+								return v != nullptr && v[0] == '1';
+							}();
+							if (light) {
+								// Ask in the frame-dump folder when one is configured, so the PNG
+								// lands next to the frame dumps; the presenter checks both folders.
+								static const std::string trigger_path = [] {
+									const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_DIR");
+									return (v != nullptr && *v != '\0')
+									           ? std::string(v) + "/present.trigger"
+									           : std::string("present.trigger");
+								}();
+								if (std::FILE* f = std::fopen(trigger_path.c_str(), "wb"); f != nullptr) {
+									std::fclose(f);
+									std::printf("NHL27FRAMEDUMP: F2 light - present capture triggered\n");
+									std::fflush(stdout);
+								}
+							} else {
+								Libs::Graphics::FrameDump::Request();
+							}
+						}
 						TogglePerformanceOverlay();
 					}
 				}

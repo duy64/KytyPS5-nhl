@@ -17,6 +17,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/presentation/openxrHeadset.h"
 #include "graphics/presentation/presenter.h"
+#include "graphics/presentation/fsr/dlssBridge.h"
 #include "graphics/presentation/fsr/nhl27Fsr3.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
@@ -1181,6 +1182,8 @@ void WindowContext::CreateVulkan() {
 	VulkanExtensions r;
 	VulkanGetExtensions(r);
 	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
+	// DLSS bridge (KYTY_DLSS=1): NGX needs its own instance extensions (no-op otherwise).
+	DlssAppendInstanceExtensions(r.required_extensions, r.available_extensions);
 	VulkanCheckInstanceVersion();
 
 	vk::ApplicationInfo app_info {};
@@ -1397,6 +1400,10 @@ void WindowContext::CreateVulkan() {
 			device_extensions.push_back(VK_EXT_ATTACHMENT_FEEDBACK_LOOP_DYNAMIC_STATE_EXTENSION_NAME);
 		}
 		Vr::OpenXrAppendExtensions(device_extensions, available_extensions, true);
+		// DLSS bridge (KYTY_DLSS=1): NGX needs its own device extensions on the
+		// rendering device (no-op otherwise).
+		DlssAppendDeviceExtensions(graphic_ctx.instance, graphic_ctx.physical_device, available_extensions,
+		                           device_extensions);
 	}
 
 	graphic_ctx.device = VulkanCreateDevice(graphic_ctx, device_extensions);

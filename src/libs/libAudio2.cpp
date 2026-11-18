@@ -12,6 +12,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <vector>
 
@@ -385,6 +386,152 @@ static bool audioout2_context_has_queueable_device(const AudioOut2ContextState& 
 	return false;
 }
 
+// NHL27OBJMIX object-mixer meter: the AudioOut2 object ports are mixed into a
+// separate stereo stream by audioout2_mix_object, and that mix is handed to
+// AudioOutOutputs alongside the regular ports. These helpers accumulate, per
+// object port, the raw buffer level before mixing plus the gains actually
+// applied, and the level of the mixed stereo output after mixing, and print
+// one block per second while object audio is active (same style and cadence
+// as the NHL27AUDIOLVL meter in audio.cpp). Measurement only; the audio
+// itself is unchanged.
+struct AudioOut2ObjmixSlot {
+	uint64_t handle = 0;
+	double   sumsq  = 0.0;
+	float    peak   = 0.0f;
+	uint64_t frames = 0;
+	float    gain0  = 0.0f;
+	float    left   = 0.0f;
+	float    right  = 0.0f;
+	uint32_t amb    = 0;
+};
+
+struct AudioOut2ObjmixState {
+	std::array<AudioOut2ObjmixSlot, 32> slots {};
+	double                              mix_sumsq[2] = {};
+	float                               mix_peak[2]  = {};
+	uint64_t                            mix_frames   = 0;
+	uint32_t                            mix_calls    = 0;
+	uint64_t                            last_flush   = 0;
+	Common::Mutex                       mutex;
+};
+
+static AudioOut2ObjmixState g_audioout2_objmix;
+
+static void audioout2_objmix_measure_object(const AudioOut2PortStateEntry& object,
+                                            uint32_t num_grains, float left, float right) {
+	const auto bytes_per_sample = object.audio_format == AudioInternal::Format::FloatMono
+	                                  ? sizeof(float)
+	                                  : sizeof(int16_t);
+	const auto available        = object.pcm_data.size() / bytes_per_sample;
+	const auto frames           = std::min<uint64_t>(num_grains, available);
+	if (frames == 0) {
+		return;
+	}
+	Common::LockGuard lock(g_audioout2_objmix.mutex);
+	AudioOut2ObjmixSlot* slot = nullptr;
+	for (auto& candidate: g_audioout2_objmix.slots) {
+		if (candidate.handle == object.handle) {
+			slot = &candidate;
+			break;
+		}
+	}
+	if (slot == nullptr) {
+		for (auto& candidate: g_audioout2_objmix.slots) {
+			if (candidate.handle == 0) {
+				slot         = &candidate;
+				slot->handle = object.handle;
+				break;
+			}
+		}
+	}
+	if (slot == nullptr) {
+		return;
+	}
+	slot->gain0 = object.gains[0];
+	slot->left  = left;
+	slot->right = right;
+	slot->amb   = object.ambisonics;
+	for (uint64_t frame = 0; frame < frames; frame++) {
+		const float sample =
+		    object.audio_format == AudioInternal::Format::FloatMono
+		        ? reinterpret_cast<const float*>(object.pcm_data.data())[frame]
+		        : reinterpret_cast<const int16_t*>(object.pcm_data.data())[frame] / 32768.0f;
+		slot->sumsq += static_cast<double>(sample) * sample;
+		slot->peak = std::max(slot->peak, std::abs(sample));
+	}
+	slot->frames += frames;
+}
+
+static void audioout2_objmix_measure_mix(const std::vector<float>& mix, uint32_t mix_calls) {
+	if (mix.empty()) {
+		return;
+	}
+	Common::LockGuard lock(g_audioout2_objmix.mutex);
+	auto&             state  = g_audioout2_objmix;
+	const auto        frames = mix.size() / 2;
+	for (size_t frame = 0; frame < frames; frame++) {
+		for (int ch = 0; ch < 2; ch++) {
+			const float sample = mix[frame * 2 + ch];
+			state.mix_sumsq[ch] += static_cast<double>(sample) * sample;
+			state.mix_peak[ch] = std::max(state.mix_peak[ch], std::abs(sample));
+		}
+	}
+	state.mix_frames += frames;
+	state.mix_calls += mix_calls;
+
+	const auto now = LibKernel::KernelGetProcessTime();
+	if (state.last_flush == 0) {
+		state.last_flush = now;
+		return;
+	}
+	if (now - state.last_flush < 1000000) {
+		return;
+	}
+	state.last_flush = now;
+	for (auto& slot: state.slots) {
+		if (slot.handle == 0 || slot.frames == 0) {
+			continue;
+		}
+		const double rms =
+		    slot.sumsq > 0.0
+		        ? 10.0 * std::log10(slot.sumsq / static_cast<double>(slot.frames))
+		        : -99.9;
+		const double peak =
+		    slot.peak > 0.0f ? 20.0 * std::log10(static_cast<double>(slot.peak)) : -99.9;
+		std::printf("NHL27OBJMIX: obj port=0x%016" PRIx64 " rms/peak=[%.1f/%.1f] "
+		            "gain0=%.3f lr=[%.3f %.3f] amb=0x%08" PRIx32 "\n",
+		            slot.handle, rms, peak, static_cast<double>(slot.gain0),
+		            static_cast<double>(slot.left), static_cast<double>(slot.right), slot.amb);
+		const auto handle = slot.handle;
+		slot              = {};
+		slot.handle       = handle;
+	}
+	if (state.mix_frames > 0) {
+		char line[256];
+		int  pos = std::snprintf(line, sizeof(line), "NHL27OBJMIX: mix rms/peak=[");
+		for (int ch = 0; ch < 2; ch++) {
+			const double rms =
+			    state.mix_sumsq[ch] > 0.0
+			        ? 10.0 * std::log10(state.mix_sumsq[ch] /
+			                            static_cast<double>(state.mix_frames))
+			        : -99.9;
+			const double peak = state.mix_peak[ch] > 0.0f
+			                        ? 20.0 * std::log10(static_cast<double>(state.mix_peak[ch]))
+			                        : -99.9;
+			pos += std::snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos),
+			                     "%s%.1f/%.1f", ch > 0 ? " " : "", rms, peak);
+		}
+		std::snprintf(line + pos, sizeof(line) - static_cast<size_t>(pos),
+		              "] objs=%" PRIu32 "\n", state.mix_calls);
+		std::printf("%s", line);
+		state.mix_sumsq[0] = state.mix_sumsq[1] = 0.0;
+		state.mix_peak[0] = state.mix_peak[1] = 0.0f;
+		state.mix_frames                        = 0;
+		state.mix_calls                         = 0;
+	}
+	std::fflush(stdout);
+}
+
 static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
                                  const AudioOut2PortStateEntry& object) {
 	if (mix.empty()) {
@@ -405,6 +552,7 @@ static void audioout2_mix_object(std::vector<float>& mix, uint32_t num_grains,
 	}
 	left *= object.gains[0];
 	right *= object.gains[0];
+	audioout2_objmix_measure_object(object, num_grains, left, right);
 	for (uint32_t frame = 0; frame < num_grains; frame++) {
 		const float sample =
 		    object.audio_format == AudioInternal::Format::FloatMono
@@ -427,12 +575,14 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2S
 	out.object_mix.clear();
 	std::vector<AudioInternal::OutputParam> params;
 	params.reserve(AudioInternal::OUT_PORTS_MAX);
+	uint32_t objects_mixed = 0;
 	for (const auto& state: g_audioout2_ports) {
 		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
 			continue;
 		}
 		if (audioout2_port_type_is_object(state.port_type)) {
 			audioout2_mix_object(out.object_mix, context->num_grains, state);
+			objects_mixed++;
 		} else if (state.audio_handle > 0 && params.size() < AudioInternal::OUT_PORTS_MAX) {
 			const auto i = params.size();
 			out.pcm[i]   = state.pcm_data;
@@ -444,6 +594,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, AudioOut2S
 		params.push_back({context->object_audio_handle, out.object_mix.data()});
 	}
 	g_audioout2_state_mutex.Unlock();
+	audioout2_objmix_measure_mix(out.object_mix, objects_mixed);
 	if (!params.empty()) {
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
 		                                     blocking);
@@ -734,6 +885,17 @@ int KYTY_SYSV_ABI AudioOut2PortCreate(AudioOut2ContextHandle ctx, const AudioOut
 	}
 
 	*port = next_port;
+
+	if (audioout2_port_type_is_object(params->port_type)) {
+		std::printf("NHL27OBJMIX: open port=0x%016" PRIx64 " ctx=0x%016" PRIx64
+		            " type=0x%04" PRIx16 " ch=%" PRIu32 " fmt=%d data_fmt=0x%08" PRIx32
+		            " freq=%" PRIu32 " samples=%" PRIu32 "\n",
+		            *port, ctx, params->port_type,
+		            static_cast<uint32_t>(audioout2_data_format_channels(params->data_format)),
+		            static_cast<int>(audio_format), params->data_format, params->sampling_freq,
+		            samples_num);
+		std::fflush(stdout);
+	}
 
 	if (next_port <= 16 || (next_port % 600) == 0) {
 		PRINT_NAME();

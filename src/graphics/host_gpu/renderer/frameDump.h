@@ -24,6 +24,7 @@ namespace Libs::Graphics {
 
 struct TextureBinding;
 struct PreparedBindings;
+struct ImageInfo;
 
 namespace FrameDump {
 
@@ -38,6 +39,18 @@ extern std::atomic<bool> g_active;
 
 // F2 in the game window: capture the next complete guest frame.
 void Request();
+
+// Session record for the guesttex dump: the texture cache calls this whenever a guest
+// texture's bytes are (re)uploaded to a host image, so an F2 dump can also include
+// textures uploaded before the captured frame (e.g. a hub photo uploaded while a menu
+// loads and only composited afterwards). Callers gate on Enabled(); the record holds
+// descriptors only (never bytes) and lives for the whole session.
+void NoteTextureUpload(const ImageInfo& info);
+
+// Joins the capture download worker thread (if one was ever started); called
+// from the renderer destructor so an in-flight download is abandoned promptly
+// instead of draining at exit.
+void Shutdown();
 
 // Writes 8-bit RGB pixels (rows top to bottom) to a PNG file.
 bool WriteRgbPng(const std::string& path, uint32_t w, uint32_t h, const std::vector<uint8_t>& rgb);
@@ -114,6 +127,25 @@ void TraceDispatch(uint64_t cs_hash, uint32_t gx, uint32_t gy, uint32_t gz, cons
                    std::span<const uint8_t> image_written);
 
 } // namespace FrameDump
+
+// NHL27PRESENT: present-stage diagnostic for the two open present defects (whole-frame
+// R/B swap on B-first frames; dark transitions whose final present draws bind only null
+// textures). Always on and logging only -- it never changes rendering. The flip hook
+// records each presented buffer (address + format, learned by role from video-out, never
+// hardcoded) and the draw hook records the last draw into a presented buffer, so a flip
+// can report a present-format change, a final present draw that bound only null
+// textures, and any non-identity component swizzle on a view that draw sampled.
+namespace PresentDiag {
+
+// Called from the renderer's draw recording for every draw. Cheap no-op unless one of
+// the colour targets is a known flip buffer. ps_images may be null.
+void NoteDraw(const uint64_t* color_targets, uint32_t color_target_count, bool ps_active,
+              const std::vector<TextureBinding>* ps_images);
+
+// Called when a video-out flip is prepared, with the buffer being presented.
+void NoteFlip(uint64_t buffer_address, vk::Format format);
+
+} // namespace PresentDiag
 } // namespace Libs::Graphics
 
 #endif // EMULATOR_SRC_GRAPHICS_HOST_GPU_RENDERER_FRAMEDUMP_H_

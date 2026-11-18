@@ -64,6 +64,51 @@ jobs:
           & (Join-Path $bin "glslang.exe") --version
           $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
+      - name: Install FidelityFX SDK 2.4 (FSR 4 bridge)
+        shell: pwsh
+        run: |
+          # Sparse partial clone: only Kits/FidelityFX is needed (the signed
+          # DX12 DLLs and FFX_API headers) for -DKYTY_ENABLE_FSR4=ON.
+          $dir = Join-Path $env:RUNNER_TEMP "FidelityFX-SDK"
+          git clone --depth 1 --branch v2.4.0 --filter=blob:none --sparse https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK.git $dir
+          if ($LASTEXITCODE -ne 0) { throw "FidelityFX SDK clone failed" }
+          git -C $dir sparse-checkout set Kits/FidelityFX
+          if ($LASTEXITCODE -ne 0) { throw "FidelityFX SDK sparse checkout failed" }
+          $dll = Join-Path $dir "Kits\FidelityFX\signedbin\amd_fidelityfx_upscaler_dx12.dll"
+          if (-not (Test-Path $dll)) {
+            throw "amd_fidelityfx_upscaler_dx12.dll is missing from the SDK clone"
+          }
+
+      - name: Install DLSS SDK 310.9.16 (DLSS bridge)
+        shell: pwsh
+        run: |
+          # Sparse partial clone: only the NGX headers, the import library and the
+          # signed release DLL are needed for -DKYTY_ENABLE_DLSS=ON.
+          $dir = Join-Path $env:RUNNER_TEMP "DLSS"
+          git clone --depth 1 --branch v310.9.16 --filter=blob:none --sparse https://github.com/NVIDIA/DLSS.git $dir
+          if ($LASTEXITCODE -ne 0) { throw "DLSS SDK clone failed" }
+          git -C $dir sparse-checkout set include lib/Windows_x86_64/x64 lib/Windows_x86_64/rel
+          if ($LASTEXITCODE -ne 0) { throw "DLSS SDK sparse checkout failed" }
+          $dll = Join-Path $dir "lib\Windows_x86_64\rel\nvngx_dlss.dll"
+          if (-not (Test-Path $dll)) {
+            throw "nvngx_dlss.dll is missing from the SDK clone"
+          }
+
+      - name: Install XeSS SDK 3.0.2 (XeSS bridge)
+        shell: pwsh
+        run: |
+          # Sparse partial clone: only the headers and the runtime DLL are needed
+          # for -DKYTY_ENABLE_XESS=ON (the bridge loads libxess.dll at runtime).
+          $dir = Join-Path $env:RUNNER_TEMP "XeSS-SDK"
+          git clone --depth 1 --branch v3.0.2 --filter=blob:none --sparse https://github.com/intel/xess.git $dir
+          if ($LASTEXITCODE -ne 0) { throw "XeSS SDK clone failed" }
+          git -C $dir sparse-checkout set inc lib bin
+          if ($LASTEXITCODE -ne 0) { throw "XeSS SDK sparse checkout failed" }
+          $dll = Join-Path $dir "bin\libxess.dll"
+          if (-not (Test-Path $dll)) {
+            throw "libxess.dll is missing from the SDK clone"
+          }
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -98,7 +143,13 @@ jobs:
             -DKYTY_ARCH_AVX2=ON ^
             -DKYTY_PGO=use ^
             -DKYTY_PGO_PROFILE=%CD%/tools/pgo/nhl27-clang19.profdata ^
-            -DKYTY_PGO_PROFILE_COMPILER=19.1.5
+            -DKYTY_PGO_PROFILE_COMPILER=19.1.5 ^
+            -DKYTY_ENABLE_FSR4=ON ^
+            -DFIDELITYFX4_SDK_DIR=%RUNNER_TEMP%\FidelityFX-SDK ^
+            -DKYTY_ENABLE_DLSS=ON ^
+            -DDLSS_SDK_DIR=%RUNNER_TEMP%\DLSS ^
+            -DKYTY_ENABLE_XESS=ON ^
+            -DXESS_SDK_DIR=%RUNNER_TEMP%\XeSS-SDK
 
       - name: Build
         shell: cmd
@@ -128,8 +179,6 @@ jobs:
 
   macos:
     name: Build KytyPS5 (macOS)
-    # Disabled by default (no macOS builds). Kept for future re-enable: delete this line.
-    if: false
     needs: metadata
     runs-on: macos-15
 
@@ -237,6 +286,7 @@ jobs:
           install -d -m 755 "$app_dir/Contents/Frameworks" "$app_dir/Contents/Resources"
           install -m 755 "$moltenvk" "$app_dir/Contents/Frameworks/libMoltenVK.dylib"
           install -m 644 "$package/LICENSE" "$app_dir/Contents/Resources/LICENSE.MoltenVK"
+          codesign --force --sign - --timestamp=none "$app_dir/Contents/MacOS/kyty_updater"
           codesign --force --sign - --timestamp=none "$app_dir"
 
       - name: Verify artifacts

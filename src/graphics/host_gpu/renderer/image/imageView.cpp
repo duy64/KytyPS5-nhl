@@ -5,8 +5,13 @@
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 
+#include <array>
+#include <atomic>
+#include <cinttypes>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
+#include <string>
 
 namespace Libs::Graphics {
 
@@ -82,6 +87,134 @@ namespace {
 }
 
 } // namespace
+
+// NHL27SAMPLE sample-path diagnostic. Logging only: nothing here alters a view, a
+// mapping, a format or any cache decision. Image::FindView is the single funnel
+// every sampled/storage view is acquired through (TextureCache::FindTexture and
+// the render-target path both end there), so it sees the final VkComponentMapping
+// a guest texture is actually sampled with — the stage NHL27PRESENT cannot see,
+// because it only inspects the present draw's own sampled views.
+namespace {
+
+// One entry per guest address (hashed, single probe; a collision evicts, like the
+// present diagnostic's bounded swizzle table). An event is printed only when an
+// address is first seen with a non-identity mapping, or when the image/view format
+// or the mapping at an address changes — never per draw.
+struct SampleSeen {
+	uint64_t             addr         = 0;
+	vk::Format           image_format = vk::Format::eUndefined;
+	vk::Format           view_format  = vk::Format::eUndefined;
+	vk::ComponentMapping mapping {};
+	bool                 used         = false;
+};
+
+constexpr size_t kSampleSeenCount = 1024;
+
+std::array<SampleSeen, kSampleSeenCount> g_sd_seen {};
+std::mutex                               g_sd_mutex;
+std::atomic<uint64_t>                    g_sd_stat_created {0};
+std::atomic<uint64_t>                    g_sd_stat_nonidentity_created {0};
+std::atomic<uint64_t>                    g_sd_stat_format_changes {0};
+std::atomic<uint64_t>                    g_sd_stat_mapping_changes {0};
+uint64_t                                 g_sd_summary_from = 1;
+
+char SampleSwizzleChar(vk::ComponentSwizzle swizzle, char own) {
+	switch (swizzle) {
+		case vk::ComponentSwizzle::eIdentity: return own;
+		case vk::ComponentSwizzle::eZero: return '0';
+		case vk::ComponentSwizzle::eOne: return '1';
+		case vk::ComponentSwizzle::eR: return 'r';
+		case vk::ComponentSwizzle::eG: return 'g';
+		case vk::ComponentSwizzle::eB: return 'b';
+		case vk::ComponentSwizzle::eA: return 'a';
+		default: return '?';
+	}
+}
+
+// The mapping as four source letters (identity reads "rgba", an R/B swap "bgra").
+std::string SampleMappingText(const vk::ComponentMapping& mapping) {
+	std::string text;
+	text += SampleSwizzleChar(mapping.r, 'r');
+	text += SampleSwizzleChar(mapping.g, 'g');
+	text += SampleSwizzleChar(mapping.b, 'b');
+	text += SampleSwizzleChar(mapping.a, 'a');
+	return text;
+}
+
+bool SampleIsIdentityMapping(const vk::ComponentMapping& mapping) {
+	const auto own = [](vk::ComponentSwizzle swizzle, vk::ComponentSwizzle channel) {
+		return swizzle == vk::ComponentSwizzle::eIdentity || swizzle == channel;
+	};
+	return own(mapping.r, vk::ComponentSwizzle::eR) && own(mapping.g, vk::ComponentSwizzle::eG) &&
+	       own(mapping.b, vk::ComponentSwizzle::eB) && own(mapping.a, vk::ComponentSwizzle::eA);
+}
+
+void SampleDiagTrack(uint64_t addr, int guest_format, vk::Format image_format, vk::Format view_format,
+                     const vk::ComponentMapping& mapping) {
+	if (addr == 0) {
+		return;
+	}
+	std::lock_guard lock(g_sd_mutex);
+	auto&           e = g_sd_seen[static_cast<size_t>((addr >> 12) ^ (addr >> 24)) &
+                                  (kSampleSeenCount - 1)];
+	if (!e.used || e.addr != addr) {
+		e.addr         = addr;
+		e.image_format = image_format;
+		e.view_format  = view_format;
+		e.mapping      = mapping;
+		e.used         = true;
+		if (!SampleIsIdentityMapping(mapping)) {
+			std::printf("NHL27SAMPLE new addr=0x%" PRIx64 " guest=%d image=%s view=%s map=%s "
+			            "(first seen)\n",
+			            addr, guest_format, vk::to_string(image_format).c_str(),
+			            vk::to_string(view_format).c_str(), SampleMappingText(mapping).c_str());
+			std::fflush(stdout);
+		}
+		return;
+	}
+	if (e.image_format != image_format || e.view_format != view_format) {
+		g_sd_stat_format_changes.fetch_add(1, std::memory_order_relaxed);
+		std::printf("NHL27SAMPLE change addr=0x%" PRIx64 " guest=%d image=%s -> %s view=%s -> %s "
+		            "map=%s\n",
+		            addr, guest_format, vk::to_string(e.image_format).c_str(),
+		            vk::to_string(image_format).c_str(), vk::to_string(e.view_format).c_str(),
+		            vk::to_string(view_format).c_str(), SampleMappingText(mapping).c_str());
+		std::fflush(stdout);
+		e.image_format = image_format;
+		e.view_format  = view_format;
+	}
+	if (!(e.mapping == mapping)) {
+		g_sd_stat_mapping_changes.fetch_add(1, std::memory_order_relaxed);
+		std::printf("NHL27SAMPLE change addr=0x%" PRIx64 " guest=%d image=%s view=%s map=%s -> %s\n",
+		            addr, guest_format, vk::to_string(image_format).c_str(),
+		            vk::to_string(view_format).c_str(), SampleMappingText(e.mapping).c_str(),
+		            SampleMappingText(mapping).c_str());
+		std::fflush(stdout);
+		e.mapping = mapping;
+	}
+}
+
+void SampleDiagNoteCreated(const vk::ComponentMapping& mapping) {
+	g_sd_stat_created.fetch_add(1, std::memory_order_relaxed);
+	if (!SampleIsIdentityMapping(mapping)) {
+		g_sd_stat_nonidentity_created.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
+} // namespace
+
+// Printed from PresentDiag::NoteFlip on the NHL27PRESENT summary cadence (every
+// 600 flips); counters are per-window and reset here, like the present summary.
+void SampleDiagPrintSummary(uint64_t frame) {
+	std::printf("NHL27SAMPLE summary frame=%" PRIu64 " views_created=%" PRIu64 " nonidentity_views=%" PRIu64
+	            " format_changes=%" PRIu64 " mapping_changes=%" PRIu64 " since_frame=%" PRIu64 "\n",
+	            frame, g_sd_stat_created.exchange(0, std::memory_order_relaxed),
+	            g_sd_stat_nonidentity_created.exchange(0, std::memory_order_relaxed),
+	            g_sd_stat_format_changes.exchange(0, std::memory_order_relaxed),
+	            g_sd_stat_mapping_changes.exchange(0, std::memory_order_relaxed), g_sd_summary_from);
+	std::fflush(stdout);
+	g_sd_summary_from = frame + 1;
+}
 
 namespace ImageViewOps {
 
@@ -334,6 +467,8 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 		normalized.level_count = std::min(normalized.level_count,
 		                                  image.mip_levels - normalized.base_level);
 	}
+	SampleDiagTrack(info.data.address, static_cast<int>(info.guest_format), image.format,
+	                normalized.format, normalized.mapping);
 	for (size_t i = 0; i < views.size(); i++) {
 		if (views[i].info == normalized) {
 			FrameBreakdown::TexAdd(FrameBreakdown::g_tex.view_hit);
@@ -401,6 +536,7 @@ vk::ImageView Image::FindView(const ImageViewInfo& view_info) {
 	create.subresourceRange.layerCount     = normalized.layer_count;
 
 	FrameBreakdown::TexAdd(FrameBreakdown::g_tex.view_created);
+	SampleDiagNoteCreated(normalized.mapping);
 	vk::ImageView view   = nullptr;
 	const auto    result = m_graphics.device.createImageView(&create, nullptr, &view);
 	if (result != vk::Result::eSuccess || view == nullptr) {

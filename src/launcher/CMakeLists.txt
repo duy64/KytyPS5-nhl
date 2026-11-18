@@ -31,6 +31,26 @@ set(SLINT_FEATURE_RENDERER_FEMTOVG OFF CACHE BOOL "" FORCE)
 set(SLINT_FEATURE_RENDERER_SOFTWARE ON CACHE BOOL "" FORCE)
 set(SLINT_STYLE "fluent-dark" CACHE STRING "" FORCE)
 
+# Corrosion (which builds Slint's Rust core) never reads CMAKE_OSX_ARCHITECTURES: with no
+# explicit Rust target it falls back to the host triple, so on an Apple Silicon machine the
+# Rust half of libslint_cpp.a is built for arm64 while the C++ half follows
+# CMAKE_OSX_ARCHITECTURES, and the link fails with undefined Slint vtables. Pin the Rust
+# target to the architecture being built, the same treatment 3rdparty/CMakeLists.txt
+# already gives FFmpeg; Slint's own CMakeLists presets Rust_CARGO_TARGET the same way for
+# Android.
+if(APPLE AND NOT Rust_CARGO_TARGET)
+	if(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+		set(Rust_CARGO_TARGET "x86_64-apple-darwin" CACHE STRING "" FORCE)
+	elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+		set(Rust_CARGO_TARGET "aarch64-apple-darwin" CACHE STRING "" FORCE)
+	endif()
+	if(Rust_CARGO_TARGET)
+		# If the Rust toolchain does not have the target installed, let Corrosion
+		# install it via rustup instead of failing the configure.
+		set(Rust_RUSTUP_INSTALL_MISSING_TARGET ON CACHE BOOL "" FORCE)
+	endif()
+endif()
+
 FetchContent_Declare(
 	Slint
 	GIT_REPOSITORY https://github.com/slint-ui/slint.git
@@ -103,6 +123,13 @@ endif()
 if(APPLE)
 	# The monitor size (platform.cpp).
 	target_link_libraries(launcher PRIVATE "-framework CoreGraphics")
+	# Slint's Rust core (winit) also references CoreFoundation, Foundation,
+	# AppKit, QuartzCore, Carbon (the HIToolbox keyboard-layout APIs) and the
+	# Objective-C runtime, but Corrosion does not propagate the Rust crates'
+	# framework requests into this C++ link (its required-libs detection
+	# returns only System/c/m), so they are named here; without them the
+	# final link fails with undefined symbols.
+	target_link_libraries(launcher PRIVATE "-framework CoreFoundation" "-framework Foundation" "-framework AppKit" "-framework QuartzCore" "-framework Carbon" objc)
 endif()
 if(UNIX AND NOT APPLE)
 	# The static Slint runtime finds system fonts through fontconfig (libfontconfig1-dev).

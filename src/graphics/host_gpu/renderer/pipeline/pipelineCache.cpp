@@ -1887,6 +1887,7 @@ struct PipelineCache::ProgramCache {
 			return false;
 		}
 		const auto key = lookup_key;
+		const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::CompileWait);
 		do {
 			UnlockPrograms();
 			// A worker that faults on a GPU-written page of the shader code waits for this

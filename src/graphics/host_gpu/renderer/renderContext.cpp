@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/experiments.h"
+#include "common/hitchWhy.h"
 #include "common/hostException.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -10,6 +11,7 @@
 #include "graphics/guest_gpu/stageStats.h"
 #include "graphics/host_gpu/pageWriteSeq.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "kernel/memory.h"
@@ -44,6 +46,9 @@ RenderContext::RenderContext(GraphicContext& graphics)
 }
 
 RenderContext::~RenderContext() {
+	// Stop the frame-dump download worker first, while the allocator and the
+	// command scheduler are still alive for its final VMA calls.
+	FrameDump::Shutdown();
 	ShutdownGpu();
 	m_command_scheduler.Shutdown();
 }
@@ -89,6 +94,7 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 			return false;
 		}
 	}
+	const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Fault);
 	ProtectStats::CountFault(access == PageFaultAccess::Write);
 	if (access == PageFaultAccess::Write && CpReadDebugEnabled()) {
 		ProtectStats::NoteWriteFaultPage(fault_vaddr);
@@ -267,6 +273,16 @@ void RenderContext::MapMemory(uint64_t vaddr, uint64_t size) {
 	m_mapped_ranges_version++;
 }
 
+// KYTY_UNMAP_DISCARD=1: GPU-written bytes in an unmapped range are dead, so no drain and no
+// download. 2 also fills them with 0xCD.
+static int UnmapDiscardMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_UNMAP_DISCARD");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	return mode;
+}
+
 void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 	Common::Timeline::Mark("unmap", size);
 	PageWriteSeq::ForceChecks();
@@ -276,6 +292,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		const Common::HitchWhy::Span hitch_span(Common::HitchWhy::Cause::Unmap);
 		// Finishing the GPU protects GPU writes to the range. Queued GPU work only reads cached
 		// copies, host-only completions (cache bookkeeping, flips, interrupts) never touch the
 		// range, and completions writing guest memory (downloads) skip what was unmapped since
@@ -298,6 +315,10 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		                         !m_texture_cache.HasImagesInRegion(vaddr, size) &&
 		                         !m_command_scheduler.HasPendingGuestOperations(vaddr, size);
 		if (buffer_wait) {
+			drain = false;
+		}
+		const bool discard = (gpu || images) && UnmapDiscardMode() != 0;
+		if (discard) {
 			drain = false;
 		}
 		const auto start   = CpReadDebugEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
@@ -331,12 +352,15 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			}
 		}
 		BufferCache::WriteTagScope tag(BufferCache::WriteTag::Unmap);
+		if (discard) {
+			m_buffer_cache.DiscardMemory(vaddr, size, UnmapDiscardMode() == 2);
+		}
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		if (FrameBreakdown::Enabled()) {
 			// NHL27UNMAP (stats only): unmaps by kind, with the time of the drain plus write-back.
-			static std::atomic<uint64_t> counts[3] {}, ns[3] {};
+			static std::atomic<uint64_t> counts[4] {}, ns[4] {};
 			static std::atomic<int64_t>  last_print {0};
-			const size_t kind = drain ? 0 : buffer_wait ? 1 : 2;
+			const size_t kind = discard ? 3 : drain ? 0 : buffer_wait ? 1 : 2;
 			counts[kind].fetch_add(1, std::memory_order_relaxed);
 			ns[kind].fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
 			                       std::chrono::steady_clock::now() - unmap_start).count()),
@@ -346,13 +370,14 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			int64_t       last = last_print.load(std::memory_order_relaxed);
 			if (now - last >= 5000 && last_print.compare_exchange_strong(last, now)) {
 				const auto take = [](std::atomic<uint64_t>& v) { return v.exchange(0, std::memory_order_relaxed); };
-				const uint64_t dn = take(counts[0]), bn = take(counts[1]), cn = take(counts[2]);
+				const uint64_t dn = take(counts[0]), bn = take(counts[1]), cn = take(counts[2]), xn = take(counts[3]);
 				const double   dm = static_cast<double>(take(ns[0])) / 1e6;
 				const double   bm = static_cast<double>(take(ns[1])) / 1e6;
 				const double   cm = static_cast<double>(take(ns[2])) / 1e6;
-				std::printf("NHL27UNMAP: 5s drain=%llu (%.1f ms) buffer_wait=%llu (%.1f ms) clean=%llu (%.1f ms)\n",
+				const double   xm = static_cast<double>(take(ns[3])) / 1e6;
+				std::printf("NHL27UNMAP: 5s drain=%llu (%.1f ms) buffer_wait=%llu (%.1f ms) clean=%llu (%.1f ms) discard=%llu (%.1f ms)\n",
 				            static_cast<unsigned long long>(dn), dm, static_cast<unsigned long long>(bn), bm,
-				            static_cast<unsigned long long>(cn), cm);
+				            static_cast<unsigned long long>(cn), cm, static_cast<unsigned long long>(xn), xm);
 				std::fflush(stdout);
 			}
 		}

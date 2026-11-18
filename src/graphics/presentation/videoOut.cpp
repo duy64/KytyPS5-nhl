@@ -18,6 +18,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/frameBreakdown.h"
+#include "graphics/host_gpu/renderer/frameDump.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -1048,6 +1049,7 @@ bool FlipQueue::Reserve(VideoOutConfig& cfg, int index, int64_t flip_arg, FlipRe
 	pending.push_back(r);
 	request_id = r.id;
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::FlipsRequested);
+	Common::HitchWhy::NoteFlipRequest();
 
 	cfg.flip_status.flipPendingNum++;
 	cfg.flip_status.submitProcessTimeCounter = r.submit_ptc;
@@ -1199,6 +1201,8 @@ void FlipQueue::Prepare(uint64_t request_id, Graphics::CommandBuffer& buffer) {
 		frame = &m_presenter.PrepareBlankFrame(width, height, index == VIDEO_OUT_BUFFER_INDEX_BLACK,
 		                                       &buffer);
 	} else {
+		// NHL27PRESENT: feed the present-stage diagnostic the buffer being presented.
+		Graphics::PresentDiag::NoteFlip(source_info.data.address, source_info.pixel_format);
 		frame = &m_presenter.PrepareFrame(buffer, source_info, hdr, headset);
 		if (headset) {
 			g_headset_mirror = true;
@@ -1520,6 +1524,7 @@ KYTY_SYSV_ABI int VideoOutSetFlipRate(int handle, int rate) {
 	Common::LockGuard lock(ctx->mutex);
 	if (ctx->requested_flip_rate != requested) {
 		Common::Timeline::Mark("flip-rate", static_cast<uint64_t>(requested));
+		Common::HitchWhy::NoteRate(static_cast<int>(requested));
 		// The game picks its frame rate (0 = 60, 1 = 30, 2 = 20 Hz): 60 Hz in play, 30 Hz in menus
 		// and many presentation scenes. With the flip count, a run's fps splits by the rate it
 		// asked for (KytyPS5-tools fps-by-rate.py); a few changes per minute.

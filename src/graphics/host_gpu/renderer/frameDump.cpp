@@ -7,10 +7,12 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 
 #include <cerrno>
 #include <set>
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cinttypes>
 #include <cmath>
@@ -18,7 +20,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <map>
 #include <mutex>
+#include <condition_variable>
+#include <queue>
+#include <thread>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -52,6 +58,8 @@ struct Target {
 	uint32_t             seq = 0;
 	uint32_t             slices = 1; // >1: 3D volume, all z slices are read back
 	bool                 img3d = false; // 3D image bound to a KYTY_DBG_FRAME_DUMP_BUF_PS draw: raw .bin + IMG3D line
+	bool                 relabelled = false; // format holds the registered video-out format, not the creation format
+	vk::Format           created_format = vk::Format::eUndefined; // cache creation format, kept when relabelled
 };
 
 struct Pending {
@@ -105,6 +113,97 @@ std::vector<BufPending>  g_bufpending;
 std::string              g_buflog;
 std::set<std::pair<uint64_t, uint32_t>> g_seen_vol; // (address, draw seq)
 std::set<std::string>    g_seen_buf;
+
+// ---- guest sampled-texture readback (NHL27GUESTTEX) ----
+// Sampled textures are never read back from the GPU (the dump saves render
+// targets and written storage images only), so what a shader actually sampled
+// is the dump's blind spot. For every unique sampled binding of the captured
+// frame, the download worker copies the RAW GUEST BYTES out of guest memory
+// (LibKernel::Memory::TryReadBacking, which fails cleanly on unmapped/short
+// ranges) into a .bin next to the PNGs, indexed by guesttex.txt. That is what
+// lets a capture answer "what bytes does the game hold at this texture's
+// address" (e.g. the Bc7 logo textures) offline. The copies run in the worker,
+// not on the game thread; guest memory may have moved on by then, which is
+// acceptable for the streamed/static assets this targets. Separate byte budget
+// from the GPU readback staging: these are plain host file writes, no staging
+// allocations are held.
+//
+// Two collection blind spots are covered on top of the in-frame bindings:
+//  - Textures uploaded BEFORE the captured frame (e.g. a hub photo uploaded
+//    while a menu loads, then only composited by later frames): OnDraw and
+//    OnDispatch run only during a capture (their call sites gate on
+//    FrameDump::Active()), so bindings alone can never see them. Instead the
+//    texture cache reports every guest texture upload to a session record
+//    (NoteTextureUpload), and FinishCapture merges the record into the dump.
+//    Merged entries keep seq 0: no draw of the captured frame bound them.
+//    The record lives for the whole session (a dump does NOT clear it) and
+//    holds descriptors only, never bytes; the worker reads the guest bytes
+//    at dump time exactly like for in-frame bindings.
+//  - Late-frame starvation: collection order is draw order, so a byte budget
+//    spent first-come on early multi-megabyte textures used to cut off the
+//    small UI textures bound late (leaders-board logos at draws ~4500-6300).
+//    Collection therefore takes every eligible descriptor; the worker
+//    admits in-frame candidates SMALLEST FIRST, then session-record
+//    candidates in first-upload order, under the byte/count budgets,
+//    writing the rest as SKIPPED (over guesttex budget) index lines.
+struct GuestTexReq {
+	uint64_t    addr      = 0;
+	uint64_t    size      = 0;
+	uint32_t    seq       = 0; // first draw/dispatch that bound it
+	uint32_t    guest_fmt = 0;
+	std::string vk_fmt;
+	uint32_t    w = 0, h = 0, d = 0;
+	uint32_t    levels = 0, layers = 0;
+	uint32_t    tile_mode = 0;
+	uint32_t    upload_order = 0; // session record: order of the first upload at this address
+};
+std::vector<GuestTexReq>                g_guesttex;
+std::set<std::pair<uint64_t, uint64_t>> g_seen_guesttex; // (address, size)
+uint64_t                                g_guesttex_bytes = 0;
+constexpr uint64_t kGuestTexMaxSize    = 64ull << 20;  // per texture
+constexpr uint64_t kGuestTexMaxBytes   = 512ull << 20; // per capture (worker admission)
+constexpr size_t   kGuestTexMaxCount   = 4096;         // files per capture (worker admission)
+constexpr size_t   kGuestTexMaxCollect = 8192;         // candidate descriptors per capture
+
+// Session record of guest texture uploads (descriptors only), keyed by guest
+// address: a re-upload at the same address replaces the entry but keeps its
+// first-upload order (GuestTexReq::upload_order), which the worker's
+// admission uses to reach early uploads (e.g. a hub photo taken during a
+// menu load) before the thousands of small uploads that follow them. Fed by
+// NoteTextureUpload under its own mutex — the texture cache calls it with the
+// cache lock held, so it must never wait on g_mutex. Once the record is full,
+// existing addresses can still be replaced but new ones are dropped (logged
+// once), so the record favours the textures seen first in the session.
+std::map<uint64_t, GuestTexReq> g_guesttex_session;
+std::mutex                      g_guesttex_session_mutex;
+constexpr size_t                kGuestTexSessionMax       = 16384;
+bool                            g_guesttex_session_full   = false; // under g_guesttex_session_mutex
+uint32_t                        g_guesttex_session_uploads = 0;    // under g_guesttex_session_mutex
+
+// ---- async download: finished captures are handed to a worker thread ----
+// The flip thread records a capture and waits only for the GPU copies
+// (FinishCapture); the worker thread does the per-pixel decode, the PNG
+// writes, the frame.txt/buffers.txt assembly, and the done line.
+struct CaptureJob {
+	std::vector<Pending>    pending;    // staging buffers, moved out of g_pending
+	std::vector<BufPending> bufpending; // moved out of g_bufpending
+	std::vector<GuestTexReq> guesttex;  // moved out of g_guesttex (NHL27GUESTTEX)
+	size_t                  guesttex_session = 0; // guesttex entries merged from the session record
+	std::string             draws;      // moved out of g_log (draw/dispatch lines)
+	std::string             buflog;     // moved out of g_buflog
+	std::string             dir;        // copied from g_dir
+	uint32_t                seq = 0;    // g_seq at handoff (draws/dispatches count)
+	uint32_t                images = 0; // g_pending.size() at handoff
+	size_t                  bufreq_leftover = 0; // g_bufreq.size() at handoff
+};
+
+std::queue<CaptureJob>  g_jobs;
+std::mutex              g_job_mutex;
+std::condition_variable g_job_cv;
+std::thread             g_worker;
+std::atomic<bool>       g_worker_stop {false};
+std::atomic<bool>       g_worker_started {false};
+std::atomic<bool>       g_worker_stopped {false}; // Shutdown() ran (double-call guard)
 
 // KYTY_DBG_FRAME_DUMP_BUF_PS=<hex ps hash>[,...]|all selects the draws whose buffers/volumes are dumped.
 // Default: the NHL 27 tiled deferred lighting pixel shaders.
@@ -346,16 +445,17 @@ void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
 
 std::string Hex(uint64_t v);
 
-void ProcessBuffers() {
-	for (auto& p : g_bufpending) {
+void ProcessBuffers(std::vector<BufPending>& bufpending, std::string& buflog,
+                    const std::string& dir) {
+	for (auto& p : bufpending) {
 		char line[512];
 		std::snprintf(line, sizeof(line), "== buffer %s of #%05u guest addr=0x%" PRIx64 " (dumped %" PRIu64 " bytes) ==\n",
 		              p.req.label.c_str(), p.req.seq, p.req.addr, p.req.size);
-		g_buflog += line;
+		buflog += line;
 		if (p.mapped != nullptr) {
 			vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
 			const auto* d = static_cast<const uint8_t*>(p.mapped);
-			g_buflog += WordsText(d, static_cast<size_t>(std::min<uint64_t>(p.req.size, 256)));
+			buflog += WordsText(d, static_cast<size_t>(std::min<uint64_t>(p.req.size, 256)));
 			{
 				size_t nz = 0;
 				const size_t nd = static_cast<size_t>(p.req.size / 4);
@@ -364,23 +464,23 @@ void ProcessBuffers() {
 					std::memcpy(&w, d + k * 4, 4);
 					nz += w != 0;
 				}
-				g_buflog += "    nonzero dwords: " + std::to_string(nz) + " / " + std::to_string(nd) + "\n";
+				buflog += "    nonzero dwords: " + std::to_string(nz) + " / " + std::to_string(nd) + "\n";
 			}
 			if (p.req.size <=(4ull << 20)) {
-				std::snprintf(line, sizeof(line), "%s/buf_%05u_%s_%s.bin", g_dir.c_str(), p.req.seq,
+				std::snprintf(line, sizeof(line), "%s/buf_%05u_%s_%s.bin", dir.c_str(), p.req.seq,
 				              p.req.label.c_str(), Hex(p.req.addr).c_str());
 				if (FILE* f = std::fopen(line, "wb")) {
 					std::fwrite(d, 1, static_cast<size_t>(p.req.size), f);
 					std::fclose(f);
-					g_buflog += std::string("    full dump -> ") + std::filesystem::path(line).filename().string() + "\n";
+					buflog += std::string("    full dump -> ") + std::filesystem::path(line).filename().string() + "\n";
 				}
 			} else {
-				g_buflog += "    (>=64KB: only the first 64KB copied, first 256 bytes shown)\n";
+				buflog += "    (>=64KB: only the first 64KB copied, first 256 bytes shown)\n";
 			}
 		}
 		vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
 	}
-	g_bufpending.clear();
+	bufpending.clear();
 }
 
 const char* TypeName(Prospero::ImageType t) {
@@ -410,12 +510,14 @@ uint32_t BytesPerPixel(vk::Format f) {
 		case vk::Format::eR8Unorm: case vk::Format::eR8Uint: case vk::Format::eR8Snorm:
 		case vk::Format::eR8Sint: return 1;
 		case vk::Format::eR8G8Unorm: case vk::Format::eR8G8Uint: case vk::Format::eR8G8Snorm:
+		case vk::Format::eR8G8Sint:
 		case vk::Format::eR16Unorm: case vk::Format::eR16Sfloat: case vk::Format::eR16Uint:
 		case vk::Format::eR16Snorm: case vk::Format::eR16Sint:
 		case vk::Format::eR5G6B5UnormPack16: case vk::Format::eD16Unorm:
 		case vk::Format::eD16UnormS8Uint: return 2;
 		case vk::Format::eR8G8B8A8Unorm: case vk::Format::eR8G8B8A8Srgb:
 		case vk::Format::eR8G8B8A8Snorm: case vk::Format::eR8G8B8A8Uint:
+		case vk::Format::eR8G8B8A8Sint:
 		case vk::Format::eB8G8R8A8Unorm: case vk::Format::eB8G8R8A8Srgb:
 		case vk::Format::eA2B10G10R10UnormPack32: case vk::Format::eA2R10G10B10UnormPack32:
 		case vk::Format::eA2B10G10R10UintPack32: case vk::Format::eB10G11R11UfloatPack32:
@@ -425,8 +527,13 @@ uint32_t BytesPerPixel(vk::Format f) {
 		case vk::Format::eD24UnormS8Uint: case vk::Format::eD32SfloatS8Uint: return 4;
 		case vk::Format::eR16G16B16A16Sfloat: case vk::Format::eR16G16B16A16Unorm:
 		case vk::Format::eR16G16B16A16Uint: case vk::Format::eR16G16B16A16Snorm:
-		case vk::Format::eR32G32Sfloat: case vk::Format::eR32G32Uint: return 8;
-		case vk::Format::eR32G32B32A32Sfloat: case vk::Format::eR32G32B32A32Uint: return 16;
+		case vk::Format::eR16G16B16A16Sint:
+		case vk::Format::eR32G32Sfloat: case vk::Format::eR32G32Uint: case vk::Format::eR32G32Sint:
+		case vk::Format::eR64Uint: case vk::Format::eR64Sint: case vk::Format::eR64Sfloat: return 8;
+		case vk::Format::eR32G32B32Sfloat: case vk::Format::eR32G32B32Uint:
+		case vk::Format::eR32G32B32Sint: return 12;
+		case vk::Format::eR32G32B32A32Sfloat: case vk::Format::eR32G32B32A32Uint:
+		case vk::Format::eR32G32B32A32Sint: return 16;
 		default: return 0;
 	}
 }
@@ -687,8 +794,144 @@ std::string Hex(uint64_t v) {
 	return b;
 }
 
+// Records one sampled binding for the guest-byte dump (see GuestTexReq).
+// Called with g_mutex held. No byte budget here: admission under the budget
+// happens smallest-first in the worker (ProcessGuestTex), so a big texture
+// bound early cannot starve the small ones bound late.
+void CollectGuestTex(uint32_t seq, const TextureBinding& b) {
+	const auto& info = b.desc.info;
+	if (b.desc.type != TextureCache::BindingType::Texture) return;
+	const uint64_t addr = info.data.address;
+	const uint64_t size = info.data.size;
+	if (addr == 0 || size == 0 || size > kGuestTexMaxSize) return;
+	if (!info.data.Valid()) return;
+	if (g_guesttex.size() >= kGuestTexMaxCollect) return;
+	if (!g_seen_guesttex.insert(std::make_pair(addr, size)).second) return;
+	GuestTexReq r;
+	r.addr      = addr;
+	r.size      = size;
+	r.seq       = seq;
+	r.guest_fmt = static_cast<uint32_t>(info.guest_format);
+	r.vk_fmt    = vk::to_string(info.pixel_format);
+	r.w         = info.extent.width;
+	r.h         = info.extent.height;
+	r.d         = info.extent.depth;
+	r.levels    = info.resources.levels;
+	r.layers    = info.resources.layers;
+	r.tile_mode = static_cast<uint32_t>(info.tile_mode);
+	g_guesttex.push_back(std::move(r));
+	g_guesttex_bytes += size;
+}
+
+// Worker side of the guest sampled-texture dump: reads the guest bytes for
+// each admitted candidate and writes them as .bin files plus the guesttex.txt
+// index. Runs on the download worker thread (ProcessJob).
+void ProcessGuestTex(CaptureJob& job) {
+	if (job.guesttex.empty()) return;
+	// Admission under the byte/count budgets, in two classes. In-frame
+	// candidates (seq != 0) go first, SMALLEST FIRST: collection order is
+	// draw order, so first-come admission let early multi-megabyte textures
+	// starve the small UI textures bound late in the frame. Session-record
+	// candidates (seq == 0) follow in UPLOAD ORDER (first upload at their
+	// address): the textures the record exists for were uploaded early —
+	// a hub photo during a menu load — and thousands of later small uploads
+	// would bury them under any size order. Candidates that do not fit are
+	// still listed in the index as SKIPPED (over guesttex budget).
+	std::vector<size_t> order;
+	order.reserve(job.guesttex.size());
+	for (size_t i = 0; i < job.guesttex.size(); i++) {
+		if (job.guesttex[i].seq != 0) order.push_back(i);
+	}
+	std::sort(order.begin(), order.end(), [&job](size_t a, size_t b) {
+		if (job.guesttex[a].size != job.guesttex[b].size) return job.guesttex[a].size < job.guesttex[b].size;
+		return a < b;
+	});
+	std::vector<size_t> session;
+	for (size_t i = 0; i < job.guesttex.size(); i++) {
+		if (job.guesttex[i].seq == 0) session.push_back(i);
+	}
+	std::sort(session.begin(), session.end(), [&job](size_t a, size_t b) {
+		if (job.guesttex[a].upload_order != job.guesttex[b].upload_order)
+			return job.guesttex[a].upload_order < job.guesttex[b].upload_order;
+		return a < b;
+	});
+	order.insert(order.end(), session.begin(), session.end());
+	std::vector<bool> admit(job.guesttex.size(), false);
+	uint64_t          total_bytes = 0;
+	uint64_t          admit_bytes = 0;
+	size_t            admit_count = 0;
+	for (const size_t i : order) {
+		const auto& r = job.guesttex[i];
+		total_bytes += r.size;
+		if (admit_count >= kGuestTexMaxCount || admit_bytes + r.size > kGuestTexMaxBytes) continue;
+		admit[i] = true;
+		admit_count++;
+		admit_bytes += r.size;
+	}
+	const size_t   skipped_budget       = job.guesttex.size() - admit_count;
+	const uint64_t skipped_budget_bytes = total_bytes - admit_bytes;
+	std::string          index;
+	uint32_t             written       = 0;
+	uint32_t             skipped_read  = 0;
+	uint32_t             skipped_write = 0;
+	uint64_t             bytes         = 0;
+	std::vector<uint8_t> data;
+	for (size_t i = 0; i < job.guesttex.size(); i++) {
+		const auto& r = job.guesttex[i];
+		char line[768];
+		if (!admit[i]) {
+			std::snprintf(line, sizeof(line),
+			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " SKIPPED (over guesttex budget)\n",
+			              r.seq, Hex(r.addr).c_str(), r.size);
+			index += line;
+			continue;
+		}
+		char fname[320];
+		std::snprintf(fname, sizeof(fname), "guesttex_%05u_%s_%ux%ux%u_g%u_%s.bin", r.seq,
+		              Hex(r.addr).c_str(), r.w, r.h, r.d, r.guest_fmt, r.vk_fmt.c_str());
+		data.assign(static_cast<size_t>(r.size), 0);
+		if (!LibKernel::Memory::TryReadBacking(r.addr, data.data(), r.size)) {
+			skipped_read++;
+			std::snprintf(line, sizeof(line),
+			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " SKIPPED (guest read failed)\n",
+			              r.seq, Hex(r.addr).c_str(), r.size);
+			index += line;
+			continue;
+		}
+		const std::string path = job.dir + "/" + fname;
+		if (FILE* f = std::fopen(path.c_str(), "wb")) {
+			std::fwrite(data.data(), 1, data.size(), f);
+			std::fclose(f);
+			written++;
+			bytes += r.size;
+			std::snprintf(line, sizeof(line),
+			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " guest_fmt=%u vk=%s %ux%ux%u "
+			              "levels=%u layers=%u tile_mode=%u -> %s\n",
+			              r.seq, Hex(r.addr).c_str(), r.size, r.guest_fmt, r.vk_fmt.c_str(), r.w, r.h, r.d,
+			              r.levels, r.layers, r.tile_mode, fname);
+		} else {
+			skipped_write++;
+			std::snprintf(line, sizeof(line),
+			              "NHL27GUESTTEX seq=%u addr=0x%s size=%" PRIu64 " SKIPPED (file write failed)\n",
+			              r.seq, Hex(r.addr).c_str(), r.size);
+		}
+		index += line;
+	}
+	if (FILE* f = std::fopen((job.dir + "/guesttex.txt").c_str(), "wb")) {
+		std::fwrite(index.data(), 1, index.size(), f);
+		std::fclose(f);
+	}
+	std::printf("NHL27GUESTTEX: %u/%zu sampled textures dumped (%" PRIu64 " bytes) -> %s/guesttex.txt\n",
+	            written, job.guesttex.size(), bytes, job.dir.c_str());
+	std::printf("NHL27GUESTTEX: candidates=%zu session=%zu recorded=%u (%" PRIu64 " bytes) "
+	            "skipped_budget=%zu (%" PRIu64 " bytes) skipped_read=%u skipped_write=%u\n",
+	            job.guesttex.size(), job.guesttex_session, written, bytes, skipped_budget,
+	            skipped_budget_bytes, skipped_read, skipped_write);
+	std::fflush(stdout);
+}
+
 // 3D volume: per-channel min/max/mean/nonzero over all voxels, a few voxel samples, z-slice PNGs.
-void ProcessVolume(Pending& p) {
+void ProcessVolume(Pending& p, const std::string& dir, std::string& log, std::string& buflog) {
 	const auto&    t   = p.target;
 	const uint32_t bpp = BytesPerPixel(t.format);
 	const size_t   sl  = static_cast<size_t>(t.w) * t.h * bpp;
@@ -703,7 +946,7 @@ void ProcessVolume(Pending& p) {
 			nz += w != 0;
 		}
 		char path[640];
-		std::snprintf(path, sizeof(path), "%s/img3d_%u_%u_%s.bin", g_dir.c_str(), p.seq, t.slot, Hex(t.addr).c_str());
+		std::snprintf(path, sizeof(path), "%s/img3d_%u_%u_%s.bin", dir.c_str(), p.seq, t.slot, Hex(t.addr).c_str());
 		std::string fname = "(write failed)";
 		if (FILE* f = std::fopen(path, "wb")) {
 			std::fwrite(d, 1, static_cast<size_t>(p.size), f);
@@ -721,10 +964,10 @@ void ProcessVolume(Pending& p) {
 			std::snprintf(wb, sizeof(wb), " %08x", w);
 			line += wb;
 		}
-		g_buflog += line + " -> " + fname + "\n";
+		buflog += line + " -> " + fname + "\n";
 	}
 	char base[512];
-	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%ux%u_%s", g_dir.c_str(), p.seq, p.label.c_str(),
+	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%ux%u_%s", dir.c_str(), p.seq, p.label.c_str(),
 	              Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str());
 	char line[1024];
 	double   sum[4] = {0, 0, 0, 0};
@@ -737,7 +980,7 @@ void ProcessVolume(Pending& p) {
 		if (!slices[z].ok) {
 			std::snprintf(line, sizeof(line), "VOL seq=%u addr=0x%s %ux%ux%u fmt=%s UNSUPPORTED\n", p.seq,
 			              Hex(t.addr).c_str(), t.w, t.h, t.slices, vk::to_string(t.format).c_str());
-			g_log += line;
+			log += line;
 			return;
 		}
 		const auto& d = slices[z];
@@ -767,14 +1010,14 @@ void ProcessVolume(Pending& p) {
 	              mn[2], mn[3], mx[0], mx[1], mx[2], mx[3], sum[0] / static_cast<double>(total),
 	              sum[1] / static_cast<double>(total), sum[2] / static_cast<double>(total),
 	              sum[3] / static_cast<double>(total));
-	g_log += line;
+	log += line;
 	const uint32_t cx = t.w / 2, cy = t.h / 2, cz = t.slices / 2;
 	const uint32_t probes[5][3] = {{0, 0, 0}, {cx, cy, cz}, {cx, cy, 0}, {t.w - 1, t.h - 1, t.slices - 1}, {cx / 2, cy / 2, cz / 2}};
 	for (const auto& pr : probes) {
 		std::snprintf(line, sizeof(line), "    voxel(%u,%u,%u) = %g %g %g %g\n", pr[0], pr[1], pr[2],
 		              at(pr[0], pr[1], pr[2], 0), at(pr[0], pr[1], pr[2], 1), at(pr[0], pr[1], pr[2], 2),
 		              at(pr[0], pr[1], pr[2], 3));
-		g_log += line;
+		log += line;
 	}
 	float scale = 1.0f;
 	{
@@ -790,10 +1033,10 @@ void ProcessVolume(Pending& p) {
 		});
 		files += " " + std::filesystem::path(f).filename().string();
 	}
-	g_log += "    slices (auto-exposed, p99 lum scale " + std::to_string(scale) + "):" + files + "\n";
+	log += "    slices (auto-exposed, p99 lum scale " + std::to_string(scale) + "):" + files + "\n";
 }
 
-void ProcessOne(Pending& p) {
+void ProcessOne(Pending& p, const std::string& dir, std::string& log, std::string& buflog) {
 	if (p.mapped == nullptr) return;
 	vmaInvalidateAllocation(p.graphics->allocator, p.alloc, 0, VK_WHOLE_SIZE);
 	const auto& t = p.target;
@@ -803,33 +1046,52 @@ void ProcessOne(Pending& p) {
 	}();
 	if (raw_enabled) {
 		char path[640];
-		std::snprintf(path, sizeof(path), "%s/%05u_%s_%s_%ux%ux%u_%s.raw", g_dir.c_str(),
+		std::snprintf(path, sizeof(path), "%s/%05u_%s_%s_%ux%ux%u_%s.raw", dir.c_str(),
 		    p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, t.slices,
 		    vk::to_string(t.format).c_str());
 		if (FILE* output = std::fopen(path, "wb")) {
 			const auto written = std::fwrite(p.mapped, 1, static_cast<size_t>(p.size), output);
 			std::fclose(output);
-			g_log += "RAW seq=" + std::to_string(p.seq) + " bytes=" + std::to_string(written) +
+			log += "RAW seq=" + std::to_string(p.seq) + " bytes=" + std::to_string(written) +
 			    " expected=" + std::to_string(p.size) + " mip=" + std::to_string(t.mip) +
 			    " layer=" + std::to_string(t.layer) + " -> " +
 			    std::filesystem::path(path).filename().string() + "\n";
 		} else {
-			g_log += "RAW seq=" + std::to_string(p.seq) + " file_open_failed\n";
+			log += "RAW seq=" + std::to_string(p.seq) + " file_open_failed\n";
 		}
 	}
 	if (t.slices > 1) {
-		ProcessVolume(p);
+		ProcessVolume(p, dir, log, buflog);
 		return;
 	}	Decoded d = Decode(t, static_cast<const uint8_t*>(p.mapped));
 	char base[512];
-	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%u_%s", g_dir.c_str(), p.seq, p.label.c_str(),
+	std::snprintf(base, sizeof(base), "%s/%05u_%s_%s_%ux%u_%s", dir.c_str(), p.seq, p.label.c_str(),
 	              Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
 	const std::string b = base;
-	char line[768];
+	char line[1024];
+	// NHL27FRAMEDUMP label fix: when a flip-buffer target was relabelled, the
+	// IMG lines below carry the registered format in fmt= and this note keeps
+	// the cache creation format on record.
+	const std::string relabel =
+	    t.relabelled ? " relabelled: cache image created as " + vk::to_string(t.created_format) +
+	                       ", decoded with the registered video-out format"
+	                 : "";
 	if (!d.ok) {
-		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s UNSUPPORTED (not decoded)\n",
-		              p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
-		g_log += line;
+		// No PNG decode for this format: keep the raw readback bytes instead of
+		// discarding them, so the target's content survives for offline analysis.
+		const std::string f      = b + ".bin";
+		std::string       suffix = " (raw write failed)";
+		if (FILE* out = std::fopen(f.c_str(), "wb")) {
+			if (std::fwrite(p.mapped, 1, static_cast<size_t>(p.size), out) ==
+			    static_cast<size_t>(p.size)) {
+				suffix = " -> " + std::filesystem::path(f).filename().string();
+			}
+			std::fclose(out);
+		}
+		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s UNSUPPORTED (not decoded)%s%s\n",
+		              p.seq, p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h,
+		              vk::to_string(t.format).c_str(), suffix.c_str(), relabel.c_str());
+		log += line;
 		return;
 	}
 	// Stats over the used channels.
@@ -910,10 +1172,21 @@ void ProcessOne(Pending& p) {
 			note(f);
 		}
 	}
-	std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s min=%g max=%g ->%s\n", p.seq,
+	if (d.kind == Kind::Int) {
+		// Integer targets (material-ID buffers, lighting masks) lose their exact
+		// values in the normalized PNG; keep the raw readback bytes alongside it
+		// so individual pixel values stay readable offline.
+		const std::string f = b + ".bin";
+		if (FILE* out = std::fopen(f.c_str(), "wb")) {
+			std::fwrite(p.mapped, 1, static_cast<size_t>(p.size), out);
+			std::fclose(out);
+			note(f);
+		}
+	}
+	std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s min=%g max=%g ->%s%s\n", p.seq,
 	              p.label.c_str(), Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str(), mn, mx,
-	              files.c_str());
-	g_log += line;
+	              files.c_str(), relabel.c_str());
+	log += line;
 }
 
 void BarrierImage(const CommandRecorder& cmd, const Target& t, vk::ImageLayout from, vk::ImageLayout to,
@@ -973,6 +1246,57 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 		return;
 	}
 	const uint64_t size = static_cast<uint64_t>(t.w) * t.h * bpp * t.slices;
+	using S = vk::PipelineStageFlagBits2;
+	using A = vk::AccessFlagBits2;
+	// State refresh: a target read back three or more times in one capture keeps only its FIRST
+	// state and its LATEST state. The latest state's staging buffer is reused in place — the
+	// copies are recorded in stream order, so the buffer ends up holding the newest state at no
+	// extra pending bytes. Without this, a target written dozens of times in one frame (the
+	// scene target, ~30 states) burns the whole readback budget and the frame's last passes —
+	// the composition/UI stage — are all skipped.
+	{
+		uint32_t matches = 0;
+		Pending* latest  = nullptr;
+		for (auto& p : g_pending) {
+			if (p.target.image == t.image && p.target.mip == t.mip && p.target.layer == t.layer &&
+			    p.target.copy_aspect == t.copy_aspect && p.label == label) {
+				if (++matches == 2) latest = &p;
+			}
+		}
+		if (latest != nullptr && latest->size == size) {
+			// The previous copy into this buffer must complete before the refresh copy
+			// overwrites it (write-after-write within the same stream).
+			vk::BufferMemoryBarrier2 bb {};
+			bb.srcStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+			bb.srcAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+			bb.dstStageMask        = vk::PipelineStageFlagBits2::eTransfer;
+			bb.dstAccessMask       = vk::AccessFlagBits2::eTransferWrite;
+			bb.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			bb.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+			bb.buffer              = latest->buffer;
+			bb.offset              = 0;
+			bb.size                = VK_WHOLE_SIZE;
+			vk::DependencyInfo dep {};
+			dep.bufferMemoryBarrierCount = 1;
+			dep.pBufferMemoryBarriers    = &bb;
+			cmd.pipelineBarrier2(dep);
+			BarrierImage(cmd, t, t.layout, vk::ImageLayout::eTransferSrcOptimal, S::eAllCommands,
+			             A::eMemoryWrite, S::eTransfer, A::eTransferRead);
+			vk::BufferImageCopy copy {};
+			copy.imageSubresource = {t.copy_aspect, t.mip, t.layer, 1};
+			copy.imageExtent      = vk::Extent3D {t.w, t.h, t.slices};
+			cmd.copyImageToBuffer(t.image, vk::ImageLayout::eTransferSrcOptimal, latest->buffer, 1, &copy);
+			BarrierImage(cmd, t, vk::ImageLayout::eTransferSrcOptimal, t.layout, S::eTransfer, A::eTransferRead,
+			             S::eAllCommands, A::eMemoryRead | A::eMemoryWrite);
+			std::snprintf(line, sizeof(line),
+			              "IMG seq=%u %s addr=0x%s %ux%u REFRESH (latest state reuses the readback slot of seq=%u)\n",
+			              seq, label, Hex(t.addr).c_str(), t.w, t.h, latest->seq);
+			g_log += line;
+			latest->seq    = seq;
+			latest->target = t;
+			return;
+		}
+	}
 	if (g_pending_bytes + size > kMaxPendingBytes) {
 		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u SKIPPED (readback memory cap)\n", seq,
 		              label, Hex(t.addr).c_str(), t.w, t.h);
@@ -996,8 +1320,6 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 	g_images++;
 	g_pending_bytes += size;
 
-	using S = vk::PipelineStageFlagBits2;
-	using A = vk::AccessFlagBits2;
 	BarrierImage(cmd, t, t.layout, vk::ImageLayout::eTransferSrcOptimal, S::eAllCommands,
 	             A::eMemoryWrite, S::eTransfer, A::eTransferRead);
 	vk::BufferImageCopy copy {};
@@ -1017,6 +1339,61 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 	p.label    = label;
 	p.graphics = &gfx;
 	g_pending.push_back(std::move(p));
+}
+
+// ---- registered video-out formats (NHL27FRAMEDUMP label fix) ----
+// PresentDiag::NoteFlip is fed the REGISTERED format of every flipped buffer
+// (videoOut.cpp passes the registration group's ImageInfo.pixel_format), while
+// a flip buffer's texture-cache image keeps the format of whichever lookup
+// created it first: a guest-descriptor lookup derives A2B10G10R10 for the
+// guest k10_10_10_2UNorm data, the registration derives A2R10G10B10 for this
+// game. The guest bits always follow the registered layout — that is the
+// layout the display path presents them with — so a readback labelled with
+// the creation format decodes with red and blue exchanged. NoteFlip records
+// the registered format per address here (via NoteRegisteredFlipFormat,
+// defined below the anonymous namespace) and MakeTarget decodes flip-buffer
+// targets with it. Labelling only: the readback bytes, the copy and every
+// rendering decision are unchanged. Bounded table, the same trade-off as the
+// present diagnostic's own tables; a never-flipped or evicted address simply
+// keeps its creation-format label, which is the pre-fix behaviour.
+struct FlipFormatSeen {
+	uint64_t   addr   = 0;
+	vk::Format format = vk::Format::eUndefined;
+};
+constexpr size_t kFlipFormatSeenCount = 16;
+std::array<FlipFormatSeen, kFlipFormatSeenCount> g_flip_formats {};
+std::mutex                                       g_flip_formats_mutex;
+
+vk::Format RegisteredFlipFormat(uint64_t addr) {
+	std::lock_guard lock(g_flip_formats_mutex);
+	for (const auto& e : g_flip_formats) {
+		if (e.addr == addr) return e.format;
+	}
+	return vk::Format::eUndefined;
+}
+
+// True when a and b are the same packed family in opposite channel order —
+// the only way a cache creation format and a registered video-out format can
+// legitimately disagree about the same guest bits (the VIDEO_OUT_FORMAT_
+// POLICIES table splits exactly these families by channel order). Anything
+// else (different family, different packing, float formats) is not a label
+// ambiguity and is never relabelled.
+bool FlipFormatChannelOrderPair(vk::Format a, vk::Format b) {
+	const auto family = [](vk::Format f) {
+		switch (f) {
+			case vk::Format::eR8G8B8A8Unorm: case vk::Format::eR8G8B8A8Srgb:
+			case vk::Format::eB8G8R8A8Unorm: case vk::Format::eB8G8R8A8Srgb: return 1;
+			case vk::Format::eA2B10G10R10UnormPack32:
+			case vk::Format::eA2R10G10B10UnormPack32: return 2;
+			default: return 0;
+		}
+	};
+	const auto b_first = [](vk::Format f) {
+		return f == vk::Format::eB8G8R8A8Unorm || f == vk::Format::eB8G8R8A8Srgb ||
+		       f == vk::Format::eA2B10G10R10UnormPack32;
+	};
+	const int fa = family(a), fb = family(b);
+	return fa != 0 && fa == fb && b_first(a) != b_first(b);
 }
 
 bool MakeTarget(RenderContext& ctx, ImageId id, const ImageViewInfo& view, vk::ImageLayout layout,
@@ -1039,6 +1416,22 @@ bool MakeTarget(RenderContext& ctx, ImageId id, const ImageViewInfo& view, vk::I
 	out.slices  = image.info.IsVolume() ? std::max(image.backing.extent.depth >> out.mip, 1u) : 1u;
 	out.layout  = layout;
 	out.addr    = addr;
+	// NHL27FRAMEDUMP label fix: for a video-out flip buffer, decode the
+	// readback with the REGISTERED format, not the cache image's creation
+	// format (see the table above). Every format-derived field above was
+	// computed from the creation format; the channel-order pairs this fires
+	// on are all non-depth colour formats with identical byte size and
+	// aspects, so those fields are the same under either format — only the
+	// decode label (Target.format) changes.
+	if (addr != 0) {
+		const vk::Format registered = RegisteredFlipFormat(addr);
+		if (registered != vk::Format::eUndefined && registered != out.format &&
+		    FlipFormatChannelOrderPair(out.format, registered)) {
+			out.created_format = out.format;
+			out.format         = registered;
+			out.relabelled     = true;
+		}
+	}
 	return true;
 }
 
@@ -1091,55 +1484,178 @@ void BeginCapture(CommandBuffer& buffer) {
 	g_buflog.clear();
 	g_seen_vol.clear();
 	g_seen_buf.clear();
+	g_guesttex.clear();
+	g_seen_guesttex.clear();
+	g_guesttex_bytes = 0;
 	g_capturing = true;
 	g_active.store(true, std::memory_order_relaxed);
 	std::printf("NHL27FRAMEDUMP: capturing frame -> %s\n", g_dir.c_str());
 	std::fflush(stdout);
 }
 
+void ProcessJob(CaptureJob& job) {
+	std::string log; // IMG lines, built here (was g_log in FinishCapture)
+	for (size_t i = 0; i < job.pending.size(); i++) {
+		if (g_worker_stop.load()) {
+			// Game is exiting (Shutdown() was called): abandon this capture instead of
+			// draining the queue, so the join in Shutdown() waits at most one image,
+			// not the whole download. Destroy the staging buffers that were never
+			// downloaded, and write no frame.txt for this job.
+			for (size_t k = i; k < job.pending.size(); k++) {
+				auto& p = job.pending[k];
+				vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
+			}
+			for (auto& b : job.bufpending) {
+				vmaDestroyBuffer(b.graphics->allocator, static_cast<VkBuffer>(b.buffer), b.alloc);
+			}
+			job.pending.clear();
+			job.bufpending.clear();
+			std::printf("NHL27FRAMEDUMP: download abandoned (game exiting) -> %s\n", job.dir.c_str());
+			std::fflush(stdout);
+			return;
+		}
+		auto& p = job.pending[i];
+		ProcessOne(p, job.dir, log, job.buflog);
+		vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
+	}
+	job.pending.clear();
+	ProcessBuffers(job.bufpending, job.buflog, job.dir);
+	ProcessGuestTex(job);
+	if (job.bufreq_leftover != 0) {
+		job.buflog += "NOTE: " + std::to_string(job.bufreq_leftover) +
+		              " buffer requests were never flushed\n";
+	}
+	if (!job.buflog.empty()) {
+		if (FILE* f = std::fopen((job.dir + "/buffers.txt").c_str(), "wb")) {
+			std::fwrite(job.buflog.data(), 1, job.buflog.size(), f);
+			std::fclose(f);
+		}
+	}
+	std::string out = "# KytyPS5 frame dump (KYTY_DBG_FRAME_DUMP). Sequence = draw/dispatch order in the frame.\n"
+	                  "# Image files are named <seq>_<rt<slot>|depth|st<slot>>_<guest addr>_<WxH>_<vk format>.png\n"
+	                  "# HDR formats: <name>.png = clamped 0..1 (linear), <name>_exp.png = auto-exposed (p99 luminance) + sRGB.\n"
+	                  "# Flip-buffer targets are decoded and named with the registered video-out format; when that differs\n"
+	                  "# from the cache image's creation format, the IMG line notes the creation format (\"relabelled\").\n\n";
+	out += job.draws;
+	out += "\n# ---- images ----\n";
+	out += log;
+	if (FILE* f = std::fopen((job.dir + "/frame.txt").c_str(), "wb")) {
+		std::fwrite(out.data(), 1, out.size(), f);
+		std::fclose(f);
+	} else {
+		std::printf("NHL27FRAMEDUMP: cannot write %s/frame.txt: errno %d\n", job.dir.c_str(), errno);
+	}
+	std::printf("NHL27FRAMEDUMP: done, %u draws/dispatches, %u images -> %s\n", job.seq, job.images,
+	            job.dir.c_str());
+	std::fflush(stdout);
+}
+
+void WorkerLoop() {
+	for (;;) {
+		CaptureJob job;
+		{
+			std::unique_lock lock(g_job_mutex);
+			g_job_cv.wait(lock, [] { return !g_jobs.empty() || g_worker_stop.load(); });
+			if (g_jobs.empty()) return; // stop requested and queue drained
+			// On stop, ProcessJob aborts immediately (destroys the staging buffers,
+			// writes nothing), so the remaining queued jobs drain in milliseconds.
+			job = std::move(g_jobs.front());
+			g_jobs.pop();
+		}
+		ProcessJob(job);
+	}
+}
+
+void EnsureWorker() {
+	// Called with g_mutex held (from FinishCapture via OnGuestFlip), so two
+	// simultaneous handoffs cannot start two workers.
+	if (g_worker_started.exchange(true)) return;
+	g_worker = std::thread(WorkerLoop);
+}
+
 void FinishCapture(CommandBuffer& buffer) {
 	buffer.GetContext().GetCommandScheduler().FlushAndWait();
 	g_active.store(false, std::memory_order_relaxed);
 	g_capturing = false;
-	std::string draws = g_log;
-	g_log.clear();
-	const uint32_t n = static_cast<uint32_t>(g_pending.size());
-	for (auto& p : g_pending) {
-		ProcessOne(p);
-		vmaDestroyBuffer(p.graphics->allocator, static_cast<VkBuffer>(p.buffer), p.alloc);
-	}
-	g_pending.clear();
-	g_targets.clear();
-	ProcessBuffers();
-	if (!g_bufreq.empty()) {
-		g_buflog += "NOTE: " + std::to_string(g_bufreq.size()) + " buffer requests were never flushed\n";
-	}
-	g_bufreq.clear();
-	if (!g_buflog.empty()) {
-		if (FILE* f = std::fopen((g_dir + "/buffers.txt").c_str(), "wb")) {
-			std::fwrite(g_buflog.data(), 1, g_buflog.size(), f);
-			std::fclose(f);
+	CaptureJob job;
+	job.pending = std::move(g_pending);
+	job.bufpending = std::move(g_bufpending);
+	job.guesttex = std::move(g_guesttex);
+	// Merge the session record of guest texture uploads (NoteTextureUpload):
+	// textures uploaded before this frame (e.g. during a menu load) that no
+	// draw of this frame bound. In-frame entries win; merged entries keep
+	// seq 0. The record itself is NOT cleared: it covers the whole session.
+	{
+		std::set<uint64_t> have;
+		for (const auto& r : job.guesttex) have.insert(r.addr);
+		std::lock_guard session_lock(g_guesttex_session_mutex);
+		for (const auto& [addr, r] : g_guesttex_session) {
+			if (job.guesttex.size() >= kGuestTexMaxCollect) break;
+			if (have.insert(addr).second) {
+				job.guesttex.push_back(r);
+				job.guesttex_session++;
+			}
 		}
-		g_buflog.clear();
 	}
-	std::string out = "# KytyPS5 frame dump (KYTY_DBG_FRAME_DUMP). Sequence = draw/dispatch order in the frame.\n"
-	                  "# Image files are named <seq>_<rt<slot>|depth|st<slot>>_<guest addr>_<WxH>_<vk format>.png\n"
-	                  "# HDR formats: <name>.png = clamped 0..1 (linear), <name>_exp.png = auto-exposed (p99 luminance) + sRGB.\n\n";
-	out += draws;
-	out += "\n# ---- images ----\n";
-	out += g_log;
-	if (FILE* f = std::fopen((g_dir + "/frame.txt").c_str(), "wb")) {
-		std::fwrite(out.data(), 1, out.size(), f);
-		std::fclose(f);
-	} else {
-		std::printf("NHL27FRAMEDUMP: cannot write %s/frame.txt: errno %d\n", g_dir.c_str(), errno);
-	}
-	std::printf("NHL27FRAMEDUMP: done, %u draws/dispatches, %u images -> %s\n", g_seq, n, g_dir.c_str());
-	std::fflush(stdout);
+	job.draws = std::move(g_log);
+	job.buflog = std::move(g_buflog);
+	job.dir = g_dir;
+	job.seq = g_seq;
+	job.images = static_cast<uint32_t>(job.pending.size());
+	job.bufreq_leftover = g_bufreq.size();
 	g_log.clear();
+	g_pending.clear();
+	g_bufpending.clear();
+	g_guesttex.clear();
+	g_seen_guesttex.clear();
+	g_guesttex_bytes = 0;
+	g_buflog.clear();
+	g_bufreq.clear();
+	g_targets.clear();
+	g_pending_bytes = 0;
+	g_images = 0;
+	EnsureWorker();
+	// Save the values for the log line BEFORE the move: job.dir is a std::string
+	// and is moved-from (empty) after the push below.
+	const uint32_t    n_images = job.images;
+	const std::string dir      = job.dir;
+	{
+		std::lock_guard lock(g_job_mutex);
+		g_jobs.push(std::move(job));
+		if (g_jobs.size() > 2) {
+			std::printf("NHL27FRAMEDUMP: warning: %zu downloads queued (oldest still running)\n",
+			            g_jobs.size());
+		}
+	}
+	g_job_cv.notify_one();
+	std::printf("NHL27FRAMEDUMP: frame captured, %u images queued for download -> %s\n", n_images,
+	            dir.c_str());
+	std::fflush(stdout);
 }
 
 } // namespace
+
+// NHL27FRAMEDUMP label fix: PresentDiag::NoteFlip records the registered
+// video-out format of each flipped buffer here so MakeTarget can label
+// flip-buffer readbacks with it (see the table above MakeTarget). Called on
+// every flip; updates the address's entry in place. Labelling only — nothing
+// here touches a view, a mapping or any rendering state.
+void NoteRegisteredFlipFormat(uint64_t addr, vk::Format format) {
+	if (addr == 0 || format == vk::Format::eUndefined) return;
+	std::lock_guard lock(g_flip_formats_mutex);
+	FlipFormatSeen* free_slot = nullptr;
+	for (auto& e : g_flip_formats) {
+		if (e.addr == addr) {
+			e.format = format;
+			return;
+		}
+		if (e.addr == 0 && free_slot == nullptr) free_slot = &e;
+	}
+	if (free_slot != nullptr) {
+		free_slot->addr   = addr;
+		free_slot->format = format;
+	}
+}
 
 bool Enabled() noexcept {
 	static const bool enabled = [] {
@@ -1158,6 +1674,61 @@ void Request() {
 	g_request.store(true);
 	std::printf("NHL27FRAMEDUMP: F2 - will capture the next complete frame\n");
 	std::fflush(stdout);
+}
+
+// Session record for the guesttex dump (see the NHL27GUESTTEX comment block):
+// the texture cache calls this on every guest texture upload, so textures
+// uploaded before a captured frame are dump candidates too. Descriptors only;
+// the worker reads the guest bytes at dump time. Takes only the record's own
+// mutex — callers may hold the texture cache lock, so this must never wait on
+// g_mutex or do any I/O beyond the one-time "record full" line.
+void NoteTextureUpload(const ImageInfo& info) {
+	const uint64_t addr = info.data.address;
+	const uint64_t size = info.data.size;
+	if (addr == 0 || size == 0 || size > kGuestTexMaxSize) return;
+	if (!info.data.Valid()) return;
+	GuestTexReq r;
+	r.addr      = addr;
+	r.size      = size;
+	r.seq       = 0; // not bound by a draw of the captured frame (FinishCapture merge)
+	r.guest_fmt = static_cast<uint32_t>(info.guest_format);
+	r.vk_fmt    = vk::to_string(info.pixel_format);
+	r.w         = info.extent.width;
+	r.h         = info.extent.height;
+	r.d         = info.extent.depth;
+	r.levels    = info.resources.levels;
+	r.layers    = info.resources.layers;
+	r.tile_mode = static_cast<uint32_t>(info.tile_mode);
+	std::lock_guard lock(g_guesttex_session_mutex);
+	const auto      it = g_guesttex_session.find(addr);
+	if (it != g_guesttex_session.end()) {
+		r.upload_order = it->second.upload_order; // first-upload order survives replacement
+		it->second     = std::move(r); // a re-upload at the same address replaces the entry
+		return;
+	}
+	if (g_guesttex_session.size() >= kGuestTexSessionMax) {
+		if (!g_guesttex_session_full) {
+			g_guesttex_session_full = true;
+			std::printf("NHL27GUESTTEX: session record full (%zu entries); new uploads are no "
+			            "longer recorded\n",
+			            kGuestTexSessionMax);
+			std::fflush(stdout);
+		}
+		return;
+	}
+	r.upload_order = g_guesttex_session_uploads++;
+	g_guesttex_session.emplace(addr, std::move(r));
+}
+
+void Shutdown() {
+	if (!g_worker_started.load()) return;
+	if (g_worker_stopped.exchange(true)) return; // second call is a no-op
+	{
+		std::lock_guard lock(g_job_mutex);
+		g_worker_stop.store(true);
+	}
+	g_job_cv.notify_one();
+	if (g_worker.joinable()) g_worker.join();
 }
 
 void OnGuestFlip(CommandBuffer& buffer) {
@@ -1238,6 +1809,14 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	}
 	for (int i = 0; i < 3; i++) AppendImages(s, ("vs_img" + std::to_string(i)).c_str(), draw.vs_images[i]);
 	AppendImages(s, "ps_img", draw.ps_images);
+	for (int i = 0; i < 3; i++) {
+		if (draw.vs_images[i] != nullptr) {
+			for (const auto& im : *draw.vs_images[i]) CollectGuestTex(seq, im);
+		}
+	}
+	if (draw.ps_images != nullptr) {
+		for (const auto& im : *draw.ps_images) CollectGuestTex(seq, im);
+	}
 	g_log += s;
 	if (draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {
 		CaptureBindings(*draw.ps_bindings, seq, draw.ps_hash);
@@ -1318,6 +1897,11 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 		     (u.storage ? " STORAGE" : " sampled") + (u.written ? " WRITTEN" : "") + "\n";
 	}
 	g_log += s;
+	for (size_t i = 0; i < images.size(); i++) {
+		const auto& u = images[i];
+		if (u.binding == nullptr || u.storage) continue;
+		CollectGuestTex(seq, *u.binding);
+	}
 	for (size_t i = 0; i < images.size(); i++) {
 		const auto& u = images[i];
 		if (u.binding == nullptr || !u.written || !u.storage) continue;
@@ -1440,3 +2024,274 @@ void TraceWrite(const char* what, uint64_t begin, uint64_t end, const char* kind
 }
 
 } // namespace Libs::Graphics::FrameDump
+
+namespace Libs::Graphics {
+// NHL27SAMPLE sample-path diagnostic summary (defined in imageView.cpp; logging only).
+void SampleDiagPrintSummary(uint64_t frame);
+} // namespace Libs::Graphics
+
+// NHL27PRESENT present-stage diagnostic (see frameDump.h). Logging only: nothing in
+// this namespace reads back pixels, touches descriptors or alters any rendering state.
+namespace Libs::Graphics::PresentDiag {
+
+namespace {
+
+constexpr size_t kMaxFlipBuffers = 8;
+constexpr size_t kMaxSampled     = 16;
+constexpr size_t kMaxSwizzleSeen = 32;
+constexpr uint64_t kSummaryEvery = 600;
+
+std::mutex g_pd_mutex;
+
+// Flip buffer addresses for the NoteDraw fast path (mirrors g_pd_buffers under the mutex).
+std::atomic<uint64_t> g_pd_flip_addrs[kMaxFlipBuffers] {};
+std::atomic<uint32_t> g_pd_flip_addr_count {0};
+// Ordinal of every recorded draw; a present draw's index within its frame is derived
+// against the ordinal snapshot taken at the previous flip.
+std::atomic<uint64_t> g_pd_draw_ordinal {0};
+
+struct SampledView {
+	uint64_t             addr        = 0;
+	vk::Format           view_format = vk::Format::eUndefined;
+	vk::ComponentMapping mapping {};
+};
+
+struct LastDraw {
+	bool     valid         = false;
+	uint64_t flips_at_draw = 0; // Flip counter value when the draw was recorded.
+	uint64_t draw_index    = 0; // Ordinal among the draws of its guest frame (1-based).
+	bool     ps_active     = false;
+	bool     all_null      = false;
+	uint32_t slots         = 0;
+	std::array<SampledView, kMaxSampled> sampled {};
+	uint32_t sampled_count = 0;
+};
+
+struct FlipBuffer {
+	uint64_t addr = 0;
+	LastDraw last {};
+};
+
+std::array<FlipBuffer, kMaxFlipBuffers> g_pd_buffers {};
+uint64_t                                g_pd_flips           = 0;
+uint64_t                                g_pd_ordinal_at_flip = 0;
+vk::Format                              g_pd_last_format     = vk::Format::eUndefined;
+bool                                    g_pd_have_format     = false;
+uint64_t                                g_pd_stat_format_flips = 0;
+uint64_t                                g_pd_stat_swizzle      = 0;
+uint64_t                                g_pd_stat_null_frames  = 0;
+uint64_t                                g_pd_summary_from      = 1;
+
+struct SwizzleSeen {
+	uint64_t             addr = 0;
+	vk::ComponentMapping mapping {};
+	bool                 used = false;
+};
+std::array<SwizzleSeen, kMaxSwizzleSeen> g_pd_swizzle_seen {};
+size_t                                   g_pd_swizzle_next = 0;
+
+std::string FormatText(vk::Format format) {
+	auto name = vk::to_string(format);
+	if (format == vk::Format::eA2R10G10B10UnormPack32) {
+		name += " (R-first)";
+	} else if (format == vk::Format::eA2B10G10R10UnormPack32) {
+		name += " (B-first)";
+	}
+	return name;
+}
+
+char SwizzleChar(vk::ComponentSwizzle swizzle, char own) {
+	switch (swizzle) {
+		case vk::ComponentSwizzle::eIdentity: return own;
+		case vk::ComponentSwizzle::eZero: return '0';
+		case vk::ComponentSwizzle::eOne: return '1';
+		case vk::ComponentSwizzle::eR: return 'r';
+		case vk::ComponentSwizzle::eG: return 'g';
+		case vk::ComponentSwizzle::eB: return 'b';
+		case vk::ComponentSwizzle::eA: return 'a';
+		default: return '?';
+	}
+}
+
+// The mapping as four source letters (identity reads "rgba", an R/B swap "bgra").
+std::string MappingText(const vk::ComponentMapping& mapping) {
+	std::string text;
+	text += SwizzleChar(mapping.r, 'r');
+	text += SwizzleChar(mapping.g, 'g');
+	text += SwizzleChar(mapping.b, 'b');
+	text += SwizzleChar(mapping.a, 'a');
+	return text;
+}
+
+bool IsIdentityMapping(const vk::ComponentMapping& mapping) {
+	const auto own = [](vk::ComponentSwizzle swizzle, vk::ComponentSwizzle channel) {
+		return swizzle == vk::ComponentSwizzle::eIdentity || swizzle == channel;
+	};
+	return own(mapping.r, vk::ComponentSwizzle::eR) && own(mapping.g, vk::ComponentSwizzle::eG) &&
+	       own(mapping.b, vk::ComponentSwizzle::eB) && own(mapping.a, vk::ComponentSwizzle::eA);
+}
+
+} // namespace
+
+void NoteDraw(const uint64_t* color_targets, uint32_t color_target_count, bool ps_active,
+              const std::vector<TextureBinding>* ps_images) {
+	const uint64_t ordinal = g_pd_draw_ordinal.fetch_add(1, std::memory_order_relaxed);
+	const uint32_t known   = g_pd_flip_addr_count.load(std::memory_order_relaxed);
+	if (known == 0 || color_targets == nullptr) {
+		return;
+	}
+	size_t hit = kMaxFlipBuffers;
+	for (uint32_t t = 0; t < color_target_count && hit == kMaxFlipBuffers; t++) {
+		if (color_targets[t] == 0) {
+			continue;
+		}
+		for (uint32_t i = 0; i < known; i++) {
+			if (g_pd_flip_addrs[i].load(std::memory_order_relaxed) == color_targets[t]) {
+				hit = i;
+				break;
+			}
+		}
+	}
+	if (hit == kMaxFlipBuffers) {
+		return;
+	}
+
+	LastDraw rec {};
+	rec.valid     = true;
+	rec.ps_active = ps_active;
+	rec.slots     = ps_images != nullptr ? static_cast<uint32_t>(ps_images->size()) : 0;
+	bool any_bound = false;
+	if (ps_images != nullptr) {
+		for (const auto& im : *ps_images) {
+			const uint64_t addr = im.desc.info.data.address;
+			if (addr == 0) {
+				continue;
+			}
+			any_bound = true;
+			if (rec.sampled_count < kMaxSampled) {
+				auto& s        = rec.sampled[rec.sampled_count++];
+				s.addr         = addr;
+				s.view_format  = im.desc.view_info.format;
+				s.mapping      = im.desc.view_info.mapping;
+			}
+		}
+	}
+	// The dark-transition signature: a pixel-shader draw whose every texture slot
+	// resolved to the null descriptor (guest address 0).
+	rec.all_null = ps_active && !any_bound;
+
+	std::lock_guard lock(g_pd_mutex);
+	rec.flips_at_draw = g_pd_flips;
+	rec.draw_index    = ordinal - g_pd_ordinal_at_flip + 1;
+	g_pd_buffers[hit].last = rec;
+}
+
+void NoteFlip(uint64_t buffer_address, vk::Format format) {
+	std::lock_guard lock(g_pd_mutex);
+
+	// Register the presented buffer (fast-path table + per-buffer draw record).
+	size_t slot = kMaxFlipBuffers;
+	for (size_t i = 0; i < kMaxFlipBuffers; i++) {
+		if (g_pd_buffers[i].addr == buffer_address) {
+			slot = i;
+			break;
+		}
+		if (g_pd_buffers[i].addr == 0 && slot == kMaxFlipBuffers) {
+			slot = i;
+		}
+	}
+	if (slot < kMaxFlipBuffers && g_pd_buffers[slot].addr == 0) {
+		g_pd_buffers[slot].addr = buffer_address;
+		g_pd_flip_addrs[slot].store(buffer_address, std::memory_order_relaxed);
+		uint32_t count = 0;
+		for (const auto& b : g_pd_buffers) {
+			count += b.addr != 0 ? 1u : 0u;
+		}
+		g_pd_flip_addr_count.store(count, std::memory_order_relaxed);
+	}
+
+	// NHL27FRAMEDUMP label fix: hand the registered format to the frame dump,
+	// which decodes flip-buffer readbacks with it instead of the cache image's
+	// creation format (see FrameDump::NoteRegisteredFlipFormat).
+	FrameDump::NoteRegisteredFlipFormat(buffer_address, format);
+
+	g_pd_flips++;
+	const uint64_t frame = g_pd_flips;
+
+	if (!g_pd_have_format) {
+		g_pd_have_format = true;
+		std::printf("NHL27PRESENT format frame=%" PRIu64 " addr=0x%" PRIx64 " initial=%s\n", frame,
+		            buffer_address, FormatText(format).c_str());
+		std::fflush(stdout);
+	} else if (format != g_pd_last_format) {
+		g_pd_stat_format_flips++;
+		std::printf("NHL27PRESENT format frame=%" PRIu64 " addr=0x%" PRIx64 " %s -> %s\n", frame,
+		            buffer_address, FormatText(g_pd_last_format).c_str(), FormatText(format).c_str());
+		std::fflush(stdout);
+	}
+	g_pd_last_format = format;
+
+	// Judge the frame that just ended by the last draw into the buffer being flipped.
+	if (slot < kMaxFlipBuffers) {
+		const auto& last = g_pd_buffers[slot].last;
+		if (last.valid && last.flips_at_draw == frame - 1) {
+			if (last.ps_active && last.all_null) {
+				g_pd_stat_null_frames++;
+				std::printf("NHL27PRESENT nullbind frame=%" PRIu64 " draw=%" PRIu64 " slots=%u addr=0x%" PRIx64
+				            "\n",
+				            frame, last.draw_index, last.slots, buffer_address);
+				std::fflush(stdout);
+			}
+			for (uint32_t i = 0; i < last.sampled_count; i++) {
+				const auto& s    = last.sampled[i];
+				SwizzleSeen* seen = nullptr;
+				for (auto& e : g_pd_swizzle_seen) {
+					if (e.used && e.addr == s.addr) {
+						seen = &e;
+						break;
+					}
+				}
+				if (seen == nullptr) {
+					if (!IsIdentityMapping(s.mapping)) {
+						g_pd_stat_swizzle++;
+						std::printf("NHL27PRESENT swizzle frame=%" PRIu64 " slot=%u addr=0x%" PRIx64
+						            " view=%s map=%s (first seen)\n",
+						            frame, i, s.addr, vk::to_string(s.view_format).c_str(),
+						            MappingText(s.mapping).c_str());
+						std::fflush(stdout);
+					}
+					auto& e   = g_pd_swizzle_seen[g_pd_swizzle_next];
+					e.addr    = s.addr;
+					e.mapping = s.mapping;
+					e.used    = true;
+					g_pd_swizzle_next = (g_pd_swizzle_next + 1) % kMaxSwizzleSeen;
+				} else if (!(seen->mapping == s.mapping)) {
+					g_pd_stat_swizzle++;
+					std::printf("NHL27PRESENT swizzle frame=%" PRIu64 " slot=%u addr=0x%" PRIx64
+					            " view=%s map=%s -> %s\n",
+					            frame, i, s.addr, vk::to_string(s.view_format).c_str(),
+					            MappingText(seen->mapping).c_str(), MappingText(s.mapping).c_str());
+					std::fflush(stdout);
+					seen->mapping = s.mapping;
+				}
+			}
+		}
+	}
+
+	if (frame % kSummaryEvery == 0) {
+		std::printf("NHL27PRESENT summary frame=%" PRIu64 " format_flips=%" PRIu64 " swizzle_events=%" PRIu64
+		            " null_frames=%" PRIu64 " since_frame=%" PRIu64 "\n",
+		            frame, g_pd_stat_format_flips, g_pd_stat_swizzle, g_pd_stat_null_frames,
+		            g_pd_summary_from);
+		std::fflush(stdout);
+		g_pd_stat_format_flips = 0;
+		g_pd_stat_swizzle      = 0;
+		g_pd_stat_null_frames  = 0;
+		g_pd_summary_from      = frame + 1;
+		SampleDiagPrintSummary(frame);
+	}
+
+	g_pd_ordinal_at_flip = g_pd_draw_ordinal.load(std::memory_order_relaxed);
+}
+
+} // namespace Libs::Graphics::PresentDiag

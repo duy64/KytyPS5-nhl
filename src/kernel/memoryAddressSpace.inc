@@ -240,7 +240,8 @@ public:
 	}
 
 	// Writes each byte of `data` whose backing byte still equals `expected` (aligned dwords with one
-	// compare-exchange each, so a concurrent CPU store into the dword wins).
+	// compare-exchange each, so a concurrent CPU store into the dword wins; single bytes at unaligned
+	// ends with one compare-exchange each, so a CPU store between the check and the write wins too).
 	bool TryMergeBacking(uint64_t vaddr, const void* data, const void* expected, uint64_t size) {
 		if (data == nullptr || expected == nullptr) {
 			return false;
@@ -259,7 +260,8 @@ public:
 					    .compare_exchange_strong(seen, want);
 					i += 4;
 				} else {
-					if (backing[i] == old[at]) backing[i] = source[at];
+					uint8_t seen = old[at];
+					std::atomic_ref<uint8_t>(backing[i]).compare_exchange_strong(seen, source[at]);
 					++i;
 				}
 			}

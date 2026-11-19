@@ -1,4 +1,14 @@
-# Test-KytyBuild.ps1 - v49 (2026-11-19)
+# Test-KytyBuild.ps1 - v50 (2026-11-19)
+# v50: frame-dump FROM row in the launch env. v48 set HOST_ST here
+# but deliberately left out a FROM row; the diagnostic build's
+# FROM gate now works (draws before the FROM index cost no queue
+# slot and no dedup entry), so the periodic F2 dumps in watcher
+# runs can focus on the frame tail, where the UI draws and the
+# final present live. The launch env now also sets
+# KYTY_DBG_FRAME_DUMP_FROM=2500, next to HOST_ST - the same value
+# as the proven manual per-game config. v49 (Play Now SELECT
+# SIDES fix) is otherwise unchanged.
+#
 # v49: Play Now SELECT SIDES fix. The first Play Now run (0219, #200)
 # stalled on the Versus screen: the script pressed Cross 57 times over
 # 14 minutes and the screen never advanced. The Versus screen is a
@@ -499,7 +509,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 49
+$TestScriptVersion = 50
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1417,6 +1427,7 @@ $psi.EnvironmentVariables["KYTY_COMPUTE_RESOLVE_AHEAD"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_DIR"] = "D:\Downloads\captures"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_HOST_ST"] = "1"
+$psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_FROM"] = "2500"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_CS_CONSTANTS"] = "1"
 if ($AtlasCapture) {
     # Atlas-dump build: dump every sampled BC texture as *_smp_*.bin.
@@ -1568,7 +1579,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v49: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v50: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

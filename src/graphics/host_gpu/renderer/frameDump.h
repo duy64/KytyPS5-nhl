@@ -4,6 +4,9 @@
 // "Poor man's RenderDoc": KYTY_DBG_FRAME_DUMP=1 enables a frame dump that is triggered with F2 in the
 // game window. KYTY_DBG_FRAME_DUMP_CS_CONSTANTS=1 additionally surveys all compute bindings and
 // copies bound GPU buffers up to 4096 bytes, without reading protected guest backing.
+// KYTY_DBG_FRAME_DUMP_HOST_ST=1 additionally reads back the HOST copies of the textures
+// graphics draws sample (st files; raw .bin for block-compressed formats), which the
+// guest-byte guesttex dump cannot see.
 // The next complete guest frame (flip to flip) is captured: every draw/dispatch is
 // logged to <captures>/frame_<n>/frame.txt and every render pass's color/depth targets and every
 // dispatch's written storage images are read back and saved as PNG. Zero cost when the flag is off

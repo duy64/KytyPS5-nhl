@@ -25,6 +25,7 @@
 #include <condition_variable>
 #include <queue>
 #include <thread>
+#include <tuple>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -113,6 +114,19 @@ std::vector<BufPending>  g_bufpending;
 std::string              g_buflog;
 std::set<std::pair<uint64_t, uint32_t>> g_seen_vol; // (address, draw seq)
 std::set<std::string>    g_seen_buf;
+
+// ---- host sampled-texture readback (KYTY_DBG_FRAME_DUMP_HOST_ST) ----
+// Queued by OnDraw (which has no command buffer), recorded by FlushRequests
+// like the volume requests above. One request per unique host image per
+// capture: the first binding wins, which is the state the frame's draws see.
+struct HostStReq {
+	Target   target;
+	uint32_t seq  = 0;
+	uint32_t slot = 0;
+};
+std::vector<HostStReq>                          g_hoststreq;
+std::set<std::tuple<uint64_t, uint32_t, uint32_t>> g_seen_hostst; // (host image, mip, layer)
+bool                                            g_hostst_capped = false;
 
 // ---- guest sampled-texture readback (NHL27GUESTTEX) ----
 // Sampled textures are never read back from the GPU (the dump saves render
@@ -230,6 +244,28 @@ bool WantBuffers(uint64_t ps_hash) {
 	}
 	return false;
 }
+
+// KYTY_DBG_FRAME_DUMP_HOST_ST=1: also read back the HOST copies of the textures
+// graphics draws sample (st dumps). The guesttex dump holds the GUEST bytes of
+// those textures, so a host image that was never refreshed after a stream-in
+// (the stale-host-image suspect behind the missing score-bug logos) is
+// invisible in a capture without this. Off by default: a capture then behaves
+// exactly as before. Only small images are queued (per-image byte cap below):
+// UI logos/atlases/icons are kilobytes, while the full-screen layers are
+// already dumped as render targets when they are written. Pair with
+// KYTY_DBG_FRAME_DUMP_FROM=<seq> so the shared readback caps (kMaxImages,
+// kMaxPendingBytes) are spent on the frame's tail, where the UI phase lives.
+bool WantHostSt() {
+	static const bool on = [] {
+		const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_HOST_ST");
+		return v != nullptr && std::strcmp(v, "1") == 0;
+	}();
+	return on;
+}
+constexpr uint64_t kHostStMaxBytes = 4ull << 20; // per queued image
+constexpr size_t   kHostStMaxCount = 512;        // queued requests per capture (memory valve;
+                                                 // the binding per-capture limits stay the
+                                                 // shared RecordReadback caps)
 
 std::string WordsText(const uint8_t* p, size_t bytes, const char* indent = "      ") {
 	std::string s;
@@ -397,7 +433,7 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 
 // Records the GPU->host copies of the queued buffers and volumes. cmd must be outside a render pass.
 void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
-	if (g_bufreq.empty() && g_volreq.empty()) return;
+	if (g_bufreq.empty() && g_volreq.empty() && g_hoststreq.empty()) return;
 	using S = vk::PipelineStageFlagBits2;
 	using A = vk::AccessFlagBits2;
 	if (!g_bufreq.empty()) {
@@ -441,6 +477,10 @@ void FlushRequests(GraphicContext& gfx, const CommandRecorder& cmd) {
 		RecordReadback(gfx, cmd, v.target, "vol", v.seq);
 	}
 	g_volreq.clear();
+	for (auto& r : g_hoststreq) {
+		RecordReadback(gfx, cmd, r.target, ("st" + std::to_string(r.slot)).c_str(), r.seq);
+	}
+	g_hoststreq.clear();
 }
 
 std::string Hex(uint64_t v);
@@ -536,6 +576,34 @@ uint32_t BytesPerPixel(vk::Format f) {
 		case vk::Format::eR32G32B32A32Sint: return 16;
 		default: return 0;
 	}
+}
+
+// Byte size of one readback of t, or 0 when the format cannot be read back.
+// Block-compressed formats have no per-pixel entry in BytesPerPixel (their
+// texel blocks are 4x4), so they are sized by blocks: Bc1/Bc4 carry 8 bytes
+// per block, Bc2/Bc3/Bc5/Bc6H/Bc7 carry 16. Where a caller admits them
+// (RecordReadback does so only under the host-st gate), this only affects
+// targets that were previously SKIPPED (unsupported format) outright;
+// ProcessOne cannot decode BC, so it keeps the raw blocks as a .bin file,
+// which is exactly what an offline BC decode needs.
+uint64_t ImageReadbackSize(const Target& t) {
+	const uint32_t bpp = BytesPerPixel(t.format);
+	if (bpp != 0) return static_cast<uint64_t>(t.w) * t.h * bpp * t.slices;
+	uint32_t block_bytes = 0;
+	switch (t.format) {
+		case vk::Format::eBc1RgbUnormBlock: case vk::Format::eBc1RgbSrgbBlock:
+		case vk::Format::eBc1RgbaUnormBlock: case vk::Format::eBc1RgbaSrgbBlock:
+		case vk::Format::eBc4UnormBlock: case vk::Format::eBc4SnormBlock: block_bytes = 8; break;
+		case vk::Format::eBc2UnormBlock: case vk::Format::eBc2SrgbBlock:
+		case vk::Format::eBc3UnormBlock: case vk::Format::eBc3SrgbBlock:
+		case vk::Format::eBc5UnormBlock: case vk::Format::eBc5SnormBlock:
+		case vk::Format::eBc6HUfloatBlock: case vk::Format::eBc6HSfloatBlock:
+		case vk::Format::eBc7UnormBlock: case vk::Format::eBc7SrgbBlock: block_bytes = 16; break;
+		default: return 0;
+	}
+	const uint64_t blocks_x = (static_cast<uint64_t>(t.w) + 3u) / 4u;
+	const uint64_t blocks_y = (static_cast<uint64_t>(t.h) + 3u) / 4u;
+	return blocks_x * blocks_y * block_bytes * t.slices;
 }
 
 float HalfToFloat(uint16_t h) {
@@ -1239,13 +1307,17 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 		return;
 	}
 	const uint32_t bpp = BytesPerPixel(t.format);
-	if (bpp == 0 || t.image == nullptr) {
+	// Block-compressed targets have no BytesPerPixel entry and were always
+	// skipped here; admit them only under the host-st gate, so a capture
+	// without it stays byte-identical to before.
+	const uint64_t size = bpp != 0 ? static_cast<uint64_t>(t.w) * t.h * bpp * t.slices
+	                               : (WantHostSt() ? ImageReadbackSize(t) : 0);
+	if (size == 0 || t.image == nullptr) {
 		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u fmt=%s SKIPPED (unsupported format)\n",
 		              seq, label, Hex(t.addr).c_str(), t.w, t.h, vk::to_string(t.format).c_str());
 		g_log += line;
 		return;
 	}
-	const uint64_t size = static_cast<uint64_t>(t.w) * t.h * bpp * t.slices;
 	using S = vk::PipelineStageFlagBits2;
 	using A = vk::AccessFlagBits2;
 	// State refresh: a target read back three or more times in one capture keeps only its FIRST
@@ -1484,6 +1556,9 @@ void BeginCapture(CommandBuffer& buffer) {
 	g_buflog.clear();
 	g_seen_vol.clear();
 	g_seen_buf.clear();
+	g_hoststreq.clear();
+	g_seen_hostst.clear();
+	g_hostst_capped = false;
 	g_guesttex.clear();
 	g_seen_guesttex.clear();
 	g_guesttex_bytes = 0;
@@ -1611,6 +1686,7 @@ void FinishCapture(CommandBuffer& buffer) {
 	g_guesttex_bytes = 0;
 	g_buflog.clear();
 	g_bufreq.clear();
+	g_hoststreq.clear();
 	g_targets.clear();
 	g_pending_bytes = 0;
 	g_images = 0;
@@ -1816,6 +1892,43 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	}
 	if (draw.ps_images != nullptr) {
 		for (const auto& im : *draw.ps_images) CollectGuestTex(seq, im);
+	}
+	if (WantHostSt()) {
+		// Queue host-image readbacks for this draw's sampled textures (see
+		// HostStReq): CollectGuestTex above records the guest bytes only, so
+		// without this the host copy a draw actually sampled is never dumped.
+		const auto queue_sampled = [&](const std::vector<TextureBinding>* images) {
+			if (images == nullptr) return;
+			for (size_t si = 0; si < images->size(); si++) {
+				const auto& im = (*images)[si];
+				if (im.desc.type != TextureCache::BindingType::Texture) continue;
+				if (g_hoststreq.size() >= kHostStMaxCount) {
+					if (!g_hostst_capped) {
+						g_hostst_capped = true;
+						g_log += "host st queue cap reached, further sampled textures skipped\n";
+					}
+					return;
+				}
+				Target t;
+				if (!MakeTarget(context, im.image_id, im.desc.view_info, im.layout,
+				                im.desc.info.data.address, t)) {
+					continue;
+				}
+				if (t.slices != 1) continue; // volumes keep the existing vol/guesttex paths
+				const uint64_t size = ImageReadbackSize(t);
+				if (size == 0 || size > kHostStMaxBytes) continue;
+				const auto key = std::make_tuple(reinterpret_cast<uint64_t>(static_cast<VkImage>(t.image)),
+				                                 t.mip, t.layer);
+				if (!g_seen_hostst.insert(key).second) continue;
+				HostStReq r;
+				r.target = t;
+				r.seq    = seq;
+				r.slot   = static_cast<uint32_t>(si);
+				g_hoststreq.push_back(std::move(r));
+			}
+		};
+		for (int i = 0; i < 3; i++) queue_sampled(draw.vs_images[i]);
+		queue_sampled(draw.ps_images);
 	}
 	g_log += s;
 	if (draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {

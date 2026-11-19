@@ -1,10 +1,14 @@
-# Test-KytyBuild.ps1 - v47 (2026-11-19)
-# v47: the v46 Play Now switch rebased onto v45 patch 2 (the Unknown
-# back-out change), after patch 2's push landed over v46 and dropped
-# the Play Now route. v46 content is unchanged: Be A Pro is out, the
-# Hub action takes PLAY NOW (D-pad Down + Cross), and a Be A Pro hub
-# backs out with Circle. Patch 2 is kept as-is: five Unknown gameplay
-# checks press Circle once, three such warnings end the phase early.
+# Test-KytyBuild.ps1 - v48 (2026-11-19)
+# v48: the diagnostic host-readback gate, for the score-bug deciding
+# capture. The #200 retest's F2 dumps carried zero BC host readbacks
+# because the watcher launches kyty_emulator.exe directly and sets
+# only its own env vars - the per-game PPSA34063.json (which has
+# HOST_ST=1) never reaches the emulator in watcher runs. So the
+# gate is set here, next to FRAME_DUMP_DIR: every F2 dump now also
+# records the host copy of each sampled texture (raw .bin, BC
+# included). No FROM row: the periodic F2 shots fire during gameplay,
+# well past any frame-count gate, and a FROM row could only suppress
+# early dumps. v47 (Play Now + patch 2) is otherwise unchanged.
 #
 # v45: continuous capture for sparkle/smear detection. Right after the
 # 09/10/11 extended-play shots in STEP 3, the script now records the
@@ -483,7 +487,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 47
+$TestScriptVersion = 48
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1400,6 +1404,7 @@ $psi.EnvironmentVariables["KYTY_INPUT_FILE"] = $InputFile
 $psi.EnvironmentVariables["KYTY_COMPUTE_RESOLVE_AHEAD"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_DIR"] = "D:\Downloads\captures"
+$psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_HOST_ST"] = "1"
 $psi.EnvironmentVariables["KYTY_DBG_FRAME_DUMP_CS_CONSTANTS"] = "1"
 if ($AtlasCapture) {
     # Atlas-dump build: dump every sampled BC texture as *_smp_*.bin.
@@ -1551,7 +1556,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v47: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v48: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

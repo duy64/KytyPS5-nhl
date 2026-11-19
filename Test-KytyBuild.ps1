@@ -1,4 +1,16 @@
-# Test-KytyBuild.ps1 - v48 (2026-11-19)
+# Test-KytyBuild.ps1 - v49 (2026-11-19)
+# v49: Play Now SELECT SIDES fix. The first Play Now run (0219, #200)
+# stalled on the Versus screen: the script pressed Cross 57 times over
+# 14 minutes and the screen never advanced. The Versus screen is a
+# SELECT SIDES screen - the controller icon starts unassigned in the
+# middle (SELECT SIDES, < > around the controller) and Cross alone
+# does nothing until a side is picked. In Be A Pro the controller
+# arrives pre-assigned to a side, which is why Cross worked there.
+# The Versus stop now assigns a side first: D-pad Left then Cross
+# on the first visit, D-pad Right then Cross if still on Versus next
+# visit (Left may cycle the team instead of the side), Cross only
+# after that. v48 (HOST_ST launch env) is otherwise unchanged.
+#
 # v48: the diagnostic host-readback gate, for the score-bug deciding
 # capture. The #200 retest's F2 dumps carried zero BC host readbacks
 # because the watcher launches kyty_emulator.exe directly and sets
@@ -1677,6 +1689,7 @@ $unknownStreak = 0
 $titleTries = 0
 $reachedIce = $false
 $reachedVersus = $false
+$versusSideTried = $null
 $navFailed = $false
 # Loading-pace tracking (v18): the frame counter in the overlay status
 # line ("frame: N, fps: M") tells whether the game is loading. A shot
@@ -1906,8 +1919,24 @@ while ($step -lt $roadmap.Count) {
                 break
             }
         }
-        Write-Host "Versus screen - pressing confirm to start the game."
-        Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+        # v49: Play Now's Versus screen is a SELECT SIDES screen - the
+        # controller starts unassigned in the middle and Cross alone
+        # does nothing until a side is picked (the 0219 run pressed
+        # Cross 57 times and never left Versus). Assign a side first:
+        # D-pad Left then Cross on the first visit, D-pad Right then
+        # Cross if still on Versus next visit, Cross only after that.
+        if (-not $versusSideTried) {
+            $versusSideTried = "Left"
+            Write-Host "Versus screen - Play Now SELECT SIDES: D-pad Left to pick a side, then Cross to start the game."
+            Invoke-InputStage -Lines @("Left 150", "sleep 1000", "j 150", "sleep 5000") -ExtraWaitSec 2
+        } elseif ($versusSideTried -eq "Left") {
+            $versusSideTried = "Right"
+            Write-Host "Versus screen - still on SELECT SIDES; trying D-pad Right to pick a side, then Cross."
+            Invoke-InputStage -Lines @("Right 150", "sleep 1000", "j 150", "sleep 5000") -ExtraWaitSec 2
+        } else {
+            Write-Host "Versus screen - pressing confirm to start the game."
+            Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+        }
         $step++
         continue
     }

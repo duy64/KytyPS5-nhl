@@ -499,7 +499,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 48
+$TestScriptVersion = 49
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1568,7 +1568,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v48: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v49: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains

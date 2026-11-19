@@ -6,7 +6,10 @@
 // copies bound GPU buffers up to 4096 bytes, without reading protected guest backing.
 // KYTY_DBG_FRAME_DUMP_HOST_ST=1 additionally reads back the HOST copies of the textures
 // graphics draws sample (st files; raw .bin for block-compressed formats), which the
-// guest-byte guesttex dump cannot see.
+// guest-byte guesttex dump cannot see. Under this gate the per-capture readback image
+// cap is raised (400 -> 2000) so a frame's tail fits, and KYTY_DBG_FRAME_DUMP_FROM=<seq>
+// also gates the host-st queueing itself, so a texture first sampled before FROM stays
+// eligible when the tail binds it again.
 // The next complete guest frame (flip to flip) is captured: every draw/dispatch is
 // logged to <captures>/frame_<n>/frame.txt and every render pass's color/depth targets and every
 // dispatch's written storage images are read back and saved as PNG. Zero cost when the flag is off

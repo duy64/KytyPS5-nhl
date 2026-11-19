@@ -266,6 +266,30 @@ constexpr uint64_t kHostStMaxBytes = 4ull << 20; // per queued image
 constexpr size_t   kHostStMaxCount = 512;        // queued requests per capture (memory valve;
                                                  // the binding per-capture limits stay the
                                                  // shared RecordReadback caps)
+constexpr uint32_t kMaxImagesHostSt = 2000;      // RecordReadback image cap under the host-st gate
+                                                 // (kMaxImages otherwise): a frame tail spends the
+                                                 // 400 cap on composition targets long before the
+                                                 // UI phase, so the diagnostic capture gets room
+                                                 // for the tail; kMaxPendingBytes still bounds the
+                                                 // staging memory either way.
+
+// KYTY_DBG_FRAME_DUMP_FROM=<seq>: only draws/dispatches from that sequence
+// number on are dumped, so the readback caps are spent on the frame's tail.
+// Cached like the other env rows. RecordReadback enforces it per readback;
+// OnDraw also enforces it at queue time for the host-st requests, because a
+// texture queued before FROM would otherwise sit in g_seen_hostst for the
+// whole capture and never be re-queued when the UI phase binds it again.
+uint32_t DumpFromSeq() {
+	static const uint32_t from = [] {
+		const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_FROM");
+		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
+	}();
+	return from;
+}
+
+// Per-capture RecordReadback image cap: raised only under the host-st gate,
+// so a capture without it keeps the exact cap (and cap log line) it has today.
+uint32_t MaxImages() { return WantHostSt() ? kMaxImagesHostSt : kMaxImages; }
 
 std::string WordsText(const uint8_t* p, size_t bytes, const char* indent = "      ") {
 	std::string s;
@@ -1288,20 +1312,20 @@ void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Targe
 	if (t.w < kMinSize || (t.h < kMinSize && !t.img3d)) return;
 	// KYTY_DBG_FRAME_DUMP_FROM=<seq>: images of the draws and dispatches from that one on only (the
 	// last passes of a frame, which the readback cap otherwise skips).
-	static const uint32_t from = [] {
-		const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_FROM");
-		return v != nullptr ? static_cast<uint32_t>(std::strtoul(v, nullptr, 0)) : 0u;
-	}();
-	if (seq < from) return;
+	if (seq < DumpFromSeq()) return;
 	if (t.samples > 1) {
 		std::snprintf(line, sizeof(line), "IMG seq=%u %s addr=0x%s %ux%u SKIPPED (multisampled)\n", seq,
 		              label, Hex(t.addr).c_str(), t.w, t.h);
 		g_log += line;
 		return;
 	}
-	if (g_images >= kMaxImages) {
-		if (g_images == kMaxImages) {
-			g_log += "IMG cap reached (400 images), further images skipped\n";
+	const uint32_t max_images = MaxImages();
+	if (g_images >= max_images) {
+		if (g_images == max_images) {
+			char cap_line[96];
+			std::snprintf(cap_line, sizeof(cap_line),
+			              "IMG cap reached (%u images), further images skipped\n", max_images);
+			g_log += cap_line;
 			g_images++;
 		}
 		return;
@@ -1893,10 +1917,14 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 	if (draw.ps_images != nullptr) {
 		for (const auto& im : *draw.ps_images) CollectGuestTex(seq, im);
 	}
-	if (WantHostSt()) {
+	if (WantHostSt() && seq >= DumpFromSeq()) {
 		// Queue host-image readbacks for this draw's sampled textures (see
 		// HostStReq): CollectGuestTex above records the guest bytes only, so
 		// without this the host copy a draw actually sampled is never dumped.
+		// The FROM gate is applied here, not only in RecordReadback: a request
+		// queued before FROM is dropped there, but its g_seen_hostst entry
+		// would stay for the whole capture and block re-queueing when the
+		// UI phase binds the same texture again.
 		const auto queue_sampled = [&](const std::vector<TextureBinding>* images) {
 			if (images == nullptr) return;
 			for (size_t si = 0; si < images->size(); si++) {

@@ -96,6 +96,7 @@ struct BufReq {
 	std::string label;
 	uint64_t    addr = 0;
 	std::shared_ptr<Buffer> retained;
+	bool        survey = false; // queued by CaptureBufferSurvey: ProcessBuffers adds an f32 stats line
 };
 struct BufPending {
 	vk::Buffer      buffer = nullptr;
@@ -127,6 +128,25 @@ struct HostStReq {
 std::vector<HostStReq>                          g_hoststreq;
 std::set<std::tuple<uint64_t, uint32_t, uint32_t>> g_seen_hostst; // (host image, mip, layer)
 bool                                            g_hostst_capped = false;
+
+// ---- non-image buffer survey (under the host-st gate) ----
+// The images a frame binds are only half its inputs: the deferred lighting
+// draws and dispatches also read per-light constants, light-grid buffers and
+// exposure state through plain buffer bindings, which no image readback can
+// see (the dark-ice investigation: the lit buffer was already dim at its
+// first readback with every imaged input sane). Under the host-st gate,
+// CaptureBufferSurvey logs the buffer bindings of every draw/dispatch the
+// binding-capture paths above do not already cover and queues one GPU copy
+// per unique (guest addr, size) per capture -- first binding wins, the same
+// rule as the host-st texture readbacks. Its own byte budget bounds the
+// staging memory; the copies ride the existing BufReq/BufPending machinery
+// and land as buf_<seq>_buf<slot>_<addr>.bin files plus buffers.txt lines.
+std::map<std::pair<uint64_t, uint64_t>, uint32_t> g_survey_seen; // (guest addr, size) -> first seq queued
+uint64_t                                         g_survey_bytes   = 0;
+bool                                             g_survey_capped  = false;
+constexpr uint64_t kSurveyMaxBytes   = 64ull << 20; // queued survey copies per capture
+constexpr uint64_t kSurveyPerBuffer  = 16ull << 20; // per queued survey copy (QueueBuffer's
+                                                    // own default cap for the older paths is 4 MiB)
 
 // ---- guest sampled-texture readback (NHL27GUESTTEX) ----
 // Sampled textures are never read back from the GPU (the dump saves render
@@ -255,6 +275,13 @@ bool WantBuffers(uint64_t ps_hash) {
 // already dumped as render targets when they are written. Pair with
 // KYTY_DBG_FRAME_DUMP_FROM=<seq> so the shared readback caps (kMaxImages,
 // kMaxPendingBytes) are spent on the frame's tail, where the UI phase lives.
+// The same gate also enables the non-image buffer survey (CaptureBufferSurvey
+// below): the buffer bindings of every draw/dispatch are logged and copied,
+// so the lighting data no image readback can see (per-light constants,
+// light-grid buffers, exposure state) lands in the same capture. The survey
+// is deliberately NOT gated by FROM: the lighting window sits early in the
+// frame, long before the UI tail FROM exists to save the image budget for,
+// and the survey carries its own byte budget instead.
 bool WantHostSt() {
 	static const bool on = [] {
 		const char* v = std::getenv("KYTY_DBG_FRAME_DUMP_HOST_ST");
@@ -333,7 +360,7 @@ void DwordLines(std::string& out, const char* tag, uint32_t seq, uint64_t ps_has
 }
 
 void QueueBuffer(vk::Buffer buf, uint64_t offset, uint64_t range, uint64_t addr, uint64_t guest_size,
-                 uint32_t seq, const std::string& label) {
+                 uint32_t seq, const std::string& label, uint64_t max_bytes = (4ull << 20)) {
 	if (!buf || range == 0 || range == VK_WHOLE_SIZE) return;
 	char key[96];
 	std::snprintf(key, sizeof(key), "%" PRIx64 ":%" PRIx64 ":%u", addr, guest_size, seq);
@@ -347,7 +374,7 @@ void QueueBuffer(vk::Buffer buf, uint64_t offset, uint64_t range, uint64_t addr,
 	BufReq r;
 	r.buf    = buf;
 	r.offset = offset;
-	r.size   = std::min<uint64_t>(range, (4ull << 20));
+	r.size   = std::min<uint64_t>(range, max_bytes);
 	r.seq    = seq;
 	r.label  = label;
 	r.addr   = addr;
@@ -452,6 +479,78 @@ void CaptureBindings(const PreparedBindings& b, uint32_t seq, uint64_t ps_hash,
 	}
 }
 
+// Buffer survey for one draw/dispatch, run under the host-st gate for every
+// event CaptureBindings does not already cover (draws: the BUF_PS selection;
+// dispatches: the CS_CONSTANTS / traced set). Leaner than CaptureBindings on
+// purpose -- no flattened-SRT file, no per-dword USERDATA/SRT/PUSH dumps --
+// because it runs for thousands of events per capture: it logs the user-data
+// dwords, the scalar-read guest ranges (addresses only) and every bound
+// buffer, and queues one GPU copy per unique (guest addr, size) per capture
+// under the survey byte budget. The copy is recorded by FlushRequests like
+// every BufReq, so it reads the buffer's state at the flush point in stream
+// order -- a buffer queued by its writer event is copied after that write.
+// ProcessBuffers writes the copies as buf_<seq>_buf<slot>_<addr>.bin and adds
+// an f32 stats line, which is what the dark-vs-healthy comparison reads: the
+// exposure state and the light data are float data, and a single wrong float
+// (an exposure value near zero) is the dark-ice suspect.
+void CaptureBufferSurvey(const PreparedBindings& b, uint32_t seq, uint64_t hash, bool dispatch) {
+	char line[512];
+	std::snprintf(line, sizeof(line), "== #%05u %s=0x%016" PRIx64 " (buffer survey) ==\n", seq,
+	              dispatch ? "cs" : "ps", hash);
+	g_buflog += line;
+	if (b.runtime != nullptr && b.runtime->resources != nullptr) {
+		const auto& r = *b.runtime->resources;
+		g_buflog += "  user_data (" + std::to_string(r.user_data.size()) + " dwords):\n";
+		g_buflog += WordsText(reinterpret_cast<const uint8_t*>(r.user_data.data()), r.user_data.size() * 4);
+		for (const auto& [addr, size] : r.specialization_reads) {
+			std::snprintf(line, sizeof(line), "    scalar_read addr=0x%" PRIx64 " size=%" PRIu64 "\n", addr,
+			              size);
+			g_buflog += line;
+		}
+	}
+	g_buflog += "  bound buffers: " + std::to_string(b.buffers.size()) + "\n";
+	for (size_t i = 0; i < b.buffers.size(); i++) {
+		const auto src = i < b.buffer_sources.size() ? b.buffer_sources[i] : PreparedBindings::BufferSource {};
+		std::snprintf(line, sizeof(line), "    buf[%zu]: guest addr=0x%" PRIx64 " size=%" PRIu64
+		              " host_offset=%" PRIu64 " host_range=%" PRIu64, i, src.address, src.size,
+		              static_cast<uint64_t>(b.buffers[i].offset), static_cast<uint64_t>(b.buffers[i].range));
+		g_buflog += line;
+		if (src.address == 0 || src.size == 0) {
+			g_buflog += "\n";
+			continue;
+		}
+		const auto key = std::make_pair(src.address, src.size);
+		if (const auto it = g_survey_seen.find(key); it != g_survey_seen.end()) {
+			std::snprintf(line, sizeof(line), " (copy queued at #%05u)\n", it->second);
+			g_buflog += line;
+			continue;
+		}
+		const uint64_t copy_size = std::min<uint64_t>(b.buffers[i].range, kSurveyPerBuffer);
+		if (g_survey_capped || g_survey_bytes + copy_size > kSurveyMaxBytes) {
+			if (!g_survey_capped) {
+				g_survey_capped = true;
+				g_buflog += "  buffer survey byte budget reached, further copies skipped\n";
+			}
+			g_buflog += " (over survey budget)\n";
+			continue;
+		}
+		const size_t queued_before = g_bufreq.size();
+		QueueBuffer(b.buffers[i].buffer, b.buffers[i].offset, b.buffers[i].range, src.address, src.size, seq,
+		            "buf" + std::to_string(i), kSurveyPerBuffer);
+		if (g_bufreq.size() > queued_before) {
+			// Mark the key only once a copy really is queued: QueueBuffer
+			// declines null / whole-size bindings, and a later event binding
+			// the same range must not be told a copy exists when none does.
+			g_survey_seen.emplace(key, seq);
+			g_bufreq.back().survey = true;
+			g_survey_bytes += g_bufreq.back().size;
+			g_buflog += " (copy queued)\n";
+		} else {
+			g_buflog += " (copy not queued)\n";
+		}
+	}
+}
+
 void RecordReadback(GraphicContext& gfx, const CommandRecorder& cmd, const Target& t, const char* label,
                     uint32_t seq);
 
@@ -530,7 +629,41 @@ void ProcessBuffers(std::vector<BufPending>& bufpending, std::string& buflog,
 				}
 				buflog += "    nonzero dwords: " + std::to_string(nz) + " / " + std::to_string(nd) + "\n";
 			}
-			if (p.req.size <=(4ull << 20)) {
+			if (p.req.survey) {
+				// Float view of the copy (survey copies only, so the older
+				// paths' buffers.txt stays byte-identical): the lighting data
+				// the survey exists for -- exposure state, per-light
+				// constants, light-grid cells -- is float data, and this one
+				// line per buffer is what a dark-vs-healthy comparison reads
+				// first. Non-finite dwords are counted but excluded.
+				const size_t nd = static_cast<size_t>(p.req.size / 4);
+				size_t       finite = 0;
+				double       sum    = 0.0;
+				float        fmn = 3.4e38f, fmx = -3.4e38f;
+				for (size_t k = 0; k < nd; k++) {
+					uint32_t w;
+					std::memcpy(&w, d + k * 4, 4);
+					float f;
+					std::memcpy(&f, &w, 4);
+					if (!std::isfinite(f)) continue;
+					finite++;
+					sum += f;
+					fmn = std::min(fmn, f);
+					fmx = std::max(fmx, f);
+				}
+				if (finite > 0) {
+					std::snprintf(line, sizeof(line), "    f32 stats: finite=%zu/%zu min=%g max=%g mean=%g\n",
+					              finite, nd, static_cast<double>(fmn), static_cast<double>(fmx),
+					              sum / static_cast<double>(finite));
+				} else {
+					std::snprintf(line, sizeof(line), "    f32 stats: finite=0/%zu\n", nd);
+				}
+				buflog += line;
+			}
+			// The 16 MiB write bound only ever binds survey copies: every
+			// older queueing path caps its copies at 4 MiB, so their files
+			// are written exactly as before.
+			if (p.req.size <= (16ull << 20)) {
 				std::snprintf(line, sizeof(line), "%s/buf_%05u_%s_%s.bin", dir.c_str(), p.req.seq,
 				              p.req.label.c_str(), Hex(p.req.addr).c_str());
 				if (FILE* f = std::fopen(line, "wb")) {
@@ -1583,6 +1716,9 @@ void BeginCapture(CommandBuffer& buffer) {
 	g_hoststreq.clear();
 	g_seen_hostst.clear();
 	g_hostst_capped = false;
+	g_survey_seen.clear();
+	g_survey_bytes   = 0;
+	g_survey_capped  = false;
 	g_guesttex.clear();
 	g_seen_guesttex.clear();
 	g_guesttex_bytes = 0;
@@ -1959,6 +2095,13 @@ void OnDraw(RenderContext& context, const DrawLog& draw) {
 		queue_sampled(draw.ps_images);
 	}
 	g_log += s;
+	if (draw.ps_bindings != nullptr && draw.ps_active && WantHostSt() && !WantBuffers(draw.ps_hash)) {
+		// Buffer survey for the draws the BUF_PS selection does not cover
+		// (see CaptureBufferSurvey): under the host-st gate every lighting
+		// draw's non-image inputs land in buffers.txt, not just the two
+		// default BUF_PS hashes'.
+		CaptureBufferSurvey(*draw.ps_bindings, seq, draw.ps_hash, false);
+	}
 	if (draw.ps_bindings != nullptr && draw.ps_active && WantBuffers(draw.ps_hash)) {
 		CaptureBindings(*draw.ps_bindings, seq, draw.ps_hash);
 		if (draw.ps_images != nullptr) {
@@ -2028,6 +2171,13 @@ void OnDispatch(RenderContext& context, CommandBuffer& buffer, uint64_t cs_hash,
 	if (bindings != nullptr && (trace_cs || capture_constants)) {
 		g_buflog += "# compute bindings captured AFTER dispatch\n";
 		CaptureBindings(*bindings, seq, cs_hash, capture_constants && !trace_cs);
+	}
+	if (bindings != nullptr && WantHostSt() && !trace_cs && !capture_constants) {
+		// Buffer survey for the dispatches the CS_CONSTANTS / traced set does
+		// not cover: the exposure reduction chain and the light-build
+		// dispatches bind their data as buffers, and without this no dispatch
+		// in a host-st capture leaves any buffer record at all.
+		CaptureBufferSurvey(*bindings, seq, cs_hash, true);
 	}
 	FlushRequests(buffer.GetGraphics(), buffer.Handle());
 	std::string s = b;

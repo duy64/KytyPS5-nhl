@@ -9,7 +9,13 @@
 // guest-byte guesttex dump cannot see. Under this gate the per-capture readback image
 // cap is raised (400 -> 2000) so a frame's tail fits, and KYTY_DBG_FRAME_DUMP_FROM=<seq>
 // also gates the host-st queueing itself, so a texture first sampled before FROM stays
-// eligible when the tail binds it again.
+// eligible when the tail binds it again. The same gate also enables a survey of the
+// NON-IMAGE buffers every draw/dispatch binds (per-light constants, light-grid buffers,
+// exposure state): bindings are logged to buffers.txt and one GPU copy per unique
+// (guest addr, size) per capture is saved as a buf_*.bin with an f32 stats line, for
+// the events the BUF_PS / CS_CONSTANTS binding captures do not already cover. The
+// survey is not gated by FROM (the lighting window sits early in the frame) and
+// carries its own byte budget.
 // The next complete guest frame (flip to flip) is captured: every draw/dispatch is
 // logged to <captures>/frame_<n>/frame.txt and every render pass's color/depth targets and every
 // dispatch's written storage images are read back and saved as PNG. Zero cost when the flag is off

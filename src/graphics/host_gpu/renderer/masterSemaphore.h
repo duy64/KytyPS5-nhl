@@ -30,6 +30,7 @@ public:
 
 	void Refresh();
 	void Wait(uint64_t tick);
+	bool WaitFor(uint64_t tick, uint64_t timeout_ns);
 
 private:
 	GraphicContext&       m_graphics;

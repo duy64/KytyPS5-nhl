@@ -1781,6 +1781,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 	// tick instead: the guest thread waits for it here while the execution thread goes on, then
 	// asks again (AbPending3: the execution thread waits). Waits for unfinished writers were 7 ms
 	// each, 4% of the execution thread in play.
+	// A retry wait that outlives this budget force-submits the open command buffer (see the wait
+	// below). Healthy writer waits average ~3.5 ms and peaked at ~9.3 ms in the NHL27WHYSUM
+	// windows this was tuned on, so the escape stays out of the common case.
+	constexpr uint64_t kRetryWaitBudgetNs = 25000000;
 	for (uint32_t attempt = 0;; ++attempt) {
 		uint64_t retry_tick = 0;
 		m_scheduler.Context().GetGpu().SendUrgentCommandSync([this, vaddr, size, is_write, caller, on_gpu, tid,
@@ -2012,7 +2016,29 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			break;
 		}
 		m_scheduler.WaitSubmitted(retry_tick);
-		m_scheduler.GetMasterSemaphore().Wait(retry_tick);
+		auto& master = m_scheduler.GetMasterSemaphore();
+		if (!master.WaitFor(retry_tick, kRetryWaitBudgetNs)) {
+			// The writer tick is submitted but has not completed within the budget. The reads
+			// are parked while the pipeline only advances when some other thread submits: the
+			// ordinary download path force-submits the open command buffer on every read (its
+			// Wait(CurrentTick())), the direct-read path does not, so a low-fps feedback loop
+			// (reads wait for ticks, ticks wait for game progress, the game threads are the
+			// ones waiting) can sustain itself. Restore that push on demand only: one Flush
+			// on the execution thread, through the same urgent-command route and the same
+			// call the retry gate itself makes, then wait as before. No locks are held here
+			// and the gate only fires for !on_gpu callers, so the waiting thread is never the
+			// execution thread and the Flush cannot wait on it.
+			static std::atomic<uint32_t> escape_lines {0};
+			if (escape_lines.fetch_add(1, std::memory_order_relaxed) < 200) {
+				std::printf("NHL27RDESCAPE: vaddr=0x%016" PRIx64 " tick=%" PRIu64 " current=%" PRIu64
+				            " attempt=%u budget_ms=25\n",
+				            vaddr, retry_tick, m_scheduler.CurrentTick(), attempt);
+				std::fflush(stdout);
+			}
+			m_scheduler.Context().GetGpu().SendUrgentCommandSync([this] { m_scheduler.Flush(); });
+			m_scheduler.WaitSubmitted(retry_tick);
+		}
+		master.Wait(retry_tick);
 	}
 	if (async_tick != 0) {
 		m_scheduler.WaitPriorityOperations(async_tick);

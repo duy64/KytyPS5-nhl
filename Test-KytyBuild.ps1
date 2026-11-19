@@ -1,4 +1,11 @@
-# Test-KytyBuild.ps1 - v45 (2026-11-17)
+# Test-KytyBuild.ps1 - v47 (2026-11-19)
+# v47: the v46 Play Now switch rebased onto v45 patch 2 (the Unknown
+# back-out change), after patch 2's push landed over v46 and dropped
+# the Play Now route. v46 content is unchanged: Be A Pro is out, the
+# Hub action takes PLAY NOW (D-pad Down + Cross), and a Be A Pro hub
+# backs out with Circle. Patch 2 is kept as-is: five Unknown gameplay
+# checks press Circle once, three such warnings end the phase early.
+#
 # v45: continuous capture for sparkle/smear detection. Right after the
 # 09/10/11 extended-play shots in STEP 3, the script now records the
 # screen continuously for about 45 seconds (one frame every 500 ms,
@@ -476,7 +483,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 45
+$TestScriptVersion = 47
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -745,8 +752,10 @@ if (Test-FileExistsQuiet $InputFile) { Remove-Item $InputFile -Force }
 $env:KYTY_INPUT_FILE = $InputFile
 
 # Copy the saved game from the launcher's run folder into the build folder
-# before launch, so the game loads the existing Be A Pro save and reaches the
-# hub instead of the new-game flow. SAVE_DATA_DIR is relative "_SaveData".
+# before launch. Play Now (v47) does not use the career save, but the copy
+# still carries the profile and settings over, and the backup below keeps
+# every run leaving a safe copy of the real save. SAVE_DATA_DIR is relative
+# "_SaveData".
 $runSave = Join-Path $env:LOCALAPPDATA "KytyPS5\run\_SaveData"
 $buildSave = Join-Path $BuildDir "_SaveData"
 if (Test-Path $runSave) {
@@ -1542,7 +1551,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v45: FULL cfgGlobal env (67 rows) + full navigation (idle test removed; v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v47: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains
@@ -1650,9 +1659,10 @@ if (-not $signInGone) {
 # Unknown loading screen waits and re-reads without consuming a try, or
 # the cap fires mid-load as it did in the 1651/1706 runs. If a stop
 # cannot be reached, the run fails with the stop name and the last screen
-# seen, instead of wandering. Be A Pro
-# rule (unchanged): if the screen offers only START CAREER with no
-# CONTINUE, STOP - never create a character.
+# seen, instead of wandering. Play Now
+# rule (v47): the run never enters Be A Pro - if it lands on the Be A
+# Pro hub it backs out to the main menu, and if a screen ever offers
+# only START CAREER with no CONTINUE, STOP - never create a character.
 $roadmap = @("Title", "Hub", "GameExperience", "Versus", "Ice")
 $step = 0
 $navShot = 0
@@ -1843,19 +1853,20 @@ while ($step -lt $roadmap.Count) {
             $navFailed = $true
             break
         }
-        # Two different Hub screens. The Be A Pro hub highlights PLAY NEXT
-        # GAME, so Cross is right there. The main menu highlights BE A PRO
-        # CAREER first, so Cross alone opens Be A Pro - that is the route
-        # we want (v12): the versus screen that matters is the Be A Pro
-        # one, not Play Now. Do NOT press Down to PLAY NOW. Tell the two
-        # Hub screens apart by the OCR text.
+        # Two different Hub screens (v47 Play Now route). The main menu
+        # highlights BE A PRO CAREER first and PLAY NOW sits one D-pad
+        # Down under it, so Down + Cross opens Play Now and lands on
+        # the SELECT TEAM screen (read as Versus). The Be A Pro hub
+        # ("play next game") is the wrong mode for this run: back out
+        # with Circle and stay on the Hub stop until the main menu
+        # shows again - never enter the career (see the v47 header).
         if ($text -match "play next game") {
-            Write-Host "Be A Pro hub - selecting PLAY NEXT GAME for the Versus screen."
-            Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
-        } else {
-            Write-Host "Main menu - selecting BE A PRO CAREER (default highlight) for the Be A Pro Versus screen."
-            Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
+            Write-Host "Be A Pro hub - wrong mode for a Play Now run; backing out to the main menu with Circle."
+            Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+            continue
         }
+        Write-Host "Main menu - selecting PLAY NOW (D-pad Down, then Cross) for the Play Now Versus screen."
+        Invoke-InputStage -Lines @("Down 150", "sleep 1000", "j 150", "sleep 4000") -ExtraWaitSec 2
         $step++
         continue
     }

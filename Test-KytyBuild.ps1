@@ -13,6 +13,17 @@
 # normally. No new inputs are sent during the window and no focus
 # behaviour is added beyond what Save-ScreenShot already does.
 #
+# v45 patch (2026-11-18, after the #200 run stalled): two nav fixes.
+# (1) X-Factors is the pre-game interstitial in the preseason flow:
+# confirming on Versus opens it and its ADVANCE button is highlighted,
+# so at the Ice stop the loop now presses Cross to advance instead of
+# Circle to back out (Circle returned to Versus and looped all 60 nav
+# shots). At other stops the Circle back-out stays. (2) Save-FrameDumpShot
+# now picks the LAST draw's rt0 (highest draw index) instead of the
+# first _rt0_ file the download wrote: the #200 run's 04-versus.png was
+# a 97-byte 32x32 rt0 tile. It waits for the download to go quiet
+# (5 s with no new PNG) before choosing, bounded by the 90 s deadline.
+#
 # v44: OneOCR (the Windows 11 Snipping Tool OCR engine) replaces the old
 # OCR engine for screen reading (user request 2026-11-16). OneOCR reads
 # the game UI text more accurately and needs no separate install: the
@@ -855,6 +866,17 @@ function Save-FrameDumpShot {
     $found = $null
     $fallback = $null
     $foundDir = $null
+    # The presented frame is the LAST draw's rt0, so among new _rt0_
+    # PNGs take the highest draw index (the numeric filename prefix),
+    # not the first file the download happened to write: the 2026-11-18
+    # #200 run picked a 32x32 rt0 and 04-versus.png was a 97-byte tile.
+    # Wait for the download to go quiet (5 s with no new PNG) before
+    # choosing, so a later draw cannot beat the pick; the 90 s deadline
+    # still bounds the wait. Keep the first new PNG as a fallback in
+    # case no rt0 appears (a depth image is better than no shot).
+    $bestIndex = -1
+    $lastNewCount = -1
+    $quietSince = Get-Date
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Milliseconds 500
         # Re-check for the newest frame_* folder each pass: the dump may
@@ -862,18 +884,25 @@ function Save-FrameDumpShot {
         $latest = @(Get-ChildItem -Path $dumpDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
         if ($latest.Count -gt 0) { $frameDir = $latest[0].FullName }
         if (Test-Path $frameDir) {
-            $now = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+            $now = @(Get-ChildItem -Path $frameDir -Filter "*.png" -ErrorAction SilentlyContinue)
+            $newCount = 0
             foreach ($f in $now) {
                 if ($before -notcontains $f.Name) {
-                    # Prefer the _rt0_ color image: the first new PNG can be
-                    # a depth image (6144x6144) or a storage image, and OCR
-                    # on a depth map reads garbage. Keep the first new PNG
-                    # as a fallback in case no rt0 appears.
+                    $newCount++
                     if (-not $fallback) { $fallback = $f.FullName; $foundDir = $frameDir }
-                    if ($f.Name -match "_rt0_") { $found = $f.FullName; $foundDir = $frameDir; break }
+                    if ($f.Name -match "_rt0_") {
+                        $idx = 0
+                        if ($f.Name -match "^([0-9]+)_") { $idx = [int]$Matches[1] }
+                        if ($idx -gt $bestIndex) { $bestIndex = $idx; $found = $f.FullName; $foundDir = $frameDir }
+                    }
                 }
             }
-            if ($found) { break }
+            if ($newCount -ne $lastNewCount) {
+                $lastNewCount = $newCount
+                $quietSince = Get-Date
+            } elseif ($found -and (((Get-Date) - $quietSince).TotalSeconds -ge 5)) {
+                break
+            }
         }
         if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) { break }
     }
@@ -1505,7 +1534,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v43: FULL cfgGlobal env (67 rows) + full navigation (idle test removed; v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v45: FULL cfgGlobal env (67 rows) + full navigation (idle test removed; v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains
@@ -1708,12 +1737,22 @@ while ($step -lt $roadmap.Count) {
         continue
     }
     if ($kind -eq "XFactor") {
-        # The Be A Pro X-Factors screen: a player-abilities menu the
-        # nav loop wandered into (the 2026-11-11 v28 run sat on it -
-        # Unknown just waits, so it never backed out). Circle backs out
-        # to the hub; re-read after.
-        Write-Host "X-Factors screen - backing out with Circle."
-        Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+        # The Be A Pro X-Factors screen. In the preseason flow it is the
+        # pre-game interstitial on the way to the ice: confirming on
+        # Versus opens it, and its ADVANCE button is highlighted (2026-
+        # 11-18 #200 run, shot 10-nav.png) - Cross advances to the game.
+        # Circle backs out to Versus, which re-confirms into X-Factors
+        # and loops forever (the #200 run burned all 60 nav shots this
+        # way), so only back out when the stop is not Ice. The 2026-11-11
+        # v28 run sat on this screen from elsewhere, so the back-out
+        # stays for other stops.
+        if ($want -eq "Ice") {
+            Write-Host "X-Factors screen - advancing with Cross."
+            Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+        } else {
+            Write-Host "X-Factors screen - backing out with Circle."
+            Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
+        }
         continue
     }
     if ($kind -eq "Unknown") {

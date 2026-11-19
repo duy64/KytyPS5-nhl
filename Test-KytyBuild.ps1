@@ -1,28 +1,4 @@
-# Test-KytyBuild.ps1 - v46 (2026-11-19)
-# v46: the autorun switches from Be A Pro to Play Now (user decision
-# 2026-11-18). In Be A Pro the script controls one player, and the
-# game's penalty-benching bug (one minor penalty = benched for the
-# rest of the game, no notice) left the script watching from the
-# bench on run after run: its inputs did nothing and the recorded
-# frames and fps were not real gameplay. Be A Pro also ties the run
-# to the real career save (the end-of-season interview stall killed
-# the 2026-11-18 run). Play Now gives full team control - always a
-# skater on the ice, normal line changes only - the same matchup
-# every run, and no season state or scripted events. Route change
-# is only the Hub action: on the main menu the script now presses
-# D-pad Down once (PLAY NOW sits under the default BE A PRO CAREER
-# highlight) then Cross, landing on the Play Now SELECT TEAM screen,
-# which the classifier already reads as Versus. If it ever lands on
-# the Be A Pro hub instead ("play next game"), it backs out with
-# Circle and stays on the Hub stop - a Play Now run never enters
-# the career. The rest of the roadmap is unchanged: the Versus stop
-# confirms with Cross (an earlier-stop screen jumps back to Versus,
-# so a multi-confirm team select still works), GameExperience is
-# skipped by the forward jump when the dialog never appears, and
-# the X-Factors advance at the Ice stop stays. Trade-off, accepted
-# by the user: 04-versus.png is now the Play Now SELECT TEAM screen;
-# the Be A Pro Versus screen is no longer covered by nightly runs.
-#
+# Test-KytyBuild.ps1 - v45 (2026-11-17)
 # v45: continuous capture for sparkle/smear detection. Right after the
 # 09/10/11 extended-play shots in STEP 3, the script now records the
 # screen continuously for about 45 seconds (one frame every 500 ms,
@@ -47,6 +23,14 @@
 # first _rt0_ file the download wrote: the #200 run's 04-versus.png was
 # a 97-byte 32x32 rt0 tile. It waits for the download to go quiet
 # (5 s with no new PNG) before choosing, bounded by the 90 s deadline.
+#
+# v45 patch 2 (2026-11-19, after the #200 retest sat 82 min on the
+# X-Factor glossary): STEP 4 Unknown recovery. Five Unknown gameplay
+# checks in a row still capture a clip burst, but now also press Circle
+# once (Back) with a quiet 5 s wait, then re-check: the rotation's own
+# Circle presses are interleaved with stick/Cross/Square inputs that
+# re-open the menu. Three such warnings (about 15 min off the ice)
+# end the gameplay phase early instead of burning the full 90 min.
 #
 # v44: OneOCR (the Windows 11 Snipping Tool OCR engine) replaces the old
 # OCR engine for screen reading (user request 2026-11-16). OneOCR reads
@@ -492,7 +476,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 46
+$TestScriptVersion = 45
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -761,10 +745,8 @@ if (Test-FileExistsQuiet $InputFile) { Remove-Item $InputFile -Force }
 $env:KYTY_INPUT_FILE = $InputFile
 
 # Copy the saved game from the launcher's run folder into the build folder
-# before launch. Play Now (v46) does not use the career save, but the copy
-# still carries the profile and settings over, and the backup below keeps
-# every run leaving a safe copy of the real save. SAVE_DATA_DIR is relative
-# "_SaveData".
+# before launch, so the game loads the existing Be A Pro save and reaches the
+# hub instead of the new-game flow. SAVE_DATA_DIR is relative "_SaveData".
 $runSave = Join-Path $env:LOCALAPPDATA "KytyPS5\run\_SaveData"
 $buildSave = Join-Path $BuildDir "_SaveData"
 if (Test-Path $runSave) {
@@ -1560,7 +1542,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v46: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v45: FULL cfgGlobal env (67 rows) + full navigation (idle test removed; v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains
@@ -1668,10 +1650,9 @@ if (-not $signInGone) {
 # Unknown loading screen waits and re-reads without consuming a try, or
 # the cap fires mid-load as it did in the 1651/1706 runs. If a stop
 # cannot be reached, the run fails with the stop name and the last screen
-# seen, instead of wandering. Play Now
-# rule (v46): the run never enters Be A Pro - if it lands on the Be A
-# Pro hub it backs out to the main menu, and if a screen ever offers
-# only START CAREER with no CONTINUE, STOP - never create a character.
+# seen, instead of wandering. Be A Pro
+# rule (unchanged): if the screen offers only START CAREER with no
+# CONTINUE, STOP - never create a character.
 $roadmap = @("Title", "Hub", "GameExperience", "Versus", "Ice")
 $step = 0
 $navShot = 0
@@ -1862,20 +1843,19 @@ while ($step -lt $roadmap.Count) {
             $navFailed = $true
             break
         }
-        # Two different Hub screens (v46 Play Now route). The main menu
-        # highlights BE A PRO CAREER first and PLAY NOW sits one D-pad
-        # Down under it, so Down + Cross opens Play Now and lands on
-        # the SELECT TEAM screen (read as Versus). The Be A Pro hub
-        # ("play next game") is the wrong mode for this run: back out
-        # with Circle and stay on the Hub stop until the main menu
-        # shows again - never enter the career (see the v46 header).
+        # Two different Hub screens. The Be A Pro hub highlights PLAY NEXT
+        # GAME, so Cross is right there. The main menu highlights BE A PRO
+        # CAREER first, so Cross alone opens Be A Pro - that is the route
+        # we want (v12): the versus screen that matters is the Be A Pro
+        # one, not Play Now. Do NOT press Down to PLAY NOW. Tell the two
+        # Hub screens apart by the OCR text.
         if ($text -match "play next game") {
-            Write-Host "Be A Pro hub - wrong mode for a Play Now run; backing out to the main menu with Circle."
-            Invoke-InputStage -Lines @("l 150", "sleep 3000") -ExtraWaitSec 2
-            continue
+            Write-Host "Be A Pro hub - selecting PLAY NEXT GAME for the Versus screen."
+            Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
+        } else {
+            Write-Host "Main menu - selecting BE A PRO CAREER (default highlight) for the Be A Pro Versus screen."
+            Invoke-InputStage -Lines @("j 150", "sleep 4000") -ExtraWaitSec 2
         }
-        Write-Host "Main menu - selecting PLAY NOW (D-pad Down, then Cross) for the Play Now Versus screen."
-        Invoke-InputStage -Lines @("Down 150", "sleep 1000", "j 150", "sleep 4000") -ExtraWaitSec 2
         $step++
         continue
     }
@@ -2001,7 +1981,11 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
 # sends a varied input pattern (skate, pass, shoot, poke). The screen is
 # OCR-checked every few cycles from a fast screen capture: Pause is
 # resumed with Cross, a menu means the game is over, Unknown is tolerated
-# and logged. A frame-dump data shot is taken every 10 minutes, and a
+# and logged. Five Unknown checks in a row also press Circle once (Back)
+# with a quiet 5 s wait (v45 patch 2: the 2327 run sat on the X-Factor
+# glossary for 82 minutes because the rotation's Circle presses are
+# interleaved with inputs that re-open it); three such warnings end the
+# phase early. A frame-dump data shot is taken every 10 minutes, and a
 # fast screen capture (flash-watch, 12-flash-<n>.png) every 5 cycles
 # (about 30 seconds) to catch brief glitches the 10-minute shots miss.
 # The emulator exiting (crash) ends the phase immediately. Skipped for
@@ -2012,6 +1996,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $gameOver = $false
     $cycle = 0
     $unknownStreak = 0
+    $unknownWarnings = 0
     $gameplayShotCount = 0
     $flashShotCount = 0
     $lastDataShot = $gameplayStart
@@ -2065,6 +2050,17 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
                     Write-Warning ("Gameplay screen not recognized for 5 checks in a row (cycle " + $cycle + "). The game may be in a replay, cutscene, or a state OCR cannot name. Continuing to send inputs.")
                     Save-ClipBurst -Label ("gameplay-unknown-" + $cycle)
                     $unknownStreak = 0
+                    # v45 patch 2: one lone Circle (Back) with a quiet 5 s
+                    # wait, so the game can settle back to the ice or a
+                    # menu; the next check then sees Ice, Pause, or a menu.
+                    # Safe on replays/cutscenes too: Circle skips them.
+                    $unknownWarnings++
+                    Write-Host ("Gameplay screen still unrecognized - pressing Circle once to back out (warning " + $unknownWarnings + " of 3).")
+                    Invoke-InputStage -Lines @("l 150", "sleep 5000") -ExtraWaitSec 1
+                    if ($unknownWarnings -ge 3) {
+                        Write-Host "Gameplay phase: screen unrecognized for 3 warnings in a row (about 15 minutes off the ice) - ending the gameplay phase early."
+                        $gameOver = $true
+                    }
                 }
             }
             # Ice needs no action - the pattern keeps the game moving.

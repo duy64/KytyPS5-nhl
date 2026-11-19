@@ -658,6 +658,15 @@ Swapchain::Status Swapchain::AcquireNextImage(CommandScheduler& scheduler) {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkAcquireNextImageKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
+		case vk::Result::eErrorDeviceLost:
+			// Unrecoverable (the device behind every host object is gone): dump the same
+			// device-fault state as the submit path, then abort with the usual message.
+			std::printf("NHL27DEVLOST: vkAcquireNextImageKHR frame_index=%u "
+			            "last_submit_tick=%" PRIu64 "\n",
+			            m_frame_index, m_image_acquired_ticks[m_frame_index]);
+			std::fflush(stdout);
+			ReportDeviceLost(m_window.graphic_ctx);
+			EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 		default: EXIT("vkAcquireNextImageKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	EXIT_IF(m_image_index >= m_images.size());
@@ -996,6 +1005,15 @@ Swapchain::Status Swapchain::Present() {
 		case vk::Result::eErrorSurfaceLostKHR:
 			LOGF("vkQueuePresentKHR returned vk::Result::eErrorSurfaceLostKHR\n");
 			return Status::SurfaceLost;
+		case vk::Result::eErrorDeviceLost:
+			// Unrecoverable (the device behind every host object is gone): dump the same
+			// device-fault state as the submit path, then abort with the usual message.
+			std::printf("NHL27DEVLOST: vkQueuePresentKHR image_index=%u frame_index=%u "
+			            "submit_tick=%" PRIu64 "\n",
+			            m_image_index, m_frame_index, m_image_acquired_ticks[m_frame_index]);
+			std::fflush(stdout);
+			ReportDeviceLost(m_window.graphic_ctx);
+			EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());

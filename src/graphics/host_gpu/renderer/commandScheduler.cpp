@@ -1599,6 +1599,16 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::QueueSubmits);
 
 	if (result == vk::Result::eErrorDeviceLost) {
+		// Device loss is unrecoverable in this process: every host object (caches, pipelines,
+		// the master semaphore, the swapchain) belongs to the one lost device. Give the event
+		// its own headline line with the scheduler state, ahead of the fault dumps below and
+		// the dedicated abort after ReportVulkanFatal, so a device loss never again surfaces
+		// as the generic "Not implemented" fatal.
+		std::printf("NHL27DEVLOST: vkQueueSubmit tick=%" PRIu64 " gpu_finished_tick=%" PRIu64
+		            " recording_tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64 "\n",
+		            tick, m_master.KnownGpuTick(), m_master.CurrentTick(), debug.debug_op,
+		            debug.debug_submit_id);
+		std::fflush(stdout);
 		DumpDeviceFault(graphics.device);
 		// NHL26 debugging: GDS is host-visible; print its nonzero dwords as of the hang.
 		const auto gds = m_context.GetBufferCache().GetGdsBuffer()->Mapped();
@@ -1619,6 +1629,11 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		ReportVulkanFatal("vkQueueSubmit", result, tick, debug.debug_op, debug.debug_submit_id,
 		                  debug.debug_arg0, debug.debug_arg1, debug.debug_arg2, debug.debug_arg3,
 		                  debug.debug_arg4);
+	}
+	if (result == vk::Result::eErrorDeviceLost) {
+		// Clean abort on the standard fatal path (fatal log + host stack + emergency
+		// shutdown), labelled as the device loss it is; the state dump is above.
+		EXIT("vkQueueSubmit: device lost, aborting (see NHL27DEVLOST / NHL26FAULT above)\n");
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 }

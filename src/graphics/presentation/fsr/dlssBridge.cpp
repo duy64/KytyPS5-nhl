@@ -820,17 +820,20 @@ void DlssAppendDeviceExtensions(vk::Instance instance, vk::PhysicalDevice physic
 	VkExtensionProperties* required = nullptr;
 	const auto             ext_result = NVSDK_NGX_VULKAN_GetFeatureDeviceExtensionRequirements(
         vk_instance, vk_physical, &Discovery().info, &count, &required);
-	// The "vk" line doubles as the build marker: its presence in a log (and in the
-	// binary) proves the Vulkan NGX path is the compiled one.
-	std::printf("NHL27DLSS vk requirements result=%d feature_supported=%u min_hw_arch=%u extensions result=%d "
-	            "count=%u\n",
-	            static_cast<int>(req_result), static_cast<unsigned>(requirement.FeatureSupported),
-	            requirement.MinHWArchitecture, static_cast<int>(ext_result), count);
-	std::fflush(stdout);
-	if (req_result == NVSDK_NGX_Result_Success && requirement.FeatureSupported != 0 &&
+	const auto extensions_before = extensions.size();
+	if (req_result == NVSDK_NGX_Result_Success &&
+	    requirement.FeatureSupported == NVSDK_NGX_FeatureSupportResult_Supported &&
 	    ext_result == NVSDK_NGX_Result_Success) {
 		AppendNgxExtensions(required, count, available, extensions);
 	}
+	const auto appended = static_cast<unsigned>(extensions.size() - extensions_before);
+	// The "vk" line doubles as the build marker: its presence in a log (and in the
+	// binary) proves the Vulkan NGX path is the compiled one.
+	std::printf("NHL27DLSS vk requirements result=%d feature_supported=%u min_hw_arch=%u extensions result=%d "
+	            "count=%u appended=%u\n",
+	            static_cast<int>(req_result), static_cast<unsigned>(requirement.FeatureSupported),
+	            requirement.MinHWArchitecture, static_cast<int>(ext_result), count, appended);
+	std::fflush(stdout);
 #else
 	(void)instance;
 	(void)physical;

@@ -19,6 +19,8 @@
 #include <atomic>
 #include <filesystem>
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
 #include <span>
 #include <thread>
 #include <type_traits>
@@ -306,6 +308,22 @@ private:
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
+	// KYTY_ASYNC_COMPUTE_PIPELINES=1: compute pipelines a compile worker created right after it
+	// compiled their program, by program id, until the first dispatch of the program takes one.
+	// Workers create them with m_driver_cache_guard shared; Save() destroys the driver cache
+	// with it exclusive.
+	std::mutex                                              m_async_compute_mutex;
+	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_async_compute_pipelines;
+	std::shared_mutex                                       m_driver_cache_guard;
+	std::atomic_uint64_t                                    m_async_compute_created {0};
+	std::atomic_uint64_t                                    m_async_compute_failed {0};
+	uint64_t                                                m_async_compute_adopted = 0; // execution thread
+	uint64_t                                                m_inline_compute_created = 0; // execution thread
+	std::chrono::steady_clock::time_point                   m_async_compute_logged {};
+	std::unique_ptr<Pipeline> CreateComputePipelineOnWorker(const ShaderComputeInputInfo& input_info,
+	                                                        vk::ShaderModule              module);
+	void PublishComputePipeline(uint64_t program_id, std::unique_ptr<Pipeline> pipeline);
+	void LogAsyncCompute(bool adopted);
 	// KYTY_PIPELINE_MEMO / NHL27PIPELINE: key and result of the previous GetGraphicsPipeline call. Pipelines are
 	// never erased before destruction, so the pointer stays valid.
 	GraphicsPipelineKey m_last_key {};
@@ -325,6 +343,7 @@ private:
 	// Writes the driver cache data to m_driver_cache_path; the cache must stay alive meanwhile.
 	void WriteDriverCache();
 	void CheckpointDriverCache();
+	void DestroyPipeline(Pipeline& pipeline);
 
 };
 

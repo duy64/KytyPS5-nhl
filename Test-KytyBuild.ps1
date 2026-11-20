@@ -1,4 +1,33 @@
-# Test-KytyBuild.ps1 - v53 (2026-11-19)
+# Test-KytyBuild.ps1 - v54 (2026-11-20)
+# v54: spectator start fixed - the Versus stop now presses the
+# SELECT SIDES screen's own CPU Vs CPU Game button. v53 left the
+# controller unassigned in the middle and pressed Cross, and its
+# first run (build #214) stalled exactly like the 0219 run v49
+# fixed: 58 Versus visits, the 60-shot cap, no game. The run's
+# 04-versus capture shows why: the screen arrives with the
+# matchup already picked (Islanders at Jets, the matchup every
+# run plays), the controller sits unassigned in the middle, and
+# Cross from the middle does nothing - the screen's own button
+# bar offers Circle Back, Triangle "CPU Vs CPU Game" and R3 View
+# X-Factor Players. So the stop's first action is now Triangle
+# (key i in the script's key map): no side is ever assigned, so
+# there is nothing to re-centre, and the teams are the game's
+# pre-picked ones. Later visits press Cross while the start
+# animates, as the working flow did after its side picks; the
+# first screen that is no longer the select screen (X-Factors,
+# a loading screen, the ice, or a Versus-classified intro
+# screen without the select text) logs SPECTATOR OK. If the
+# select screen is still up after the 7-visit attempt budget -
+# the working side-pick flow cleared it in 5 visits - the stop
+# logs SPECTATOR FAILED - FALLING BACK TO PLAYING A SIDE and
+# runs the proven v49-v52 pick verbatim (D-pad Left then Cross,
+# D-pad Right then Cross, Cross after that), so the run still
+# tests the build; reaching the ice then notes the game is a
+# played-side game, not a spectator game. Observe-only gameplay
+# (v53) is unchanged, and the XeSS pass re-invokes this same
+# script, so it inherits the new Versus stop. v53 (spectator
+# gameplay) is otherwise unchanged.
+#
 # v53: spectator gameplay. The test no longer "plays" with scripted
 # inputs (user direction 2026-11-19). At the Versus SELECT SIDES
 # screen the controller now stays unassigned in the middle - no
@@ -569,7 +598,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 53
+$TestScriptVersion = 54
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1653,7 +1682,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v53: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v54: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains
@@ -1774,6 +1803,18 @@ $unknownStreak = 0
 $titleTries = 0
 $reachedIce = $false
 $reachedVersus = $false
+# Spectator attempt state (v54): the Versus stop first tries
+# the SELECT SIDES screen's own CPU Vs CPU Game button
+# (Triangle). Pending -> Attempted on the Triangle press -> Ok
+# when a later screen proves the game is starting, or ->
+# Fallback when the attempt budget runs out on the select
+# screen and the proven side pick takes over. The budget is in
+# Versus stop visits: the working side-pick flow cleared the
+# select screen in 5 visits.
+$spectatorState = "Pending"
+$spectatorAttemptVisits = 0
+$spectatorAttemptBudget = 7
+$fallbackSideStage = 0
 $navFailed = $false
 # Loading-pace tracking (v18): the frame counter in the overlay status
 # line ("frame: N, fps: M") tells whether the game is loading. A shot
@@ -1836,6 +1877,20 @@ while ($step -lt $roadmap.Count) {
     $want = $roadmap[$step]
     Write-Host ("roadmap: stop '" + $want + "' (try " + $stepTries + "), screen: " + $kind + " (shot " + $shotName + ")")
     if ($text) { Write-Host ("ocr: " + (($text -split "`r?`n" | Where-Object { $_.Trim() } | Select-Object -First 3) -join " | ")) }
+
+    # Spectator verdict (v54): once Triangle has been pressed
+    # on the SELECT SIDES screen, the first screen that is no
+    # longer the select screen proves the CPU Vs CPU game is
+    # starting - the X-Factors interstitial, a loading screen
+    # (Unknown), the ice itself, or a Versus-classified intro
+    # screen whose text no longer offers team/side selection.
+    # Sign-in and pause dialogs prove nothing and do not count
+    # either way; the attempt budget burns only on Versus stop
+    # visits, in the Versus stop below.
+    if (($spectatorState -eq "Attempted") -and (($kind -eq "XFactor") -or ($kind -eq "Unknown") -or ($kind -eq "Ice") -or (($kind -eq "Versus") -and ($text -notmatch "select team|select sides")))) {
+        $spectatorState = "Ok"
+        Write-Host "SPECTATOR OK: the CPU Vs CPU game is starting - no side is assigned and the match runs CPU vs CPU."
+    }
 
     # Known detours: handled the same at every stop, never advance the step.
     if ($kind -eq "SignIn") {
@@ -2003,24 +2058,68 @@ while ($step -lt $roadmap.Count) {
                 break
             }
         }
-        # v53: spectator mode - no side is picked. Play Now's Versus
-        # screen is a SELECT SIDES screen and the controller starts
-        # unassigned in the middle; it stays there, and the stop's
-        # one action is Cross, the confirm press from the unassigned
-        # position, so the match starts as CPU vs CPU. v49 assigned
-        # a side here (D-pad Left then Cross, D-pad Right then Cross
-        # if still on Versus) because the 0219 run pressed Cross 57
-        # times and never left Versus - that pick is removed on
-        # purpose: an assigned controller makes the match a
-        # scripted-player game instead of a spectator game.
-        Write-Host "Versus screen - Play Now SELECT SIDES: leaving the controller unassigned (center) for a CPU vs CPU spectator game; pressing Cross to advance."
-        Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+        # v54: start the spectator game with the screen's own
+        # CPU Vs CPU Game button (Triangle, key i in the key
+        # map). The matchup is already picked when the screen
+        # arrives and the controller starts unassigned in the
+        # middle; Triangle starts a CPU vs CPU game from exactly
+        # that state, so no side is assigned and nothing needs
+        # re-centring. (v53 pressed Cross from the middle, which
+        # does nothing on this screen - the #214 run stalled for
+        # 58 visits, the 0219 failure v49 first fixed.) While
+        # the start is unproven, later visits press Cross, as
+        # the working flow did after its side picks; the loop's
+        # spectator verdict above logs SPECTATOR OK on the
+        # first screen past the select screen. If the select
+        # screen survives the attempt budget, the stop falls
+        # back to the proven v49-v52 side pick below, so the
+        # run still tests the build.
+        if ($spectatorState -eq "Pending") {
+            $spectatorState = "Attempted"
+            $spectatorAttemptVisits = 1
+            Write-Host "Versus screen - Play Now SELECT SIDES: pressing Triangle (the screen's CPU Vs CPU Game button) to start a CPU vs CPU spectator game."
+            Invoke-InputStage -Lines @("i 150", "sleep 5000") -ExtraWaitSec 2
+        } elseif ($spectatorState -eq "Attempted") {
+            $spectatorAttemptVisits++
+            if ($spectatorAttemptVisits -gt $spectatorAttemptBudget) {
+                $spectatorState = "Fallback"
+                $fallbackSideStage = 0
+                Write-Host "SPECTATOR FAILED - FALLING BACK TO PLAYING A SIDE: the select screen is still up after the CPU Vs CPU attempt budget; using the proven side-pick sequence."
+            } else {
+                Write-Host ("Versus screen - CPU Vs CPU start in progress (attempt visit " + $spectatorAttemptVisits + " of " + $spectatorAttemptBudget + "); pressing Cross to advance.")
+                Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+            }
+        } elseif ($spectatorState -eq "Ok") {
+            Write-Host "Versus screen - pressing confirm to start the game."
+            Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+        }
+        if ($spectatorState -eq "Fallback") {
+            # The proven v49-v52 side pick, verbatim: assign a
+            # side first (D-pad Left, then D-pad Right if still
+            # on the screen), then confirm. The run plays a side
+            # from here - it is not a spectator game.
+            if ($fallbackSideStage -eq 0) {
+                Write-Host "Versus screen - Play Now SELECT SIDES: D-pad Left to pick a side, then Cross to start the game."
+                Invoke-InputStage -Lines @("Left 150", "sleep 1000", "j 150", "sleep 5000") -ExtraWaitSec 2
+                $fallbackSideStage = 1
+            } elseif ($fallbackSideStage -eq 1) {
+                Write-Host "Versus screen - still on SELECT SIDES; trying D-pad Right to pick a side, then Cross."
+                Invoke-InputStage -Lines @("Right 150", "sleep 1000", "j 150", "sleep 5000") -ExtraWaitSec 2
+                $fallbackSideStage = 2
+            } else {
+                Write-Host "Versus screen - pressing confirm to start the game."
+                Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
+            }
+        }
         $step++
         continue
     }
     if ($want -eq "Ice") {
         $reachedIce = $true
         Write-Host "On the ice - roadmap complete, leaving the nav loop for gameplay shots."
+        if ($spectatorState -eq "Fallback") {
+            Write-Host "Playing a side (spectator fallback): this game was started with the side pick, not the CPU Vs CPU button - the gameplay phase observes a played-side game, not a spectator game."
+        }
         $step++
         continue
     }
@@ -2046,7 +2145,11 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     Wait-FrameDumpQuiescent
     $g5 = Save-Shot -ShotName "05-ice.png"
     Write-Host ("ice captured: " + $g5)
-    Write-Host "Spectator game running - watching live play for a gameplay shot (no inputs sent)."
+    if ($spectatorState -eq "Fallback") {
+        Write-Host "Played-side game running (spectator fallback) - watching live play for a gameplay shot (no inputs sent)."
+    } else {
+        Write-Host "Spectator game running - watching live play for a gameplay shot (no inputs sent)."
+    }
     Start-Sleep -Seconds 4
     $g6 = Save-ScreenShot -ShotName "06-ice-skate.png"
     Write-Host ("ice skate captured: " + $g6)

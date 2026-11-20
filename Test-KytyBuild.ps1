@@ -1,4 +1,28 @@
-# Test-KytyBuild.ps1 - v51 (2026-11-19)
+# Test-KytyBuild.ps1 - v52 (2026-11-19)
+# v52: XeSS variant pass. After a main-line build's normal pass
+# completes conclusively (04-versus.png in the result folder - the
+# watcher's own rule for a completed test), the script runs ONE
+# more pass of the same build with the XeSS upscaler on, so XeSS
+# engagement, fps and visuals are tested next to the normal
+# results. The pass is this same script re-invoked with -XessPass
+# (the watcher's invocation pattern): it adds KYTY_XESS=1 and
+# KYTY_FSR4=0 to the launch env. The upscaler bridges are picked
+# per frame in DLSS > XeSS > FSR 4 order, so FSR 4 is set off
+# explicitly - a XeSS that cannot start then shows as no bridge
+# upscale instead of silently falling back to FSR 4 frames.
+# KYTY_FSR3_NHL27_PRESENT=1, which the XeSS present path
+# requires, is already in the standard env rows. The XeSS pass
+# gets its own result folder (the normal folder name plus -xess),
+# its own transcript, and its own tested marker
+# (tested-<build>-xess.txt next to the watcher's markers, same
+# version= format), so the two passes never suppress or overwrite
+# each other, and a script version bump re-tests both. The child
+# skips the captures cleanup, so the normal pass's result folder
+# and frame dumps are not deleted before the watcher archives
+# them. Non-main builds, atlas runs, -KeepRunning runs and
+# inconclusive normal passes do not trigger it. v51 (full-frame
+# F2 dumps) is otherwise unchanged.
+#
 # v51: the FROM row is out of the launch env again. Watcher F2
 # dumps are full-frame: the diagnostic build's HOST_ST
 # readbacks of draw-sampled textures are the deciding evidence
@@ -494,6 +518,8 @@
 #   build: sets KYTY_DBG_FRAME_DUMP_SAMPLED=1, stops at the versus screen,
 #   dumps the sampled BC textures (*_smp_*.bin) into the result folder,
 #   then stops. No gameplay. Pass -BuildDir for the atlas-dump build.
+#   -XessPass is never passed by hand: the script re-invokes itself
+#   with it for the v52 XeSS variant pass (see the v52 note above).
 
 param(
     [string]$GamePath = "D:\Downloads\ps5 games\PPSA34063-app0",
@@ -509,6 +535,7 @@ param(
     [switch]$SkipGameplay,
     [switch]$NoOcr,
     [switch]$AtlasCapture,
+    [switch]$XessPass,
     [int]$GameplayMinutes = 90
 )
 
@@ -517,7 +544,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 51
+$TestScriptVersion = 52
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -538,7 +565,12 @@ function Test-FileExistsQuiet {
 # removes them. Clear the old ones at the start of each run so only this
 # run's dumps remain (this run's dumps stay until the next run starts).
 $captureDir = "D:\Downloads\captures"
-if (Test-Path $captureDir) {
+if ($XessPass) {
+    # v52: the XeSS pass continues the same watcher pass - the
+    # normal pass's result folder and frame dumps must survive
+    # until the watcher archives them, so the cleanup is skipped.
+    Write-Host "captures: cleanup skipped (XeSS pass - the normal pass results and frame dumps stay)"
+} elseif (Test-Path $captureDir) {
     Get-ChildItem -Path $captureDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | ForEach-Object {
         Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -589,6 +621,9 @@ $TranscriptPath = Join-Path $OutDir "transcript.txt"
 Start-Transcript -Path $TranscriptPath -Force | Out-Null
 Write-Host ("out:   " + $OutDir)
 Write-Host ("game:  " + $GamePath)
+if ($XessPass) {
+    Write-Host "variant: XeSS pass - same build, second pass (KYTY_XESS=1, KYTY_FSR4=0: XeSS upscaler on, FSR 4 off)"
+}
 
 # OneOCR (for reading the screen). The engine ships with the Windows 11
 # Snipping Tool; its files are staged once into a oneocr-bin folder next
@@ -1483,6 +1518,13 @@ $psi.EnvironmentVariables["KYTY_FSR3_LUMA_FORMAT_FIX"] = "1"
 $psi.EnvironmentVariables["KYTY_FSR3_NHL27_HISTORY"] = "1"
 $psi.EnvironmentVariables["KYTY_FSR3_NHL27_PRESENT"] = "1"
 $psi.EnvironmentVariables["KYTY_FSR3_NHL27_SHADOW"] = "1"
+if ($XessPass) {
+    # v52 XeSS variant pass: XeSS on, FSR 4 off (see the v52 note at
+    # the top of this script for why FSR 4 is set off explicitly).
+    $psi.EnvironmentVariables["KYTY_XESS"] = "1"
+    $psi.EnvironmentVariables["KYTY_FSR4"] = "0"
+    Write-Host "XeSS pass: KYTY_XESS=1, KYTY_FSR4=0 in the launch env"
+}
 $psi.EnvironmentVariables["KYTY_LABEL_UNCACHED_DIRECT"] = "1"
 $psi.EnvironmentVariables["KYTY_LAZY_SHARED_WRITES"] = "1"
 $psi.EnvironmentVariables["KYTY_LDS_NO_READBACK"] = "1"
@@ -1586,7 +1628,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v51: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v52: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains
@@ -2193,6 +2235,64 @@ if ($KeepRunning) {
     # finished files, not the previous session's.
     Copy-EmulatorLog
 }
+# v52: XeSS variant pass. A main-line build whose normal pass reached
+# the game (04-versus.png in the result folder - the watcher's own
+# conclusive rule) gets ONE more pass of the same build with the XeSS
+# upscaler on. The pass is this same script re-invoked with -XessPass
+# (the watcher's invocation pattern): its own result folder (this
+# run's folder name plus -xess), its own transcript, and its own
+# tested marker (tested-<build>-xess.txt, in this script's folder -
+# the same folder and version= format the watcher uses for
+# tested-<build>.txt). The marker check keeps a re-run of the normal
+# pass at the same script version from repeating a XeSS pass that
+# already completed; a script version bump makes both markers stale,
+# so both passes re-test. Skipped, with the reason logged, for: the
+# XeSS pass itself, atlas runs, -KeepRunning runs (the emulator is
+# still running), non-main builds, and normal passes that never
+# reached the game.
+if (-not $XessPass -and -not $AtlasCapture -and -not $KeepRunning) {
+    $buildLeaf = Split-Path $BuildDir -Leaf
+    if ($buildLeaf -like "*-main-*") {
+        if (Test-Path (Join-Path $OutDir "04-versus.png")) {
+            $xessMarker = Join-Path $oneOcrScriptDir ("tested-" + $buildLeaf + "-xess.txt")
+            $xessMarkedVersion = 0
+            if (Test-Path $xessMarker) {
+                try {
+                    $markerText = Get-Content $xessMarker -Raw -ErrorAction Stop
+                    if ($markerText -match 'version\s*=\s*(\d+)') { $xessMarkedVersion = [int]$Matches[1] }
+                } catch { $xessMarkedVersion = 0 }
+            }
+            if ($xessMarkedVersion -ge $TestScriptVersion) {
+                Write-Host ("XeSS pass: already completed at script v" + $TestScriptVersion + " (marker " + $xessMarker + ") - skipping.")
+            } else {
+                $xessOutDir = $OutDir + "-xess"
+                $scriptPath = $MyInvocation.MyCommand.Path
+                if ([string]::IsNullOrWhiteSpace($scriptPath)) { $scriptPath = Join-Path $oneOcrScriptDir "Test-KytyBuild.ps1" }
+                $xessArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -BuildDir "' + $BuildDir + '" -OutDir "' + $xessOutDir + '" -XessPass'
+                $xessArgs += ' -GamePath "' + $GamePath + '" -BootWaitSec ' + $BootWaitSec + ' -LoadWaitSec ' + $LoadWaitSec
+                $xessArgs += ' -ScreenWidth ' + $ScreenWidth + ' -ScreenHeight ' + $ScreenHeight + ' -GameplayMinutes ' + $GameplayMinutes
+                if ($NoOcr) { $xessArgs += ' -NoOcr' }
+                if ($SkipGameplay) { $xessArgs += ' -SkipGameplay' }
+                if (-not [string]::IsNullOrWhiteSpace($ReleaseTag)) { $xessArgs += ' -ReleaseTag "' + $ReleaseTag + '"' }
+                Write-Host ("XeSS pass: launching the variant pass for " + $buildLeaf)
+                Write-Host ("XeSS pass: result folder " + $xessOutDir)
+                $xp = Start-Process -FilePath "powershell.exe" -ArgumentList $xessArgs -Wait -PassThru -WindowStyle Normal
+                Write-Host ("XeSS pass: exit code " + $xp.ExitCode)
+                if (Test-Path (Join-Path $xessOutDir "04-versus.png")) {
+                    Set-Content -Path $xessMarker -Value ("version=" + $TestScriptVersion + " " + (Get-Date -Format "yyyy-MM-dd HH:mm")) -Encoding ASCII -ErrorAction SilentlyContinue
+                    Write-Host ("XeSS pass: conclusive (04-versus.png present) - marker written: " + $xessMarker)
+                } else {
+                    Write-Host "XeSS pass: not conclusive (no 04-versus.png) - no marker written; it re-runs with the next normal pass."
+                }
+            }
+        } else {
+            Write-Host "XeSS pass: skipped - the normal pass did not reach the game (no 04-versus.png), so there is nothing to vary yet."
+        }
+    } else {
+        Write-Host ("XeSS pass: skipped - " + $buildLeaf + " is not a main-line build (no -main- in the folder name).")
+    }
+}
+
 Clear-DisplayAwake
 Stop-Transcript | Out-Null
 Write-Host ("done. result folder: " + $OutDir)

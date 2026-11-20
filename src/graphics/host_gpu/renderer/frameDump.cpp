@@ -289,7 +289,7 @@ bool WantHostSt() {
 	}();
 	return on;
 }
-constexpr uint64_t kHostStMaxBytes = 4ull << 20; // per queued image
+constexpr uint64_t kHostStMaxBytes = 32ull << 20; // per queued image
 constexpr size_t   kHostStMaxCount = 512;        // queued requests per capture (memory valve;
                                                  // the binding per-capture limits stay the
                                                  // shared RecordReadback caps)

@@ -151,4 +151,61 @@ void MasterSemaphore::Wait(uint64_t tick) {
 	Refresh();
 }
 
+// Bounded twin of Wait: same fast path and the same wait accounting, but the semaphore wait
+// gets a finite timeout and the caller learns whether the tick completed in time. A timeout
+// is not an error (the LONGWAIT / perf bookings of a completed wait stay with the Wait call
+// that finishes it); any other result keeps Wait's fatal behaviour. The guest-read retry wait
+// uses this to force a submission when a writer tick outlives its budget, then falls back to
+// Wait for the remainder.
+bool MasterSemaphore::WaitFor(uint64_t tick, uint64_t timeout_ns) {
+	if (IsFree(tick)) {
+		return true;
+	}
+	Refresh();
+	if (IsFree(tick)) {
+		return true;
+	}
+
+	const bool on_gpu_thread = GuestGpu::IsGpuThread();
+	FrameBreakdown::Timer wait_timer(FrameBreakdown::g_counters.gpu_wait_ns, on_gpu_thread);
+	FrameBreakdown::GpuBusyScope busy_scope(FrameBreakdown::GB_WAIT);
+	if (on_gpu_thread) {
+		FrameBreakdown::Add(FrameBreakdown::g_counters.gpu_wait_count);
+	}
+
+	vk::SemaphoreWaitInfo wait_info {};
+	wait_info.semaphoreCount = 1;
+	wait_info.pSemaphores    = &m_semaphore;
+	wait_info.pValues        = &tick;
+
+	const bool timed  = BufferCache::PerfTimersEnabled() && GuestGpu::IsGpuThread();
+	const bool stats  = FrameBreakdown::Enabled();
+	const auto start  = timed || stats ? std::chrono::steady_clock::now()
+	                                   : std::chrono::steady_clock::time_point {};
+	Common::Timeline::Mark("host-wait", tick);
+	Common::Timeline::MarkStack();
+	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
+	                                         Common::DebugCounters::Counter::GpuWaitNs);
+	const auto result = m_graphics.device.waitSemaphores(&wait_info, timeout_ns);
+	Common::Timeline::Mark("host-done", tick);
+	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess && result != vk::Result::eTimeout);
+	Refresh();
+	if (result != vk::Result::eSuccess) {
+		return false;
+	}
+	if (stats) {
+		const auto ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+		if (ns >= 3000000u) {
+			NoteLongWait(ns, on_gpu_thread);
+		}
+	}
+	if (timed) {
+		BufferCache::PerfAddTime(BufferCache::PerfTimer::GpuWait,
+		                         static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                             std::chrono::steady_clock::now() - start).count()));
+	}
+	return true;
+}
+
 } // namespace Libs::Graphics

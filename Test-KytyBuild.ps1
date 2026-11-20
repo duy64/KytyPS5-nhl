@@ -1,4 +1,32 @@
-# Test-KytyBuild.ps1 - v56 (2026-11-20)
+# Test-KytyBuild.ps1 - v57 (2026-11-20)
+# v57: native-scale variant pass, modelled on the v52 XeSS pass.
+# After a main-line build's normal pass completes conclusively
+# (04-versus.png in the result folder - the watcher's own rule
+# for a completed test), the script runs ONE more pass of the
+# same build at native resolution, so the fps cost of the
+# standard downscale is measured next to the normal results:
+# the normal pass renders internally at 2560x1440
+# (KYTY_NHL_RES_SCALE=0.6667) and upscales; the native pass
+# renders at the full 3840x2160 (RES_SCALE=1). The pass is this
+# same script re-invoked with -NativePass (the watcher's
+# invocation pattern): the launch env is identical to a regular
+# pass except KYTY_NHL_RES_SCALE, which the standard env rows
+# set to 0.6667 and the native pass then overrides to 1 - the
+# ONLY difference. The upscaler bridge is untouched (FSR 4
+# stays on, exactly as in the normal pass). The native pass
+# gets its own result folder (the normal folder name plus
+# -native), its own transcript, and its own tested marker
+# (tested-<build>-native.txt next to the watcher's markers,
+# same version= format), so the passes never suppress or
+# overwrite each other, and a script version bump re-tests all
+# of them. The child skips the captures cleanup, so the normal
+# pass's result folder and frame dumps are not deleted before
+# the watcher archives them. Non-main builds, atlas runs,
+# -KeepRunning runs and inconclusive normal passes do not
+# trigger it, and neither variant pass triggers the other:
+# each variant block's gate excludes both switches. v56
+# (gameplay foreground guard) is otherwise unchanged.
+#
 # v56: the gameplay loop re-asserts the emulator as the foreground
 # window before every screen read (the 12-cycle OCR check and the
 # 5-cycle flash-watch). In the #214 run on 2026-11-20 a PowerShell
@@ -610,6 +638,9 @@
 #   then stops. No gameplay. Pass -BuildDir for the atlas-dump build.
 #   -XessPass is never passed by hand: the script re-invokes itself
 #   with it for the v52 XeSS variant pass (see the v52 note above).
+#   -NativePass is never passed by hand: the script re-invokes
+#   itself with it for the v57 native-scale variant pass (see
+#   the v57 note above).
 
 param(
     [string]$GamePath = "D:\Downloads\ps5 games\PPSA34063-app0",
@@ -626,6 +657,7 @@ param(
     [switch]$NoOcr,
     [switch]$AtlasCapture,
     [switch]$XessPass,
+    [switch]$NativePass,
     [int]$GameplayMinutes = 90
 )
 
@@ -634,7 +666,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 56
+$TestScriptVersion = 57
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -660,6 +692,11 @@ if ($XessPass) {
     # normal pass's result folder and frame dumps must survive
     # until the watcher archives them, so the cleanup is skipped.
     Write-Host "captures: cleanup skipped (XeSS pass - the normal pass results and frame dumps stay)"
+} elseif ($NativePass) {
+    # v57: the native pass continues the same watcher pass - the
+    # normal pass's result folder and frame dumps must survive
+    # until the watcher archives them, so the cleanup is skipped.
+    Write-Host "captures: cleanup skipped (native pass - the normal pass results and frame dumps stay)"
 } elseif (Test-Path $captureDir) {
     Get-ChildItem -Path $captureDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | ForEach-Object {
         Remove-Item -LiteralPath $_.FullName -Recurse -Force -ErrorAction SilentlyContinue
@@ -713,6 +750,9 @@ Write-Host ("out:   " + $OutDir)
 Write-Host ("game:  " + $GamePath)
 if ($XessPass) {
     Write-Host "variant: XeSS pass - same build, second pass (KYTY_XESS=1, KYTY_FSR4=0: XeSS upscaler on, FSR 4 off)"
+}
+if ($NativePass) {
+    Write-Host "variant: native pass - same build, second pass (KYTY_NHL_RES_SCALE=1: native resolution, the standard 0.6667 downscale off)"
 }
 
 # OneOCR (for reading the screen). The engine ships with the Windows 11
@@ -1729,6 +1769,14 @@ $psi.EnvironmentVariables["KYTY_LDS_NO_READBACK"] = "1"
 $psi.EnvironmentVariables["KYTY_LONG_BUFFER_GC_AGE"] = "1"
 $psi.EnvironmentVariables["KYTY_NATIVE_INDIRECT"] = "1"
 $psi.EnvironmentVariables["KYTY_NHL_RES_SCALE"] = "0.6667"
+if ($NativePass) {
+    # v57 native-scale variant pass: native resolution (see the
+    # v57 note at the top of this script). This override, after
+    # the standard row above, is the ONLY launch-env difference
+    # from a regular pass.
+    $psi.EnvironmentVariables["KYTY_NHL_RES_SCALE"] = "1"
+    Write-Host "Native pass: KYTY_NHL_RES_SCALE=1 in the launch env"
+}
 $psi.EnvironmentVariables["KYTY_OUTPUT_1080P"] = "0"
 $psi.EnvironmentVariables["KYTY_PARTIAL_WAVE_REDUCTION"] = "1"
 $psi.EnvironmentVariables["KYTY_PERF_DRAW_DETAIL"] = "0"
@@ -2533,10 +2581,11 @@ if ($KeepRunning) {
 # pass at the same script version from repeating a XeSS pass that
 # already completed; a script version bump makes both markers stale,
 # so both passes re-test. Skipped, with the reason logged, for: the
-# XeSS pass itself, atlas runs, -KeepRunning runs (the emulator is
+# XeSS pass itself, native pass runs (v57), atlas runs,
+# -KeepRunning runs (the emulator is
 # still running), non-main builds, and normal passes that never
 # reached the game.
-if (-not $XessPass -and -not $AtlasCapture -and -not $KeepRunning) {
+if (-not $XessPass -and -not $NativePass -and -not $AtlasCapture -and -not $KeepRunning) {
     $buildLeaf = Split-Path $BuildDir -Leaf
     if ($buildLeaf -like "*-main-*") {
         if (Test-Path (Join-Path $OutDir "04-versus.png")) {
@@ -2576,6 +2625,67 @@ if (-not $XessPass -and -not $AtlasCapture -and -not $KeepRunning) {
         }
     } else {
         Write-Host ("XeSS pass: skipped - " + $buildLeaf + " is not a main-line build (no -main- in the folder name).")
+    }
+}
+
+# v57: native-scale variant pass. A main-line build whose normal
+# pass reached the game (04-versus.png in the result folder - the
+# watcher's own conclusive rule) gets ONE more pass of the same
+# build at native resolution (KYTY_NHL_RES_SCALE=1 in place of
+# the standard 0.6667 downscale), so the fps cost of the
+# downscale is measured next to the normal results. The pass is
+# this same script re-invoked with -NativePass (the watcher's
+# invocation pattern): its own result folder (this run's folder
+# name plus -native), its own transcript, and its own tested
+# marker (tested-<build>-native.txt, in this script's folder -
+# the same folder and version= format the watcher uses for
+# tested-<build>.txt). The marker check keeps a re-run of the
+# normal pass at the same script version from repeating a native
+# pass that already completed; a script version bump makes all
+# markers stale, so all passes re-test. Skipped, with the reason
+# logged, for: the native pass itself, XeSS pass runs, atlas
+# runs, -KeepRunning runs (the emulator is still running),
+# non-main builds, and normal passes that never reached the game.
+if (-not $NativePass -and -not $XessPass -and -not $AtlasCapture -and -not $KeepRunning) {
+    $buildLeaf = Split-Path $BuildDir -Leaf
+    if ($buildLeaf -like "*-main-*") {
+        if (Test-Path (Join-Path $OutDir "04-versus.png")) {
+            $nativeMarker = Join-Path $oneOcrScriptDir ("tested-" + $buildLeaf + "-native.txt")
+            $nativeMarkedVersion = 0
+            if (Test-Path $nativeMarker) {
+                try {
+                    $markerText = Get-Content $nativeMarker -Raw -ErrorAction Stop
+                    if ($markerText -match 'version\s*=\s*(\d+)') { $nativeMarkedVersion = [int]$Matches[1] }
+                } catch { $nativeMarkedVersion = 0 }
+            }
+            if ($nativeMarkedVersion -ge $TestScriptVersion) {
+                Write-Host ("Native pass: already completed at script v" + $TestScriptVersion + " (marker " + $nativeMarker + ") - skipping.")
+            } else {
+                $nativeOutDir = $OutDir + "-native"
+                $scriptPath = $MyInvocation.MyCommand.Path
+                if ([string]::IsNullOrWhiteSpace($scriptPath)) { $scriptPath = Join-Path $oneOcrScriptDir "Test-KytyBuild.ps1" }
+                $nativeArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $scriptPath + '" -BuildDir "' + $BuildDir + '" -OutDir "' + $nativeOutDir + '" -NativePass'
+                $nativeArgs += ' -GamePath "' + $GamePath + '" -BootWaitSec ' + $BootWaitSec + ' -LoadWaitSec ' + $LoadWaitSec
+                $nativeArgs += ' -ScreenWidth ' + $ScreenWidth + ' -ScreenHeight ' + $ScreenHeight + ' -GameplayMinutes ' + $GameplayMinutes
+                if ($NoOcr) { $nativeArgs += ' -NoOcr' }
+                if ($SkipGameplay) { $nativeArgs += ' -SkipGameplay' }
+                if (-not [string]::IsNullOrWhiteSpace($ReleaseTag)) { $nativeArgs += ' -ReleaseTag "' + $ReleaseTag + '"' }
+                Write-Host ("Native pass: launching the variant pass for " + $buildLeaf)
+                Write-Host ("Native pass: result folder " + $nativeOutDir)
+                $np = Start-Process -FilePath "powershell.exe" -ArgumentList $nativeArgs -Wait -PassThru -WindowStyle Normal
+                Write-Host ("Native pass: exit code " + $np.ExitCode)
+                if (Test-Path (Join-Path $nativeOutDir "04-versus.png")) {
+                    Set-Content -Path $nativeMarker -Value ("version=" + $TestScriptVersion + " " + (Get-Date -Format "yyyy-MM-dd HH:mm")) -Encoding ASCII -ErrorAction SilentlyContinue
+                    Write-Host ("Native pass: conclusive (04-versus.png present) - marker written: " + $nativeMarker)
+                } else {
+                    Write-Host "Native pass: not conclusive (no 04-versus.png) - no marker written; it re-runs with the next normal pass."
+                }
+            }
+        } else {
+            Write-Host "Native pass: skipped - the normal pass did not reach the game (no 04-versus.png), so there is nothing to vary yet."
+        }
+    } else {
+        Write-Host ("Native pass: skipped - " + $buildLeaf + " is not a main-line build (no -main- in the folder name).")
     }
 }
 

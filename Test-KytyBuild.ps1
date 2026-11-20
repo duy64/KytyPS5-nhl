@@ -1,4 +1,29 @@
-# Test-KytyBuild.ps1 - v52 (2026-11-19)
+# Test-KytyBuild.ps1 - v53 (2026-11-19)
+# v53: spectator gameplay. The test no longer "plays" with scripted
+# inputs (user direction 2026-11-19). At the Versus SELECT SIDES
+# screen the controller now stays unassigned in the middle - no
+# D-pad side pick - and the stop's one action is the confirm press
+# (Cross) from the unassigned position, so the match runs CPU vs
+# CPU with the full broadcast presentation (commentary, replays,
+# overlays, cutscenes). This replaces the v49 side pick; the v49
+# note below keeps that history (the 0219 run pressed Cross 57
+# times and never left Versus, which is why a side was assigned).
+# STEP 3 keeps its shot cadence (05..11), the pause-menu check and
+# the continuous capture, but the skate/shoot inputs before the 06
+# and 09/10/11 shots are gone - the script waits and watches live
+# play instead. STEP 4 is an observation phase now: the rotating
+# skate/pass/shoot/poke patterns are removed and each cycle is a
+# plain ~5 s wait, so the OCR check (every 12 cycles), the
+# 10-minute data shot, the flash-watch (every 5 cycles) and the
+# progress lines keep their cadence. The Pause resume, the
+# menu-ends-the-game detection and the Unknown back-out recovery
+# are unchanged (menu actions, not play inputs). The phase bound
+# is unchanged: up to -GameplayMinutes (default 90), or until the
+# game returns to a menu. The XeSS variant pass re-invokes this
+# same script, so it inherits spectator mode with no extra work:
+# no -XessPass code path assigns a side or sends gameplay inputs.
+# v52 (XeSS variant pass) is otherwise unchanged.
+#
 # v52: XeSS variant pass. After a main-line build's normal pass
 # completes conclusively (04-versus.png in the result folder - the
 # watcher's own rule for a completed test), the script runs ONE
@@ -511,7 +536,7 @@
 #   [-OutDir "D:\Downloads\captures\KyTyTest-..."] [-ReleaseTag "..."]
 #   [-BootWaitSec 90] [-ScreenWidth 3840] [-ScreenHeight 2160]
 #   [-KeepRunning] [-SkipGameplay] [-NoOcr] [-GameplayMinutes 90]
-#   -GameplayMinutes caps the STEP 4 dumb-gameplay phase (default 90, a
+#   -GameplayMinutes caps the STEP 4 spectator phase (default 90, a
 #   full game at real-time pace with stoppages; pass 30 for a shorter run).
 #   The phase ends early if the game returns to a menu.
 #   -AtlasCapture runs a short versus-only capture for the atlas-dump
@@ -544,7 +569,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 52
+$TestScriptVersion = 53
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1628,7 +1653,7 @@ foreach ($p in $preExisting) {
 }
 $stdoutLog = Join-Path $OutDir "emulator-stdout.log"
 $stderrLog = Join-Path $OutDir "emulator-stderr.log"
-Write-Host "v52: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
+Write-Host "v53: FULL cfgGlobal env (67 rows) + full navigation via Play Now (v42 proved the collapse is env-caused, median 109 fps)"
 $proc = [System.Diagnostics.Process]::Start($psi)
 Write-Host ("pid: " + $proc.Id)
 # v25: start the async stdout/stderr readers. Register-ObjectEvent drains
@@ -1749,7 +1774,6 @@ $unknownStreak = 0
 $titleTries = 0
 $reachedIce = $false
 $reachedVersus = $false
-$versusSideTried = $null
 $navFailed = $false
 # Loading-pace tracking (v18): the frame counter in the overlay status
 # line ("frame: N, fps: M") tells whether the game is loading. A shot
@@ -1979,24 +2003,18 @@ while ($step -lt $roadmap.Count) {
                 break
             }
         }
-        # v49: Play Now's Versus screen is a SELECT SIDES screen - the
-        # controller starts unassigned in the middle and Cross alone
-        # does nothing until a side is picked (the 0219 run pressed
-        # Cross 57 times and never left Versus). Assign a side first:
-        # D-pad Left then Cross on the first visit, D-pad Right then
-        # Cross if still on Versus next visit, Cross only after that.
-        if (-not $versusSideTried) {
-            $versusSideTried = "Left"
-            Write-Host "Versus screen - Play Now SELECT SIDES: D-pad Left to pick a side, then Cross to start the game."
-            Invoke-InputStage -Lines @("Left 150", "sleep 1000", "j 150", "sleep 5000") -ExtraWaitSec 2
-        } elseif ($versusSideTried -eq "Left") {
-            $versusSideTried = "Right"
-            Write-Host "Versus screen - still on SELECT SIDES; trying D-pad Right to pick a side, then Cross."
-            Invoke-InputStage -Lines @("Right 150", "sleep 1000", "j 150", "sleep 5000") -ExtraWaitSec 2
-        } else {
-            Write-Host "Versus screen - pressing confirm to start the game."
-            Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
-        }
+        # v53: spectator mode - no side is picked. Play Now's Versus
+        # screen is a SELECT SIDES screen and the controller starts
+        # unassigned in the middle; it stays there, and the stop's
+        # one action is Cross, the confirm press from the unassigned
+        # position, so the match starts as CPU vs CPU. v49 assigned
+        # a side here (D-pad Left then Cross, D-pad Right then Cross
+        # if still on Versus) because the 0219 run pressed Cross 57
+        # times and never left Versus - that pick is removed on
+        # purpose: an assigned controller makes the match a
+        # scripted-player game instead of a spectator game.
+        Write-Host "Versus screen - Play Now SELECT SIDES: leaving the controller unassigned (center) for a CPU vs CPU spectator game; pressing Cross to advance."
+        Invoke-InputStage -Lines @("j 150", "sleep 5000") -ExtraWaitSec 2
         $step++
         continue
     }
@@ -2028,8 +2046,8 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     Wait-FrameDumpQuiescent
     $g5 = Save-Shot -ShotName "05-ice.png"
     Write-Host ("ice captured: " + $g5)
-    Write-Host "Skating (left stick up) for a gameplay shot."
-    Invoke-InputStage -Lines @("w 2000", "sleep 1000") -ExtraWaitSec 1
+    Write-Host "Spectator game running - watching live play for a gameplay shot (no inputs sent)."
+    Start-Sleep -Seconds 4
     $g6 = Save-ScreenShot -ShotName "06-ice-skate.png"
     Write-Host ("ice skate captured: " + $g6)
     Write-Host "Opening the pause menu (Options)."
@@ -2047,8 +2065,8 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $g8 = Save-ScreenShot -ShotName "08-ice-resumed.png"
     Write-Host ("ice resumed captured: " + $g8)
     for ($p = 1; $p -le 3; $p++) {
-        Write-Host ("Extended play interval " + $p + " of 3 (skating, then a shot).")
-        Invoke-InputStage -Lines @("w 2000", "sleep 1000", "j 150", "sleep 4000") -ExtraWaitSec 2
+        Write-Host ("Extended play interval " + $p + " of 3 (spectator: watching live play, then a shot).")
+        Start-Sleep -Seconds 9
         $gp = Save-ScreenShot -ShotName ("{0:D2}-ice-play-{1}.png" -f (8 + $p), $p)
         Write-Host ("extended play captured: " + $gp)
     }
@@ -2075,26 +2093,32 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     Write-Warning "Did not reach the ice in the nav loop. Result folder holds the nav shots and the transcript for diagnosis."
 }
 
-# STEP 4 - dumb full-game gameplay (v4). The point is coverage, not skill:
-# keep the player moving and the game progressing so the emulator collects
-# gameplay data (logs, frame dumps, crash data) through a full game, even
-# if the play is bad. The game auto-changes lines, so shift changes and
-# powerplays happen on their own - exactly the coverage the missing-players
-# crash needs. Runs for up to $GameplayMinutes real minutes (default 90,
-# a full game at real-time pace with stoppages), or until the game ends
-# (OCR shows Hub/Versus/Title/SignIn, meaning back to a menu). Each cycle
-# sends a varied input pattern (skate, pass, shoot, poke). The screen is
-# OCR-checked every few cycles from a fast screen capture: Pause is
-# resumed with Cross, a menu means the game is over, Unknown is tolerated
-# and logged. Five Unknown checks in a row also press Circle once (Back)
-# with a quiet 5 s wait (v45 patch 2: the 2327 run sat on the X-Factor
-# glossary for 82 minutes because the rotation's Circle presses are
-# interleaved with inputs that re-open it); three such warnings end the
-# phase early. A frame-dump data shot is taken every 10 minutes, and a
-# fast screen capture (flash-watch, 12-flash-<n>.png) every 5 cycles
-# (about 30 seconds) to catch brief glitches the 10-minute shots miss.
-# The emulator exiting (crash) ends the phase immediately. Skipped for
-# -AtlasCapture (the run already stopped at the versus screen).
+# STEP 4 - spectator full-game observation (v53; dumb scripted gameplay
+# in v4-v52). The point is coverage, not skill: the match is CPU vs CPU
+# (the Versus stop left the controller unassigned), so the game plays
+# itself with the full broadcast presentation while the emulator
+# collects gameplay data (logs, frame dumps, crash data) through a full
+# game. The game auto-changes lines, so shift changes and powerplays
+# happen on their own - exactly the coverage the missing-players crash
+# needs. Runs for up to $GameplayMinutes real minutes (default 90, a
+# full game at real-time pace with stoppages), or until the game ends
+# (OCR shows Hub/Versus/Title/SignIn, meaning back to a menu; the phase
+# then ends, and the next match is the next watcher pass). NO gameplay
+# inputs are sent: each cycle is a plain ~5 s wait, about the length of
+# the old input patterns, so the cadences below are unchanged. The
+# screen is OCR-checked every 12 cycles from a fast screen capture:
+# Pause is resumed with Cross, a menu means the game is over, Unknown
+# is tolerated and logged. Five Unknown checks in a row also press
+# Circle once (Back) with a quiet 5 s wait (v45 patch 2: the 2327 run
+# sat on the X-Factor glossary for 82 minutes because the old
+# rotation's Circle presses were interleaved with inputs that re-open
+# it); three such warnings end the phase early. That Circle press is a
+# screen back-out recovery, not a play input. A frame-dump data shot
+# is taken every 10 minutes, and a fast screen capture (flash-watch,
+# 12-flash-<n>.png) every 5 cycles (about 30 seconds) to catch brief
+# glitches the 10-minute shots miss. The emulator exiting (crash) ends
+# the phase immediately. Skipped for -AtlasCapture (the run already
+# stopped at the versus screen).
 if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $gameplayStart = Get-Date
     $gameplayEnd = $gameplayStart.AddMinutes($GameplayMinutes)
@@ -2105,32 +2129,20 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $gameplayShotCount = 0
     $flashShotCount = 0
     $lastDataShot = $gameplayStart
-    Write-Host ("gameplay phase: up to " + $GameplayMinutes + " min of dumb play, ends early if the game returns to a menu.")
+    Write-Host ("gameplay phase: up to " + $GameplayMinutes + " min of CPU vs CPU spectator play (no inputs sent), ends early if the game returns to a menu.")
     while (((Get-Date) -lt $gameplayEnd) -and -not $gameOver) {
         $cycle++
         if (-not (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue)) {
             Write-Warning ("Emulator exited during gameplay (cycle " + $cycle + "). Stopping the gameplay phase - see last-run.log.")
             break
         }
-        # Varied input pattern, rotating by cycle. Left stick (w/a/s/d)
-        # skates, Cross (j) passes and takes faceoffs, Circle (l) shoots,
-        # Square (k) poke-checks, D-pad Up changes lines. No smart play -
-        # just keep moving and keep the puck in play so the game progresses.
-        $pattern = $cycle % 6
-        if ($pattern -eq 0) {
-            $lines = @("w 1800", "sleep 300", "j 150", "sleep 500", "w 1200", "sleep 500")
-        } elseif ($pattern -eq 1) {
-            $lines = @("a 1500", "sleep 300", "l 150", "sleep 500", "w 1200", "sleep 500")
-        } elseif ($pattern -eq 2) {
-            $lines = @("d 1500", "sleep 300", "j 150", "sleep 500", "s 1200", "sleep 500")
-        } elseif ($pattern -eq 3) {
-            $lines = @("s 1500", "sleep 300", "l 150", "sleep 500", "w 1200", "sleep 500")
-        } elseif ($pattern -eq 4) {
-            $lines = @("k 150", "sleep 300", "j 150", "sleep 500", "w 1800", "sleep 500")
-        } else {
-            $lines = @("Up 150", "sleep 300", "w 2000", "sleep 300", "j 150", "sleep 500")
-        }
-        Invoke-InputStage -Lines $lines -ExtraWaitSec 1
+        # v53: spectator mode - no input pattern is sent. The CPU
+        # plays both teams; the cycle is a plain wait of about the
+        # old patterns' length (they ran ~4.5 s of stage lines plus
+        # the 1 s extra wait), so the 12-cycle OCR check stays at
+        # about a minute, the 5-cycle flash-watch at about 30 s and
+        # the 30-cycle progress line at about 2.5 minutes.
+        Start-Sleep -Seconds 5
         # Every 12 cycles (about a minute), OCR-check the screen from a
         # fast screen capture and react. The frame-dump data shot below is
         # separate; this check only needs to read the screen state.
@@ -2152,7 +2164,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
             } elseif ($checkKind -eq "Unknown") {
                 $unknownStreak++
                 if ($unknownStreak -ge 5) {
-                    Write-Warning ("Gameplay screen not recognized for 5 checks in a row (cycle " + $cycle + "). The game may be in a replay, cutscene, or a state OCR cannot name. Continuing to send inputs.")
+                    Write-Warning ("Gameplay screen not recognized for 5 checks in a row (cycle " + $cycle + "). The game may be in a replay, cutscene, or a state OCR cannot name. Continuing to watch.")
                     Save-ClipBurst -Label ("gameplay-unknown-" + $cycle)
                     $unknownStreak = 0
                     # v45 patch 2: one lone Circle (Back) with a quiet 5 s
@@ -2168,7 +2180,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
                     }
                 }
             }
-            # Ice needs no action - the pattern keeps the game moving.
+            # Ice needs no action - the CPU keeps the game moving.
         }
         # Frame-dump data shot every 10 minutes.
         if (((Get-Date) - $lastDataShot).TotalMinutes -ge 10) {

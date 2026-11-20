@@ -1,4 +1,6 @@
-# Watch-KytyBuilds.ps1 - v11 (2026-11-19)
+# Watch-KytyBuilds.ps1 - v12 (2026-11-20)
+# v12 (user request, 2026-11-20): dim level while the loop is armed
+# lowered from 15% to 0%. Everything else is v11 unchanged.
 # Watches D:\Downloads for new KyTy builds and auto-runs the NHL 27 test
 # (Test-KytyBuild.ps1) for each one. Meant to run on a schedule (every
 # 15 min) via a Windows Scheduled Task. Results are copied to -UploadDir
@@ -13,7 +15,7 @@
 # the watcher did not launch), the monitors are restored to 100%
 # and the dim marker is deleted - he is at the desk. Otherwise -
 # a test running, or the loop armed and idle - the monitors are
-# dimmed to 15% through the existing C:\Users\duy84\dim-ddc.ps1
+# dimmed to 0% through the existing C:\Users\duy84\dim-ddc.ps1
 # (DDC/CI) and stay dimmed; the marker file
 # (C:\Users\duy84\dim-by-autorun.txt) means "the loop is holding
 # the monitors dimmed". A test launch re-checks the dim like any
@@ -267,7 +269,7 @@ function Stop-DisplaySession {
 # is armed and the user is away. The evaluation sits with the stand-
 # down check further down: user playing -> restore to 100% (he is at
 # the desk); otherwise - a test running, or the loop armed and idle -
-# the monitors are / stay dimmed at 15%. Dimming goes through the
+# the monitors are / stay dimmed at 0%. Dimming goes through the
 # existing dim-ddc.ps1 (DDC/CI), which sets a panel-level brightness
 # - the framebuffer the test script reads for navigation is
 # unchanged, so tests are unaffected. Like the v9 display control,
@@ -276,7 +278,7 @@ function Stop-DisplaySession {
 $script:DimScriptPath = "C:\Users\duy84\dim-ddc.ps1"
 $script:DimLogPath = "C:\Users\duy84\dim-screen.log"
 $script:DimMarkerPath = "C:\Users\duy84\dim-by-autorun.txt"
-$script:DimRunPercent = 15
+$script:DimRunPercent = 0
 $script:DimRestorePercent = 100
 
 function Invoke-DimScript {
@@ -411,7 +413,7 @@ function Ensure-MonitorsDimmed {
                 Write-Host ("Monitor dim to " + $script:DimRunPercent + "% (" + $Reason + ") could not be confirmed by read-back.")
             }
         }
-        Set-Content -Path $script:DimMarkerPath -Value ("dimmed to " + $script:DimRunPercent + "% by Watch-KytyBuilds v11 at " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " (" + $Reason + ")") -Encoding ASCII -ErrorAction SilentlyContinue
+        Set-Content -Path $script:DimMarkerPath -Value ("dimmed to " + $script:DimRunPercent + "% by Watch-KytyBuilds v12 at " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " (" + $Reason + ")") -Encoding ASCII -ErrorAction SilentlyContinue
     } catch {
         Write-Host ("Monitor dimming skipped: " + $_.Exception.Message)
     }

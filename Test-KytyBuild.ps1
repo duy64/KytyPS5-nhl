@@ -1,4 +1,25 @@
-# Test-KytyBuild.ps1 - v54 (2026-11-20)
+# Test-KytyBuild.ps1 - v55 (2026-11-20)
+# v55: auto-F2 trigger in the gameplay flash-watch (user's call,
+# 2026-11-20). The flash-watch has now caught the pixelated-mess
+# family live three times (#213 flash-122, #211 retest flashes 16
+# and 97) with no frame dump of the moment, and the dump is the
+# deciding evidence for the stale-host suspect. Each flash-watch
+# shot is now measured as it is taken (Test-FlashFrame: a 384x216
+# sample; black / bright / mid / green fractions) and three
+# signatures fire a frame dump on the spot through the existing
+# trigger-file path: Pixelated (a mostly black frame carrying
+# scattered bright specks - the convicted family's shape), Green
+# (a whole-frame green cast), and sudden Black (a frame over
+# 98.5% black right after a lit one). The dump's present is saved
+# as 13-autof2-<n>.png next to the flash shot that fired it, and
+# every trigger is logged with its metrics. Bounds: at most 3
+# auto dumps per gameplay phase, at least 8 minutes apart, and a
+# trigger is skipped while a previous dump download is still
+# growing. Thresholds were calibrated on the runs' own labelled
+# flash shots (the three pixelated frames, the #211 green flash,
+# and their clean neighbours). Everything else is unchanged
+# from v54.
+#
 # v54: spectator start fixed - the Versus stop now presses the
 # SELECT SIDES screen's own CPU Vs CPU Game button. v53 left the
 # controller unassigned in the middle and pressed Cross, and its
@@ -598,7 +619,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 54
+$TestScriptVersion = 55
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1062,6 +1083,75 @@ function Save-FrameDumpShot {
         }
     }
     return $dest
+}
+
+# v55: measure one flash-watch shot for the corruption signatures
+# that fire an automatic frame dump. Returns a hashtable with the
+# fractions; Kind is Clean unless a signature matches. Works on a
+# 384x216 sample read through LockBits - fast enough to run on
+# every flash shot without slowing the loop. Any failure returns
+# Clean: a broken measurement must never disturb a run. The
+# sudden-Black signature needs the previous shot, so the gameplay
+# loop applies that one itself from the Black fraction.
+function Test-FlashFrame {
+    param([string]$Path)
+    $m = @{ Kind = "Clean"; Black = 0.0; Bright = 0.0; Mid = 0.0; Green = 0.0 }
+    try {
+        Add-Type -AssemblyName System.Drawing -ErrorAction SilentlyContinue
+        $src = [System.Drawing.Image]::FromFile($Path)
+        try {
+            $bmp = New-Object System.Drawing.Bitmap(384, 216)
+            try {
+                $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+                try {
+                    $gfx.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::Bilinear
+                    $gfx.DrawImage($src, 0, 0, 384, 216)
+                } finally { $gfx.Dispose() }
+                $rect = New-Object System.Drawing.Rectangle(0, 0, 384, 216)
+                $data = $bmp.LockBits($rect, [System.Drawing.Imaging.ImageLockMode]::ReadOnly, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)
+                try {
+                    $stride = $data.Stride
+                    $bytes = New-Object byte[] ($stride * 216)
+                    [System.Runtime.InteropServices.Marshal]::Copy($data.Scan0, $bytes, 0, $bytes.Length)
+                } finally { $bmp.UnlockBits($data) }
+            } finally { $bmp.Dispose() }
+        } finally { $src.Dispose() }
+        $black = 0; $bright = 0; $mid = 0; $green = 0; $total = 0
+        for ($y = 0; $y -lt 216; $y++) {
+            $row = $y * $stride
+            for ($x = 0; $x -lt 384; $x++) {
+                $i = $row + ($x * 4)
+                $b = $bytes[$i]; $g = $bytes[$i + 1]; $r = $bytes[$i + 2]
+                $mx = $r; if ($g -gt $mx) { $mx = $g }; if ($b -gt $mx) { $mx = $b }
+                if ($mx -lt 10) { $black++ }
+                elseif ($mx -gt 120) { $bright++ } else { $mid++ }
+                if (($g -gt 90) -and (($g - $r) -gt 45) -and (($g - $b) -gt 45)) { $green++ }
+                $total++
+            }
+        }
+        $m.Black = $black / $total; $m.Bright = $bright / $total; $m.Mid = $mid / $total; $m.Green = $green / $total
+        if ($m.Green -gt 0.05) { $m.Kind = "Green" }
+        elseif (($m.Black -ge 0.60) -and ($m.Black -le 0.985) -and ($m.Bright -gt 0.0008) -and ($m.Mid -gt 0.04)) { $m.Kind = "Pixelated" }
+    } catch {
+        $m.Kind = "Clean"
+    }
+    return $m
+}
+
+# v55: is a frame-dump download still growing? A trigger fired
+# into a running download is swallowed by the emulator, so the
+# auto-F2 path checks first: count the PNGs in the newest
+# frame_* folder twice, about a second apart; growth means busy.
+function Test-DumpDownloadBusy {
+    $dumpDir = $env:KYTY_DBG_FRAME_DUMP_DIR
+    if (-not $dumpDir) { $dumpDir = "D:\Downloads\captures" }
+    $latest = @(Get-ChildItem -Path $dumpDir -Directory -Filter "frame_*" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending)
+    if ($latest.Count -eq 0) { return $false }
+    $dir = $latest[0].FullName
+    $c1 = @(Get-ChildItem -Path $dir -Filter "*.png" -ErrorAction SilentlyContinue).Count
+    Start-Sleep -Milliseconds 1200
+    $c2 = @(Get-ChildItem -Path $dir -Filter "*.png" -ErrorAction SilentlyContinue).Count
+    return ($c2 -ne $c1)
 }
 
 # Wait until the frame-dump download is finished: no new PNG has appeared
@@ -2231,6 +2321,9 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
     $unknownWarnings = 0
     $gameplayShotCount = 0
     $flashShotCount = 0
+    $prevFlashBlack = 0.0
+    $autoF2Count = 0
+    $lastAutoF2 = $gameplayStart.AddMinutes(-8)
     $lastDataShot = $gameplayStart
     Write-Host ("gameplay phase: up to " + $GameplayMinutes + " min of CPU vs CPU spectator play (no inputs sent), ends early if the game returns to a menu.")
     while (((Get-Date) -lt $gameplayEnd) -and -not $gameOver) {
@@ -2294,12 +2387,34 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
         }
         # Flash-watch: fast screen capture every 5 cycles (about 30
         # seconds) to catch brief/transient glitches the 10-minute
-        # frame-dump shots would miss. Screen capture only - no frame
-        # dump, so it is cheap and does not disturb play.
+        # frame-dump shots would miss. v55: each shot is also
+        # measured for corruption signatures, and a match fires an
+        # automatic frame dump (auto-F2) while the glitch is still
+        # on screen - at most 3 per phase, 8 minutes apart.
         if (($cycle % 5) -eq 0) {
             $flashShotCount++
             $fs = Save-ScreenShot -ShotName ("12-flash-" + $flashShotCount + ".png")
             Write-Host ("flash-watch shot: " + $fs)
+            if ($fs) {
+                $fm = Test-FlashFrame -Path $fs
+                $kind = $fm.Kind
+                if (($kind -eq "Clean") -and ($fm.Black -gt 0.985) -and ($prevFlashBlack -lt 0.90)) { $kind = "Black" }
+                $prevFlashBlack = $fm.Black
+                if ($kind -ne "Clean") {
+                    $since = ((Get-Date) - $lastAutoF2).TotalMinutes
+                    if (($autoF2Count -ge 3) -or ($since -lt 8)) {
+                        Write-Host ("AUTO-F2: " + $kind + " signature in " + (Split-Path $fs -Leaf) + " but not firing (count " + $autoF2Count + " of 3, " + [math]::Round($since, 1) + " min since last).")
+                    } elseif (Test-DumpDownloadBusy) {
+                        Write-Host ("AUTO-F2: " + $kind + " signature in " + (Split-Path $fs -Leaf) + " but a dump download is still running - trigger skipped.")
+                    } else {
+                        $autoF2Count++
+                        $lastAutoF2 = Get-Date
+                        Write-Host ("AUTO-F2 TRIGGER: " + $kind + " in " + (Split-Path $fs -Leaf) + " (black " + [math]::Round($fm.Black, 3) + ", bright " + [math]::Round($fm.Bright, 4) + ", mid " + [math]::Round($fm.Mid, 3) + ", green " + [math]::Round($fm.Green, 3) + ") - firing frame dump " + $autoF2Count + " of 3.")
+                        $ap = Save-FrameDumpShot -ShotName ("13-autof2-" + $autoF2Count + ".png")
+                        if ($ap) { Write-Host ("AUTO-F2: dump present saved: " + $ap) } else { Write-Host "AUTO-F2: trigger produced no dump present (see frame dump diagnosis above)." }
+                    }
+                }
+            }
         }
         # Progress line every 30 cycles so the transcript shows the phase
         # is alive without flooding it.

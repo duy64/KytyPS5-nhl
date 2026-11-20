@@ -1,9 +1,36 @@
-# Watch-KytyBuilds.ps1 - v10 (2026-11-18)
+# Watch-KytyBuilds.ps1 - v11 (2026-11-19)
 # Watches D:\Downloads for new KyTy builds and auto-runs the NHL 27 test
 # (Test-KytyBuild.ps1) for each one. Meant to run on a schedule (every
 # 15 min) via a Windows Scheduled Task. Results are copied to -UploadDir
 # (a local archive folder) when set, so Muse can pull them over the
 # direct connection and review them without anyone sending them.
+#
+# v11 monitor dimming (user request, 2026-11-19): brightness
+# follows whether the auto-test loop is armed and the user is
+# away - not the boundaries of an individual test run. Every
+# watcher tick evaluates brightness at the same point as the
+# stand-down check: if the user is playing (an emulator session
+# the watcher did not launch), the monitors are restored to 100%
+# and the dim marker is deleted - he is at the desk. Otherwise -
+# a test running, or the loop armed and idle - the monitors are
+# dimmed to 15% through the existing C:\Users\duy84\dim-ddc.ps1
+# (DDC/CI) and stay dimmed; the marker file
+# (C:\Users\duy84\dim-by-autorun.txt) means "the loop is holding
+# the monitors dimmed". A test launch re-checks the dim like any
+# other evaluation, and a run ending changes nothing. Every set
+# is verified by read-back: the dim script's log from a subsequent
+# call holds a fresh GetMonitorBrightness read in its "was"
+# values, which must match the set targets - a set that returned
+# True once silently failed to hold on 2026-11-19, so one call is
+# not proof. While the marker is present, an evaluation spends
+# one call confirming the dim is still held, and re-asserts it
+# with a full verified set only if the brightness drifted. DDC
+# brightness is a panel setting - the framebuffer the test script
+# reads for navigation is unchanged, so tests are unaffected.
+# Known accepted edge: if the watcher task is disabled by hand
+# while dimmed, nothing restores the monitors automatically.
+# Like the v9 display control, every dim call is failure-
+# isolated: a dimming problem never breaks a test run.
 #
 # v10 Drive-free results (user request, 2026-11-18): Google Drive is
 # out of the loop. The results archive now lives on this PC: when
@@ -235,6 +262,188 @@ function Stop-DisplaySession {
     Suspend-DisplaysIfIdle
 }
 
+# ---------------------------------------------------------------------------
+# v11 monitor dimming: brightness follows whether the auto-test loop
+# is armed and the user is away. The evaluation sits with the stand-
+# down check further down: user playing -> restore to 100% (he is at
+# the desk); otherwise - a test running, or the loop armed and idle -
+# the monitors are / stay dimmed at 15%. Dimming goes through the
+# existing dim-ddc.ps1 (DDC/CI), which sets a panel-level brightness
+# - the framebuffer the test script reads for navigation is
+# unchanged, so tests are unaffected. Like the v9 display control,
+# every helper is failure-isolated: a dimming problem must never
+# break a test run.
+$script:DimScriptPath = "C:\Users\duy84\dim-ddc.ps1"
+$script:DimLogPath = "C:\Users\duy84\dim-screen.log"
+$script:DimMarkerPath = "C:\Users\duy84\dim-by-autorun.txt"
+$script:DimRunPercent = 15
+$script:DimRestorePercent = 100
+
+function Invoke-DimScript {
+    param([int]$Percent)
+    # One call to dim-ddc.ps1; returns its log text ("" when the
+    # script or its log is unavailable). The log is deleted first,
+    # so a stale log from an earlier call can never be misread as
+    # this call's result. Never throws.
+    try {
+        Remove-Item $script:DimLogPath -Force -ErrorAction SilentlyContinue
+        $null = & $script:DimScriptPath -Percent $Percent
+        if (Test-Path $script:DimLogPath) { return (Get-Content $script:DimLogPath -Raw -ErrorAction SilentlyContinue) }
+    } catch { }
+    return ""
+}
+
+function Read-DimLog {
+    param([string]$LogText, [int]$Percent)
+    # Parse one dim-ddc.ps1 log for a call at $Percent. Returns $null
+    # when the log holds no usable per-monitor entries. Otherwise an
+    # object with: Count (monitors seen), AllSetOk (every set landed
+    # on the target recomputed from that monitor's range, reported
+    # True, and the log's own Percent line matches), AllWasOk (every
+    # read-back "was" already equalled that target - the state was
+    # already held before the call), Report (the report line).
+    if ([string]::IsNullOrWhiteSpace($LogText)) { return $null }
+    $entries = [regex]::Matches($LogText, 'was (\d+) \(range (\d+)-(\d+)\) -> set (\d+) = (True|False)')
+    if ($entries.Count -eq 0) { return $null }
+    $allSetOk = $true
+    $allWasOk = $true
+    if ($LogText -match 'Percent:\s*(\d+)') {
+        if ([int]$Matches[1] -ne $Percent) { $allSetOk = $false }
+    } else { $allSetOk = $false }
+    foreach ($entry in $entries) {
+        $wasValue = [int]$entry.Groups[1].Value
+        $rangeMin = [int]$entry.Groups[2].Value
+        $rangeMax = [int]$entry.Groups[3].Value
+        $setValue = [int]$entry.Groups[4].Value
+        if ($entry.Groups[5].Value -ne 'True') { $allSetOk = $false }
+        $expectedTarget = $rangeMin + [int][Math]::Floor((($rangeMax - $rangeMin) * $Percent) / 100)
+        if ($setValue -ne $expectedTarget) { $allSetOk = $false }
+        if ($wasValue -ne $expectedTarget) { $allWasOk = $false }
+    }
+    $reportLine = (($LogText -split "`r?`n") | Where-Object { $_ -match '-> set' } | Select-Object -First 1)
+    $report = "(no report line)"
+    if ($reportLine) { $report = $reportLine.Trim() }
+    return [PSCustomObject]@{ Count = $entries.Count; AllSetOk = $allSetOk; AllWasOk = $allWasOk; Report = $report }
+}
+
+function Set-MonitorBrightnessVerified {
+    param([int]$Percent)
+    # Set every monitor to $Percent through dim-ddc.ps1 and verify
+    # by read-back. A set that returns True once silently failed to
+    # hold on 2026-11-19, so the set alone is not proof: the script
+    # is called a second time with the same percentage, and the
+    # second call's log holds a fresh GetMonitorBrightness read in
+    # its "was" values, which must match the targets. The second
+    # call is idempotent and re-asserts the setting, so the
+    # verification doubles as a retry. Returns $true when the state
+    # is confirmed. Never throws.
+    try {
+        if (-not (Test-Path $script:DimScriptPath)) {
+            Write-Host ("Monitor brightness: dim script not found (" + $script:DimScriptPath + "). Skipping.")
+            return $false
+        }
+        $first = Read-DimLog -LogText (Invoke-DimScript -Percent $Percent) -Percent $Percent
+        if ($first) { Write-Host ("Monitor brightness set (" + $Percent + "%): " + $first.Report) }
+        $last = Read-DimLog -LogText (Invoke-DimScript -Percent $Percent) -Percent $Percent
+        if (-not $last) {
+            Write-Host ("Monitor brightness: no per-monitor read-back entries; " + $Percent + "% not confirmed.")
+            return $false
+        }
+        Write-Host ("Monitor brightness read-back (" + $Percent + "%): " + $last.Report)
+        $ok = ($last.AllSetOk -and $last.AllWasOk)
+        if ($ok) {
+            Write-Host ("Monitor brightness confirmed at " + $Percent + "% (read-back matches on " + $last.Count + " monitor(s)).")
+        } else {
+            Write-Host ("Monitor brightness NOT confirmed at " + $Percent + "% - a set did not hold. Read-back: " + $last.Report)
+        }
+        return $ok
+    } catch {
+        Write-Host ("Monitor brightness set skipped: " + $_.Exception.Message)
+        return $false
+    }
+}
+
+function Test-MonitorsAtPercent {
+    param([int]$Percent)
+    # One dim-ddc.ps1 call at $Percent (an idempotent set). Returns
+    # $true when the call's read-back shows every monitor was
+    # ALREADY at the target before the call - the state is being
+    # held. The call re-asserts the target either way, so a drifted
+    # state is corrected by the check itself. Never throws.
+    try {
+        if (-not (Test-Path $script:DimScriptPath)) { return $false }
+        $verdict = Read-DimLog -LogText (Invoke-DimScript -Percent $Percent) -Percent $Percent
+        if (-not $verdict) { return $false }
+        Write-Host ("Monitor brightness check (" + $Percent + "%): " + $verdict.Report)
+        return ($verdict.AllSetOk -and $verdict.AllWasOk)
+    } catch { return $false }
+}
+
+function Ensure-MonitorsDimmed {
+    param([string]$Reason)
+    # The loop is armed and the user is away: the monitors should
+    # be / stay dimmed. With no marker this evaluation owns the dim
+    # from scratch (verified set, then write the marker). With the
+    # marker present the loop is already holding the dim, so one
+    # check call confirms it is still held, and only a drift pays
+    # for a full verified re-set. The marker is (re)written whenever
+    # the set was invoked with the dim script present, even when
+    # the read-back could not confirm it - the NOT-confirmed line
+    # is in the log, and later evaluations keep checking. Never
+    # throws.
+    try {
+        if (-not (Test-Path $script:DimScriptPath)) {
+            Write-Host "Monitor dimming unavailable (dim script not found). Continuing without dimming."
+            return
+        }
+        if (Test-Path $script:DimMarkerPath) {
+            if (Test-MonitorsAtPercent -Percent $script:DimRunPercent) {
+                Write-Host ("Monitors still dimmed at " + $script:DimRunPercent + "% (" + $Reason + "); read-back confirmed.")
+            } else {
+                Write-Host ("Monitors had drifted from " + $script:DimRunPercent + "% (" + $Reason + "); re-asserting.")
+                $null = Set-MonitorBrightnessVerified -Percent $script:DimRunPercent
+            }
+        } else {
+            $dimOk = Set-MonitorBrightnessVerified -Percent $script:DimRunPercent
+            if ($dimOk) {
+                Write-Host ("Monitors dimmed to " + $script:DimRunPercent + "% (" + $Reason + ").")
+            } else {
+                Write-Host ("Monitor dim to " + $script:DimRunPercent + "% (" + $Reason + ") could not be confirmed by read-back.")
+            }
+        }
+        Set-Content -Path $script:DimMarkerPath -Value ("dimmed to " + $script:DimRunPercent + "% by Watch-KytyBuilds v11 at " + (Get-Date -Format "yyyy-MM-dd HH:mm:ss") + " (" + $Reason + ")") -Encoding ASCII -ErrorAction SilentlyContinue
+    } catch {
+        Write-Host ("Monitor dimming skipped: " + $_.Exception.Message)
+    }
+}
+
+function Ensure-MonitorsRestored {
+    # The user is at the desk (his own emulator session is
+    # running): if the loop is holding the monitors dimmed, give
+    # them back at 100% and clear the marker. With no marker the
+    # loop dimmed nothing, so nothing is touched - a brightness
+    # the user set himself is his. The marker is cleared even
+    # when the read-back cannot confirm the restore; the attempt
+    # is logged with its read-back values. Never throws.
+    try {
+        if (-not (Test-Path $script:DimMarkerPath)) { return }
+        if (-not (Test-Path $script:DimScriptPath)) {
+            Write-Host "Monitor restore unavailable (dim script not found); clearing the dim marker."
+            Remove-Item $script:DimMarkerPath -Force -ErrorAction SilentlyContinue
+            return
+        }
+        $restoreOk = Set-MonitorBrightnessVerified -Percent $script:DimRestorePercent
+        Remove-Item $script:DimMarkerPath -Force -ErrorAction SilentlyContinue
+        if ($restoreOk) {
+            Write-Host ("Monitors restored to " + $script:DimRestorePercent + "% (user is playing); dim marker cleared.")
+        } else {
+            Write-Host ("Monitor restore to " + $script:DimRestorePercent + "% (user is playing) could not be confirmed by read-back; dim marker cleared.")
+        }
+    } catch {
+        Write-Host ("Monitor restore skipped: " + $_.Exception.Message)
+    }
+}
+
 # If a test is already running, do nothing. A lock is stale only if the
 # process that created it is no longer running (the watcher was killed or
 # crashed). v6 REMOVED the old 45-minute age rule: a full test runs about
@@ -259,10 +468,19 @@ if (Test-Path $LockFile) {
         Write-Host "A test is already running (lock file present). Exiting."; exit 0
     }
 }
+# v11 brightness evaluation, at the same point as the stand-down
+# check below: if the user is playing (an emulator session this
+# watcher did not launch - a watcher-owned run would have been
+# caught by the lock check above), he is at the desk, so hand the
+# monitors back at 100% before standing down. Otherwise the loop
+# is armed and the user is away, so the monitors should be / stay
+# dimmed whether this tick goes on to run a test or exits idle.
 # If the user is already playing, do not start a test over their game.
 if (Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue) {
+    Ensure-MonitorsRestored
     Write-Host "Emulator already running (user playing). Exiting."; exit 0
 }
+Ensure-MonitorsDimmed -Reason "loop armed, user away"
 if (-not (Test-Path $TestScript)) { Write-Host ("Test script not found: " + $TestScript); exit 0 }
 if (-not (Test-Path $BuildsRoot)) { Write-Host ("Builds folder not found: " + $BuildsRoot); exit 0 }
 
@@ -468,6 +686,7 @@ function Invoke-AtlasCapture {
     $atlasOut = Join-Path $ResultsRoot ("KyTyTest-" + (Split-Path $atlasBuild -Leaf) + "-atlas-" + $stamp)
     Set-Content -Path $LockFile -Value $PID -Encoding ASCII
     Start-DisplaySession
+    Ensure-MonitorsDimmed -Reason ("atlas capture " + $Tag)
     try {
         Write-Host ("Running atlas capture for: " + $atlasBuild)
         $argList = '-NoProfile -ExecutionPolicy Bypass -File "' + $TestScript + '" -BuildDir "' + $atlasBuild + '" -OutDir "' + $atlasOut + '" -AtlasCapture'
@@ -491,6 +710,9 @@ function Invoke-AtlasCapture {
         }
     }
     finally {
+        # v11: no brightness restore here - the loop stays armed
+        # after the run, so the monitors stay dimmed until the user
+        # plays (the tick evaluation handles the restore).
         Stop-DisplaySession
         if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
     }
@@ -651,6 +873,7 @@ $outDir = Join-Path $ResultsRoot ("KyTyTest-" + $target.Name + "-" + $stamp)
 
 Set-Content -Path $LockFile -Value $PID -Encoding ASCII
 Start-DisplaySession
+Ensure-MonitorsDimmed -Reason ("build test " + $target.Name)
 try {
     Write-Host ("Running test for: " + $buildDir)
     $argList = '-NoProfile -ExecutionPolicy Bypass -File "' + $TestScript + '" -BuildDir "' + $buildDir + '" -OutDir "' + $outDir + '"'
@@ -688,6 +911,9 @@ try {
     Sync-ResultsToArchive
 }
 finally {
+    # v11: no brightness restore here - the loop stays armed after
+    # the run, so the monitors stay dimmed until the user plays
+    # (the tick evaluation handles the restore).
     Stop-DisplaySession
     if (Test-Path $LockFile) { Remove-Item $LockFile -Force }
 }

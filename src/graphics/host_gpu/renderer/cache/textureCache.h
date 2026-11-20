@@ -201,6 +201,10 @@ private:
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
 	[[nodiscard]] static BindingType UploadBinding(const Image& image);
+	// KYTY_FULL_UPLOAD stills: sampled textures whose contents come only from guest
+	// memory (not a render/depth/video-out target, not a storage image, not a
+	// stencil plane, which uploads into its depth owner).
+	[[nodiscard]] static bool IsStillImage(const Image& image);
 
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
@@ -291,6 +295,9 @@ private:
 
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
+	// KYTY_FULL_UPLOAD: images created while the gate is on that have not yet had a
+	// complete guest upload (or a complete image copy) in this lifetime.
+	std::unordered_set<ImageId>                       m_full_upload_pending;
 	std::atomic<bool>                                 m_still_pending {false};
 	// NHL27RBENROL, per window: enrolled binds by format and size, downloads, label drains.
 	std::map<uint64_t, uint32_t>                      m_rb_images;

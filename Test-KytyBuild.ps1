@@ -1,4 +1,19 @@
-# Test-KytyBuild.ps1 - v55 (2026-11-20)
+# Test-KytyBuild.ps1 - v56 (2026-11-20)
+# v56: the gameplay loop re-asserts the emulator as the foreground
+# window before every screen read (the 12-cycle OCR check and the
+# 5-cycle flash-watch). In the #214 run on 2026-11-20 a PowerShell
+# console came to the foreground mid-run and stayed, so every
+# later capture read the console instead of the game and the live
+# glitch watch was blind (the screenshots still landed). The new
+# Assert-EmulatorForeground helper checks the foreground window
+# before each read: when it is not the emulator's, it logs a
+# FLASH-WATCH line naming the window that was in front and
+# brings the emulator forward through the existing v27 helper
+# (Invoke-BringEmulatorToFront). When the emulator window is
+# gone the helper skips quietly, like every other watch failure.
+# Nothing else changes: navigation, the auto-F2 rules and
+# thresholds, and the spectator gameplay are all as in v55.
+#
 # v55: auto-F2 trigger in the gameplay flash-watch (user's call,
 # 2026-11-20). The flash-watch has now caught the pixelated-mess
 # family live three times (#213 flash-122, #211 retest flashes 16
@@ -619,7 +634,7 @@ $ErrorActionPreference = "Stop"
 # The watcher reads this number to decide whether a build needs re-testing:
 # a build marked tested with an older script version gets re-run when the
 # script version increases, so a script fix automatically re-tests builds.
-$TestScriptVersion = 55
+$TestScriptVersion = 56
 
 # Test-Path throws a terminating error (ErrorActionPreference is Stop) when a
 # file is locked by another process ("Access is denied"). The emulator holds
@@ -1525,6 +1540,45 @@ function Invoke-BringEmulatorToFront {
     }
 }
 
+# v56: keep the emulator in front during the gameplay watch. The
+# screen capture reads the foreground window, so anything that
+# takes the foreground mid-run (the #214 run: a PowerShell console
+# at 08:39, which stayed) blinds every later check and flash shot.
+# Called before each gameplay screen read: when the foreground
+# window is not the emulator's, log what was in front (so the
+# monitor can see it happened) and re-assert the emulator through
+# Invoke-BringEmulatorToFront. Never throws and never blocks: a
+# missing emulator window just skips, like any other watch
+# failure (a failed measurement reads as Clean in the loop).
+function Assert-EmulatorForeground {
+    param([string]$Context = "flash-watch")
+    try { Add-Type -TypeDefinition $KytyForegroundCode -ErrorAction Stop } catch { }
+    try {
+        $emu = Get-Process -Name "kyty_emulator" -ErrorAction SilentlyContinue | Select-Object -First 1
+        if (-not $emu) { return }
+        $hwnd = $emu.MainWindowHandle
+        if ($hwnd -eq [IntPtr]::Zero) { return }
+        $fgHwnd = [KytyForeground]::GetForegroundWindow()
+        if ($fgHwnd -eq $hwnd) { return }
+        $fgTitle = "unknown window"
+        try {
+            $fgPid = 0
+            [void][KytyForeground]::GetWindowThreadProcessId($fgHwnd, [ref]$fgPid)
+            if ($fgPid -gt 0) {
+                $fgProc = Get-Process -Id $fgPid -ErrorAction SilentlyContinue
+                if ($fgProc) {
+                    if ($fgProc.MainWindowTitle) { $fgTitle = $fgProc.MainWindowTitle } else { $fgTitle = $fgProc.ProcessName }
+                }
+            }
+        } catch { }
+        if (Invoke-BringEmulatorToFront) {
+            Write-Host ("FLASH-WATCH: foreground was '" + $fgTitle + "' before the " + $Context + " read, re-asserted emulator.")
+        } else {
+            Write-Host ("FLASH-WATCH: foreground was '" + $fgTitle + "' before the " + $Context + " read, re-assert FAILED - this read may be blind.")
+        }
+    } catch { }
+}
+
 # v32: wait for the emulator to FULLY exit before any log is copied, and
 # copy last-run.log only then. The 0012 run proved the old order wrong:
 # the end-of-run copy ran while the emulator was still alive, so it
@@ -2346,6 +2400,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
         # and slowed the game for no benefit - Pause/menu/game-over do
         # not need a 30-second response.)
         if (($cycle % 12) -eq 0) {
+            Assert-EmulatorForeground -Context "gameplay check"
             $checkShot = Save-ScreenShot -ShotName "12-gameplay-check.png"
             $checkText = Get-ShotText -ShotPath $checkShot
             $checkKind = Get-ScreenKind -Text $checkText
@@ -2393,6 +2448,7 @@ if ($reachedIce -and -not $SkipGameplay -and -not $AtlasCapture) {
         # on screen - at most 3 per phase, 8 minutes apart.
         if (($cycle % 5) -eq 0) {
             $flashShotCount++
+            Assert-EmulatorForeground -Context "flash-watch"
             $fs = Save-ScreenShot -ShotName ("12-flash-" + $flashShotCount + ".png")
             Write-Host ("flash-watch shot: " + $fs)
             if ($fs) {

@@ -1686,6 +1686,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		EXIT_IF(prepared == nullptr || prepared->runtime == nullptr || !*prepared->runtime);
 		const auto& program = *prepared->runtime->program;
 		write_count += std::popcount(program.bindings.descriptor_mask);
+		if (ShaderMoltenVkDistinctBufferBindings() &&
+		    (program.bindings.descriptor_mask &
+		     (uint64_t {1} << static_cast<size_t>(BindingKind::Buffers))) != 0) {
+			// The Buffers kind writes once per used buffer width, not once.
+			write_count += static_cast<size_t>(program.info.buffer_u8) +
+			               static_cast<size_t>(program.info.buffer_u16) +
+			               static_cast<size_t>(program.info.buffer_int64_atomics);
+		}
 		for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 			const auto index = std::countr_zero(mask);
 			const auto count = program.bindings.descriptor_counts[index];
@@ -1859,6 +1867,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			write.descriptorType = NativeDescriptorType(kind);
 			write.descriptorCount = program.bindings.descriptor_counts[index];
 			const auto image_start = image_cursor;
+			bool       wrote_inline = false;
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
 				image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = image_start;
@@ -1871,6 +1880,21 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							EXIT_IF(view.buffer == nullptr);
 						}
 						write.pBufferInfo = descriptors.buffers.data();
+						if (ShaderMoltenVkDistinctBufferBindings()) {
+							// One write per used buffer width at its own binding,
+							// matching the layout (shaders.cpp); every width's
+							// array carries the same buffer descriptors.
+							const std::array used {program.info.buffer_u8, program.info.buffer_u16,
+							                       true, program.info.buffer_int64_atomics};
+							for (uint32_t width = 0; width < used.size(); ++width) {
+								if (!used[width]) continue;
+								auto width_write           = write;
+								width_write.dstBinding = ShaderRecompiler::IR::NativeBufferBinding(
+								    program.stage, width, true);
+								m_descriptor_writes.push_back(width_write);
+							}
+							wrote_inline = true;
+						}
 						break;
 					case BindingKind::BdaPagetable:
 					case BindingKind::FaultBuffer: {
@@ -1911,7 +1935,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (image_cursor != image_start) {
 				write.pImageInfo = m_descriptor_images.data() + image_start;
 			}
-			m_descriptor_writes.push_back(write);
+			if (!wrote_inline) {
+				m_descriptor_writes.push_back(write);
+			}
 		}
 		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 			const auto& resource = program.info.images[i];

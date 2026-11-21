@@ -194,6 +194,22 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 		const auto index = std::countr_zero(mask);
 		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
+		if (kind == ShaderRecompiler::IR::DescriptorBindingKind::Buffers &&
+		    ShaderMoltenVkDistinctBufferBindings()) {
+			// One layout binding per buffer width, at the emitter's per-width
+			// bindings (spirvEmitterModule.cpp); each carries the program's
+			// full buffer count.
+			const std::array used {program.info.buffer_u8, program.info.buffer_u16, true,
+			                       program.info.buffer_int64_atomics};
+			for (uint32_t width = 0; width < used.size(); ++width) {
+				if (!used[width]) continue;
+				descriptor_bindings.push_back(
+				    {ShaderRecompiler::IR::NativeBufferBinding(program.stage, width, true),
+				     NativeDescriptorType(kind), program.bindings.descriptor_counts[index], stage,
+				     nullptr});
+			}
+			continue;
+		}
 		descriptor_bindings.push_back(
 		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
 		     program.bindings.descriptor_counts[index], stage, nullptr});

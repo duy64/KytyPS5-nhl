@@ -487,6 +487,36 @@ void AliasLogOnce(AliasAction action, uint64_t address, uint64_t size, const cha
 	            detail);
 }
 
+// KYTY_COPY_DIRTY=0 restores the base CopyImage behaviour: PrepareImageCopy
+// settles the destination's dirty flags even when the copy is then skipped.
+bool CopyDirtyEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_COPY_DIRTY");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// One NHL27G2 line per CopyImage skip that base behaviour would have settled on
+// credit (destination cpu-dirty, source buffer-modified, ranges unequal). The
+// running total is the session verdict counter; printing is capped.
+void LogCopySkip(uint64_t dst_address, uint64_t dst_size, uint64_t src_address, uint64_t src_size,
+                 bool definite) {
+	static std::atomic<uint64_t> total {0};
+	static std::atomic<uint64_t> printed {0};
+	const uint64_t               count = total.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (printed.fetch_add(1, std::memory_order_relaxed) >= 5000) {
+		return;
+	}
+	std::printf("NHL27G2: copy_skip dst=0x%llx dst_size=0x%llx src=0x%llx src_size=0x%llx "
+	            "dirty=%s total=%llu\n",
+	            static_cast<unsigned long long>(dst_address),
+	            static_cast<unsigned long long>(dst_size),
+	            static_cast<unsigned long long>(src_address),
+	            static_cast<unsigned long long>(src_size), definite ? "definite" : "maybe",
+	            static_cast<unsigned long long>(count));
+}
+
 } // namespace
 
 bool TextureCache::WriteBackAliasedImage(ImageId id) {
@@ -929,9 +959,23 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
-	PrepareImageCopy(destination);
-	if (source.IsBufferModified()) {
-		if (source.info.data == destination.info.data) {
+	// G2 (KYTY_COPY_DIRTY): PrepareImageCopy settles the destination's cpu-dirty
+	// flags on the assumption the copy overwrites it. When the source is
+	// buffer-modified and the guest ranges differ, the copy is skipped — so with
+	// the gate on, settle the destination only when the copy will run, or when
+	// the equal-range path re-marks it buffer-modified. A skipped copy leaves
+	// the destination's dirty flags (and any maybe-dirty edge hash) untouched.
+	const bool source_buffer_modified = source.IsBufferModified();
+	const bool equal_ranges           = source.info.data == destination.info.data;
+	if (!source_buffer_modified || equal_ranges || !CopyDirtyEnabled()) {
+		PrepareImageCopy(destination);
+	} else if (destination.IsCpuDirty()) {
+		LogCopySkip(destination.info.data.address, destination.info.data.size,
+		            source.info.data.address, source.info.data.size,
+		            destination.IsDefinitelyCpuDirty());
+	}
+	if (source_buffer_modified) {
+		if (equal_ranges) {
 			destination.MarkBufferModified();
 		}
 		return;

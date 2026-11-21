@@ -429,6 +429,22 @@ constexpr uint32_t NativePushConstantSize = sizeof(PushData);
 	       group * static_cast<uint32_t>(DescriptorBindingKind::Count);
 }
 
+// Binding of one buffer-width variable (width index: 0 = u8, 1 = u16, 2 = u32,
+// 3 = u64). Normally every width shares the Buffers binding as an alias. Under
+// the MoltenVK distinct-bindings codegen option (shader.h) each width except
+// u32 — the one width every buffer program has — moves to its own block, one
+// full binding span (all four stage groups) past the regular bindings, so no
+// two width variables share a (set, binding) and the blocks cannot collide
+// with any other kind's binding in any stage group.
+[[nodiscard]] constexpr uint32_t NativeBufferBinding(ShaderType stage, uint32_t width,
+                                                     bool distinct) {
+	const auto base = NativeBinding(stage, DescriptorBindingKind::Buffers);
+	if (!distinct || width == 2u) {
+		return base;
+	}
+	return base + (width + 1u) * (static_cast<uint32_t>(DescriptorBindingKind::Count) * 4u);
+}
+
 [[nodiscard]] constexpr ImageResourceClass ImageBindingResourceClass(DescriptorBindingKind kind) {
 	const auto value = static_cast<uint32_t>(kind);
 	if (value >= FirstImageBinding && value < FirstStorageImageBinding) {

@@ -21,6 +21,7 @@
 #include <mutex>
 #include <memory>
 #include <type_traits>
+#include <string>
 #include <unordered_set>
 #include <vector>
 
@@ -143,6 +144,9 @@ public:
 	[[nodiscard]] bool PublishPendingStills();
 	void               NoteStillDrain(uint64_t ns) { m_rb_drain_ns += ns; }
 	void               LogReadbackWindow();
+	// KYTY_OPRING: renders every cached image's operation history as text for
+	// the frame dump (op_ring.txt); empty when KYTY_OPRING=0.
+	[[nodiscard]] std::string DumpOpRingText();
 	// Advances whenever an image is registered or unregistered.
 	[[nodiscard]] uint64_t ImageSetEpoch() const { return m_image_set_epoch; }
 	// The ImageSetEpoch of the last registration or unregistration of an image overlapping the

@@ -49,6 +49,45 @@ struct ImageBinding {
 	bool             shader_write  = false;
 };
 
+// KYTY_OPRING (diagnostics): per-image operation history. Every producer that
+// (re)writes an image's contents, and the first sample after each write,
+// appends one entry to the image's OpRing (see Image::OpNote); an F2 frame
+// dump writes all rings to op_ring.txt (TextureCache::DumpOpRingText). The
+// history answers two questions a plain dump cannot: was this image ever
+// written, and which operations produced its current contents, in order.
+// Recording is a few stores on paths that already hold the cache lock;
+// KYTY_OPRING=0 disables it entirely.
+enum class OpRingKind : uint8_t {
+	Create,             // image inserted into the cache
+	Upload,             // guest bytes uploaded (InitializeImage)
+	CopyIn,             // image-to-image copy into this image (a = source address)
+	BufferWrite,        // GPU buffer copy/fill overlapped this image (a/b = write range)
+	GpuWrite,           // GPU write committed (render/storage/depth target bind)
+	ResolveIn,          // resolve from another image (a = source address)
+	SampledAfterWrite,  // first texture bind after the last write
+	SampledBeforeWrite, // first texture bind with no write ever recorded
+};
+
+struct OpRingEntry {
+	uint64_t   seq  = 0; // global operation order (see OpRingCurrentSeq)
+	OpRingKind kind = OpRingKind::Create;
+	uint64_t   a    = 0; // op-specific: source or write guest address
+	uint64_t   b    = 0; // op-specific: size
+};
+
+struct OpRing {
+	static constexpr uint32_t kSize = 8;
+	OpRingEntry entries[kSize] {};
+	uint32_t    next                = 0; // slot the next entry overwrites
+	uint64_t    total               = 0; // entries ever recorded
+	bool        ever_written        = false;
+	bool        sampled_since_write = false;
+};
+
+// KYTY_OPRING gate (cached getenv): enabled unless KYTY_OPRING=0.
+[[nodiscard]] bool     OpRingEnabled() noexcept;
+[[nodiscard]] uint64_t OpRingCurrentSeq() noexcept;
+
 class Image final {
 public:
 	Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& info);
@@ -130,6 +169,11 @@ public:
 	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
+	// KYTY_OPRING: appends one entry to op_ring and updates its write/sample
+	// flags (write kinds set ever_written and re-arm the sample marker;
+	// sample kinds set sampled_since_write). No-op when the gate is off.
+	void OpNote(OpRingKind kind, uint64_t a = 0, uint64_t b = 0) noexcept;
+
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
 		return pages ? ImagePageRangesOverlap(info.data.address, info.data.size, address, size)
@@ -176,6 +220,8 @@ public:
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
 	uint64_t         tick_accessed_last = 0;
+	// KYTY_OPRING operation history (see OpRing above).
+	OpRing           op_ring;
 	size_t           lru_id             = 0;
 	uint64_t         lru_tick           = ~uint64_t {0}; // GC tick of the last LRU touch
 	// Resident image heap elements that select this image.

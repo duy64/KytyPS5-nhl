@@ -511,6 +511,7 @@ void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
 	auto resolved_destination_range        = destination_range;
 	resolved_source_range.layer_count      = layers;
 	resolved_destination_range.layer_count = layers;
+	OpNote(OpRingKind::ResolveIn, source.info.data.address, source.info.data.size);
 	const vk::Extent3D resolve_extent {info.extent.width, info.extent.height, 1};
 
 	m_scheduler.EndRendering();
@@ -788,6 +789,43 @@ Prospero::BufferFormat RenderTargetTransferFormat(uint32_t bytes_per_element) {
 }
 
 } // namespace ImageOps
+
+namespace {
+
+std::atomic<uint64_t> g_op_ring_seq {0};
+
+} // namespace
+
+bool OpRingEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_OPRING");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+uint64_t OpRingCurrentSeq() noexcept {
+	return g_op_ring_seq.load(std::memory_order_relaxed);
+}
+
+void Image::OpNote(OpRingKind kind, uint64_t a, uint64_t b) noexcept {
+	if (!OpRingEnabled()) {
+		return;
+	}
+	if (kind == OpRingKind::SampledAfterWrite || kind == OpRingKind::SampledBeforeWrite) {
+		op_ring.sampled_since_write = true;
+	} else {
+		op_ring.ever_written        = true;
+		op_ring.sampled_since_write = false;
+	}
+	auto& entry  = op_ring.entries[op_ring.next];
+	entry.seq    = g_op_ring_seq.fetch_add(1, std::memory_order_relaxed) + 1;
+	entry.kind   = kind;
+	entry.a      = a;
+	entry.b      = b;
+	op_ring.next = (op_ring.next + 1) % OpRing::kSize;
+	++op_ring.total;
+}
 
 Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageInfo& image_info)
     : info(image_info),

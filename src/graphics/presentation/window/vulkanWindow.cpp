@@ -911,6 +911,8 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		std::printf("NHL27CODEGEN moltenvk_scalar_subgroups=1\n");
 		g_shader_moltenvk_runtime_buffer_arrays.store(true, std::memory_order_relaxed);
 		std::printf("NHL27CODEGEN moltenvk_runtime_buffer_arrays=1\n");
+		g_shader_moltenvk_distinct_buffer_bindings.store(true, std::memory_order_relaxed);
+		std::printf("NHL27CODEGEN moltenvk_distinct_buffer_bindings=1\n");
 		std::fflush(stdout);
 #endif
 		LOGF("Vulkan shaderFloat16=%d gate=%d native_fp16=%d denormPreserve16=%d szinp16=%d rte16=%d\n",

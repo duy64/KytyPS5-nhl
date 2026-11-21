@@ -20,6 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.release_tag.outputs.value }}
+      release_draft: ${{ steps.release_draft.outputs.value }}
 
     steps:
       - name: Generate release tag
@@ -28,6 +29,19 @@ jobs:
         run: |
           BRANCH_SLUG=$(echo "${GITHUB_REF_NAME##*/}" | sed 's/^nhl27-//; s/[^A-Za-z0-9-]/-/g')
           echo "value=KytyPS5-$(date -u +'%Y-%m-%d')-${BRANCH_SLUG}-${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Decide release visibility
+        id: release_draft
+        shell: bash
+        run: |
+          case "$GITHUB_REF_NAME" in
+            opt/nhl27-main|opt/nhl27-mvkargbuf|opt/nhl27-mvksubgroup|opt/nhl27-dlsslowmem)
+              echo "value=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "value=true" >> "$GITHUB_OUTPUT"
+              ;;
+          esac
 
   windows:
     name: Build KytyPS5 (Windows)
@@ -337,6 +351,7 @@ jobs:
       contents: write
     env:
       RELEASE_NAME: ${{ needs.metadata.outputs.release_tag }}
+      RELEASE_DRAFT: ${{ needs.metadata.outputs.release_draft }}
 
     steps:
       - name: Download Windows build
@@ -386,12 +401,16 @@ jobs:
             fi
           done
           test "${#assets[@]}" -gt 0
+          draft_args=()
+          if [[ "$RELEASE_DRAFT" == "true" ]]; then
+            draft_args+=(--draft)
+          fi
           if gh release view "$RELEASE_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
             gh release upload "$RELEASE_NAME" "${assets[@]}" \
               --clobber \
               --repo "$GITHUB_REPOSITORY"
           else
-            gh release create "$RELEASE_NAME" "${assets[@]}" \
+            gh release create "$RELEASE_NAME" "${assets[@]}" "${draft_args[@]}" \
               --generate-notes \
               --repo "$GITHUB_REPOSITORY" \
               --target "$GITHUB_SHA" \

@@ -191,6 +191,7 @@ struct CaptureJob {
 	size_t                  guesttex_session = 0; // guesttex entries merged from the session record
 	std::string             draws;      // moved out of g_log (draw/dispatch lines)
 	std::string             buflog;     // moved out of g_buflog
+	std::string             op_ring;    // KYTY_OPRING snapshot (TextureCache::DumpOpRingText)
 	std::string             dir;        // copied from g_dir
 	uint32_t                seq = 0;    // g_seq at handoff (draws/dispatches count)
 	uint32_t                images = 0; // g_pending.size() at handoff
@@ -1531,6 +1532,12 @@ void ProcessJob(CaptureJob& job) {
 			std::fclose(f);
 		}
 	}
+	if (!job.op_ring.empty()) {
+		if (FILE* f = std::fopen((job.dir + "/op_ring.txt").c_str(), "wb")) {
+			std::fwrite(job.op_ring.data(), 1, job.op_ring.size(), f);
+			std::fclose(f);
+		}
+	}
 	std::string out = "# KytyPS5 frame dump (KYTY_DBG_FRAME_DUMP). Sequence = draw/dispatch order in the frame.\n"
 	                  "# Image files are named <seq>_<rt<slot>|depth|st<slot>>_<guest addr>_<WxH>_<vk format>.png\n"
 	                  "# HDR formats: <name>.png = clamped 0..1 (linear), <name>_exp.png = auto-exposed (p99 luminance) + sRGB.\n"
@@ -1599,6 +1606,7 @@ void FinishCapture(CommandBuffer& buffer) {
 	}
 	job.draws = std::move(g_log);
 	job.buflog = std::move(g_buflog);
+	job.op_ring = buffer.GetContext().GetTextureCache().DumpOpRingText();
 	job.dir = g_dir;
 	job.seq = g_seq;
 	job.images = static_cast<uint32_t>(job.pending.size());

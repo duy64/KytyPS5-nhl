@@ -62,6 +62,68 @@ bool ReadbackStillsEnabled() {
 	return value == nullptr || value[0] != '0';
 }
 
+// KYTY_EDGE_HASH=0 restores the base untrack/maybe-dirty behaviour. Default on: a
+// head/tail fragment released from page tracking carries a content hash that is
+// settled when the fragment is tracked again (a mismatch promotes the image to
+// definite cpu-dirty), and the edge hash may only acquit an image it covers
+// completely. Hashing runs on tracking transitions only (the fault path), never
+// per frame and never on the draw path; uploads follow only on a proven mismatch.
+bool EdgeHashEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_EDGE_HASH");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// NHL27EDGE: promotions the edge hashes produced, split by cause.
+std::atomic<uint64_t> g_edge_head_promotions {0};
+std::atomic<uint64_t> g_edge_tail_promotions {0};
+std::atomic<uint64_t> g_edge_oversize_promotions {0};
+
+void LogEdgePromotion(const char* cause, const Image& image) {
+	std::printf(
+	    "NHL27EDGE: cause=%s addr=0x%llx size=0x%llx head=%llu tail=%llu oversize=%llu\n",
+	    cause, static_cast<unsigned long long>(image.info.data.address),
+	    static_cast<unsigned long long>(image.info.data.size),
+	    static_cast<unsigned long long>(g_edge_head_promotions.load(std::memory_order_relaxed)),
+	    static_cast<unsigned long long>(g_edge_tail_promotions.load(std::memory_order_relaxed)),
+	    static_cast<unsigned long long>(
+	        g_edge_oversize_promotions.load(std::memory_order_relaxed)));
+}
+
+// Settles one recorded edge-fragment hash: the fragment is about to be watched
+// again, so its current bytes are hashed and compared with the hash taken when it
+// was released. A mismatch means the guest rewrote the fragment while it was
+// unprotected -- a write no page fault could see -- and promotes the image to
+// definite cpu-dirty. The recorded hash is always cleared; nothing is recorded
+// while the gate is off, so with the gate off this never fires.
+void SettleEdgeHash(Image& image, bool head) {
+	auto& recorded = head ? image.head_hash : image.tail_hash;
+	if (!recorded.has_value()) {
+		return;
+	}
+	const uint64_t current = head ? image.HashGuestHead() : image.HashGuestTail();
+	const bool     changed = current != *recorded;
+	recorded.reset();
+	if (!changed || image.IsDefinitelyCpuDirty()) {
+		return;
+	}
+	image.MarkCpuDirty();
+	(head ? g_edge_head_promotions : g_edge_tail_promotions)
+	    .fetch_add(1, std::memory_order_relaxed);
+	LogEdgePromotion(head ? "head" : "tail", image);
+}
+
+const char* ImageSourceName(BufferCache::ImageSource source) {
+	switch (source) {
+		case BufferCache::ImageSource::RegisteredBuffer: return "registered";
+		case BufferCache::ImageSource::GpuModified: return "gpu";
+		case BufferCache::ImageSource::GuestRead: return "guest";
+	}
+	return "unknown";
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -558,7 +620,19 @@ void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	// (SameBacking, ResolveOverlap) and never reads those; dirtiness is acted on later by RefreshImage.
 	// Registration/free changes still bump via Unregister/Delete/Free.
 	GenCount(FrameBreakdown::g_delta.gen_dirty_skipped);
-	image.MarkMaybeCpuDirty();
+	if (EdgeHashEnabled() && !image.GuestEdgesCoverImage()) {
+		// KYTY_EDGE_HASH: the edge hash covers only the partial first and last pages,
+		// so for a larger image it cannot acquit the interior: the image is definite
+		// cpu-dirty instead of maybe.
+		const bool promoted = !image.IsDefinitelyCpuDirty();
+		image.MarkCpuDirty();
+		if (promoted) {
+			g_edge_oversize_promotions.fetch_add(1, std::memory_order_relaxed);
+			LogEdgePromotion("oversize", image);
+		}
+	} else {
+		image.MarkMaybeCpuDirty();
+	}
 	UntrackImage(id);
 }
 
@@ -573,6 +647,10 @@ void TextureCache::TrackImage(ImageId id) {
 		return;
 	}
 	if (!image.IsTracked()) {
+		// KYTY_EDGE_HASH: settle any recorded fragment hashes before the whole
+		// range is watched again.
+		SettleEdgeHash(image, true);
+		SettleEdgeHash(image, false);
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
 		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
@@ -599,6 +677,8 @@ void TextureCache::TrackImageHead(ImageId id) {
 		EXIT("TextureCache: invalid image head tracking range\n");
 	}
 	const auto size  = image.track_addr - image_begin;
+	// KYTY_EDGE_HASH: settle the head fragment's hash before it is watched again.
+	SettleEdgeHash(image, true);
 	image.track_addr = image_begin;
 	m_page_manager.UpdatePageWatchers<true>(image_begin, size);
 }
@@ -617,6 +697,8 @@ void TextureCache::TrackImageTail(ImageId id) {
 	}
 	const auto address   = image.track_addr_end;
 	const auto size      = image_end - address;
+	// KYTY_EDGE_HASH: settle the tail fragment's hash before it is watched again.
+	SettleEdgeHash(image, false);
 	image.track_addr_end = image_end;
 	m_page_manager.UpdatePageWatchers<true>(address, size);
 }
@@ -645,6 +727,11 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	}
 	// No generation bump: watcher-range change only (see MarkAsMaybeDirty).
 	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
+	if (EdgeHashEnabled()) {
+		// KYTY_EDGE_HASH: record the head fragment's content; it is settled when
+		// the fragment is tracked again (see SettleEdgeHash).
+		image.head_hash = image.HashGuestHead();
+	}
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
 	image.track_addr   = address;
@@ -665,6 +752,11 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	}
 	// No generation bump: watcher-range change only (see MarkAsMaybeDirty).
 	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
+	if (EdgeHashEnabled()) {
+		// KYTY_EDGE_HASH: record the tail fragment's content; it is settled when
+		// the fragment is tracked again (see SettleEdgeHash).
+		image.tail_hash = image.HashGuestTail();
+	}
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
 	image.track_addr_end = address;
@@ -1498,10 +1590,23 @@ void TextureCache::InitializeImage(ImageId id) {
 	}
 	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
 	if (upload) {
-		const auto [source, source_offset] =
-		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		BufferCache::ImageSource image_source = BufferCache::ImageSource::GuestRead;
+		const auto [source, source_offset] = m_buffer_cache.ObtainBufferForImage(
+		    image.info.data.address, image.info.data.size,
+		    EdgeHashEnabled() ? &image_source : nullptr);
 		if (source == nullptr) {
 			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		if (EdgeHashEnabled() && !image.upsrc_reported) {
+			// NHL27UPSRC: this image's first guest upload, and the source its bytes
+			// came from -- a registered buffer's tracker-clean pages are taken as
+			// they are, so "registered" is the path that can serve bytes nobody
+			// read from the guest.
+			image.upsrc_reported = true;
+			std::printf("NHL27UPSRC: addr=0x%llx size=0x%llx src=%s\n",
+			            static_cast<unsigned long long>(image.info.data.address),
+			            static_cast<unsigned long long>(image.info.data.size),
+			            ImageSourceName(image_source));
 		}
 		UploadImage(image, *source, source_offset);
 		// Frame dump session record: remember every uploaded guest texture so

@@ -143,6 +143,15 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
+	// KYTY_EDGE_HASH: the head/tail fragments UntrackImageHead/UntrackImageTail release,
+	// hashed on their own, so a hash recorded at release can be settled when the fragment
+	// is tracked again.
+	[[nodiscard]] uint64_t HashGuestHead() const;
+	[[nodiscard]] uint64_t HashGuestTail() const;
+	// Whether HashGuestEdges() covers every byte of the image: it reads only the partial
+	// first and last pages, so an image reaching past both page boundaries has an interior
+	// no edge hash can acquit.
+	[[nodiscard]] bool GuestEdgesCoverImage() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
 		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -163,11 +172,19 @@ public:
 	ImageUsage       usage;
 	ImageBinding     binding;
 	bool             registered     = false;
+	// NHL27UPSRC: the first guest upload of this image has been reported.
+	bool             upsrc_reported = false;
 	// A large linear image: the guest reads it back as soon as a label says it is drawn.
 	bool             download_still = false;
 	mutable uint32_t query_epoch    = 0;
 	uint64_t         track_addr     = 0;
 	uint64_t         track_addr_end = 0;
+	// KYTY_EDGE_HASH: content hashes of the head/tail fragments while they are released
+	// from tracking, recorded by UntrackImageHead/UntrackImageTail and settled by the
+	// matching re-track before the fragment is watched again. Empty while the fragment
+	// is tracked (or was never released); nothing is recorded while the gate is off.
+	std::optional<uint64_t> head_hash;
+	std::optional<uint64_t> tail_hash;
 	ImageId          depth_id {};
 	// A stencil plane image was associated with this depth image (its depth_id names this one).
 	bool             stencil_associated = false;

@@ -225,7 +225,12 @@ public:
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferCached(uint64_t vaddr, uint64_t size,
 	                                                              bool is_written, bool is_texel_buffer,
 	                                                              BufferId id = {});
-	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
+	// Which source ObtainBufferForImage took for an image upload (NHL27UPSRC
+	// diagnostics): a registered buffer synchronized in place, a GPU-modified region
+	// obtained for download, or a direct read of the guest backing.
+	enum class ImageSource : uint8_t { RegisteredBuffer, GpuModified, GuestRead };
+	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size,
+	                                                                ImageSource* source = nullptr);
 	// A plain read ObtainBufferCached served from `buffer` when the registration generation was
 	// `registration` and the CPU modification generation `cpu_generation`: whether the same buffer
 	// and offset still hold (registration unchanged, range not CPU-modified since); touches it and

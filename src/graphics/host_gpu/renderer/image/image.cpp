@@ -857,6 +857,47 @@ uint64_t Image::HashGuestEdges() const {
 	return XXH3_64bits(bytes.data(), static_cast<size_t>(head_size + tail_size));
 }
 
+namespace {
+
+// The guest bytes of one edge fragment, hashed the way HashGuestEdges hashes: read
+// from the backing store and folded with XXH3. A fragment is at most one tracker page.
+uint64_t HashGuestFragment(uint64_t address, uint64_t size) {
+	std::array<uint8_t, TRACKER_PAGE_SIZE> bytes {};
+	if (size != 0 && !LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+		EXIT("Image: failed to hash guest backing\n");
+	}
+	return XXH3_64bits(bytes.data(), static_cast<size_t>(size));
+}
+
+} // namespace
+
+uint64_t Image::HashGuestHead() const {
+	const auto range = info.data;
+	// The fragment UntrackImageHead releases: the image's bytes up to the end of its
+	// first tracker page (the whole first page when the image starts on a boundary).
+	const uint64_t end = std::min(
+	    range.End(), Common::AlignDown(range.address + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE));
+	return HashGuestFragment(range.address, end - range.address);
+}
+
+uint64_t Image::HashGuestTail() const {
+	const auto range = info.data;
+	// The fragment UntrackImageTail releases: the image's bytes from the start of its
+	// last tracker page (clipped at the image start for images inside one page).
+	const uint64_t begin =
+	    std::max(range.address, Common::AlignDown(range.End(), TRACKER_PAGE_SIZE));
+	return HashGuestFragment(begin, range.End() - begin);
+}
+
+bool Image::GuestEdgesCoverImage() const {
+	const auto range = info.data;
+	// HashGuestEdges reads [address, AlignUp(address)) and [AlignDown(End), End); the
+	// two fragments meet -- cover the whole image -- exactly when the page boundary at
+	// or after the start is not before the page boundary at or before the end.
+	return Common::AlignUp(range.address, TRACKER_PAGE_SIZE) >=
+	       Common::AlignDown(range.End(), TRACKER_PAGE_SIZE);
+}
+
 Image::ShadowLevel& Image::ShadowLevelAt(uint32_t level) {
 	EXIT_IF(level >= backing.mip_levels);
 	if (m_shadow == nullptr) {

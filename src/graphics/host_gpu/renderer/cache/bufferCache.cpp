@@ -2586,7 +2586,8 @@ uint64_t BufferCache::TexelImageVersion(uint64_t vaddr) const {
 	return m_texture_cache.AddressBucketVersion(vaddr);
 }
 
-std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
+std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size,
+                                                               ImageSource* source) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
 	}
@@ -2596,13 +2597,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
 			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			if (source != nullptr) {
+				*source = ImageSource::RegisteredBuffer;
+			}
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
 	if (IsRegionGpuModified(vaddr, size)) {
+		if (source != nullptr) {
+			*source = ImageSource::GpuModified;
+		}
 		return ObtainBuffer(vaddr, size, false, false);
 	}
 
+	if (source != nullptr) {
+		*source = ImageSource::GuestRead;
+	}
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {

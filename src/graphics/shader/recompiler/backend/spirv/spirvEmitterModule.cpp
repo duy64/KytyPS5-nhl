@@ -288,28 +288,39 @@ void DefineDescriptors(EmitterState& state) {
 		if (counts[index] == 0) continue;
 		bindings.descriptor_mask |= uint64_t{1} << index;
 		const auto kind = static_cast<Kind>(index);
-		const auto Define = [&](uint32_t type, const char* name,
-		                        spv::StorageClass storage = spv::StorageClassStorageBuffer) {
+		const auto DefineBound = [&](uint32_t type, const char* name, uint32_t binding,
+		                             spv::StorageClass storage = spv::StorageClassStorageBuffer) {
 			const auto variable =
 			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 			state.builder.AddName(variable, name);
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0);
-			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding,
-			                            IR::NativeBinding(state.program.stage, kind));
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
 			return variable;
+		};
+		const auto Define = [&](uint32_t type, const char* name,
+		                        spv::StorageClass storage = spv::StorageClassStorageBuffer) {
+			return DefineBound(type, name, IR::NativeBinding(state.program.stage, kind), storage);
 		};
 		const auto ArrayType = [&](uint32_t type) {
 			return state.builder.Type(
 			    spv::OpTypeArray, type,
 			    ConstantU32(state, counts[index]));
 		};
-		// MoltenVK codegen option (shader.h): a program that accesses buffers at
-		// more than one element width gets one fixed-size descriptor array per
-		// width, all aliased at this kind's binding; SPIRV-Cross's discrete path
-		// (push descriptor sets under MoltenVK) cannot convert that. Emit the
-		// arrays runtime-sized so they convert as pointer aliases. Single-width
-		// programs and every non-MoltenVK run keep the fixed-size array.
+		// MoltenVK codegen options (shader.h): a program that accesses buffers at
+		// more than one element width gets one descriptor array per width.
+		// Aliased at this kind's binding, SPIRV-Cross's discrete path (push
+		// descriptor sets under MoltenVK) cannot convert two fixed-size arrays
+		// sharing a binding. The distinct-bindings option gives each width its
+		// own binding instead (IR::NativeBufferBinding), so the arrays stay
+		// fixed-size and nothing is aliased; it supersedes the runtime-sized
+		// option, whose arrays MoltenVK's registered binding counts make
+		// SPIRV-Cross read as fixed-size anyway. Single-width programs and
+		// every non-MoltenVK run keep the fixed-size array at the shared
+		// binding.
 		const auto BufferArrayType = [&](uint32_t type) {
+			if (ShaderMoltenVkDistinctBufferBindings()) {
+				return ArrayType(type);
+			}
 			if (ShaderMoltenVkRuntimeBufferArrays() &&
 			    (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics)) {
 				return state.builder.Type(spv::OpTypeRuntimeArray, type);
@@ -339,15 +350,19 @@ void DefineDescriptors(EmitterState& state) {
 				}
 				const std::array used {info.buffer_u8, info.buffer_u16, true, info.buffer_int64_atomics};
 				constexpr std::array names {"buffers_u8", "buffers_u16", "buffers", "buffers_u64"};
+				const bool distinct_bindings = ShaderMoltenVkDistinctBufferBindings();
 				for (uint32_t alias = 0; alias < used.size(); ++alias) {
 					if (!used[alias]) continue;
 					auto& buffer = state.storage_buffers[alias];
 					const auto type = StorageBufferType(state, buffer, 8u << alias);
-					buffer.variable = Define(BufferArrayType(type), names[alias]);
+					buffer.variable = DefineBound(
+					    BufferArrayType(type), names[alias],
+					    IR::NativeBufferBinding(state.program.stage, alias, distinct_bindings));
 					if (group_read_only) {
 						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationNonWritable);
 					}
-					if (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics) {
+					if (!distinct_bindings &&
+					    (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics)) {
 						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationAliased);
 					}
 					// RDNA2 stores publish to L2 even without GLC; every alias of the buffer

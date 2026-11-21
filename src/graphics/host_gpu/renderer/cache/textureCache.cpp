@@ -297,6 +297,7 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 		RegisterImage(id);
 		BumpGeneration(info.data.address, info.data.address + info.data.size);
 	}
+	m_slot_images[id].OpNote(OpRingKind::Create, info.data.address, info.data.size);
 
 	return id;
 }
@@ -934,6 +935,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
 		}
+		destination.OpNote(OpRingKind::CopyIn, source.info.data.address, source.info.data.size);
 		return;
 	}
 	const bool source_depth = source.info.IsDepth();
@@ -959,6 +961,7 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		destination.MarkGpuModified();
 	}
 	destination.ClearBufferModified();
+	destination.OpNote(OpRingKind::CopyIn, source.info.data.address, source.info.data.size);
 }
 
 void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
@@ -977,6 +980,7 @@ void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint3
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
+	destination.OpNote(OpRingKind::CopyIn, source.info.data.address, source.info.data.size);
 }
 
 bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, BindingType binding,
@@ -1509,6 +1513,7 @@ void TextureCache::InitializeImage(ImageId id) {
 		if (FrameDump::Enabled()) {
 			FrameDump::NoteTextureUpload(image.info);
 		}
+		image.OpNote(OpRingKind::Upload, image.info.data.address, image.info.data.size);
 		image.ClearBufferModified();
 	}
 	if (image.IsCpuDirty()) {
@@ -2208,6 +2213,11 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 			}
 		}
 	}
+	if (desc.type == BindingType::Texture && !image.op_ring.sampled_since_write) {
+		image.OpNote(image.op_ring.ever_written ? OpRingKind::SampledAfterWrite
+		                                        : OpRingKind::SampledBeforeWrite,
+		             desc.info.data.address, desc.info.data.size);
+	}
 	switch (desc.type) {
 		case BindingType::Texture: break;
 		case BindingType::Storage:
@@ -2329,6 +2339,7 @@ void TextureCache::CommitGpuWrite(Image& image) {
 		image.RefreshComplete();
 	}
 	image.MarkGpuModified();
+	image.OpNote(OpRingKind::GpuWrite, image.info.data.address, image.info.data.size);
 }
 
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
@@ -2775,6 +2786,67 @@ void TextureCache::LogReadbackWindow() {
 	m_rb_drain_ns = 0;
 }
 
+static const char* OpRingKindName(OpRingKind kind) {
+	switch (kind) {
+		case OpRingKind::Create: return "CREATE";
+		case OpRingKind::Upload: return "UPLOAD";
+		case OpRingKind::CopyIn: return "COPY_IN";
+		case OpRingKind::BufferWrite: return "BUFFER_WRITE";
+		case OpRingKind::GpuWrite: return "GPU_WRITE";
+		case OpRingKind::ResolveIn: return "RESOLVE_IN";
+		case OpRingKind::SampledAfterWrite: return "SAMPLED_AFTER_WRITE";
+		case OpRingKind::SampledBeforeWrite: return "SAMPLED_BEFORE_WRITE";
+	}
+	return "UNKNOWN";
+}
+
+std::string TextureCache::DumpOpRingText() {
+	if (!OpRingEnabled()) {
+		return {};
+	}
+	std::scoped_lock lock {m_lock};
+	std::string      out;
+	char             line[512];
+	const auto       append_line = [&out, &line](int written) {
+		if (written > 0) {
+			out.append(line, static_cast<size_t>(std::min(written, static_cast<int>(sizeof(line)) - 1)));
+		}
+	};
+	append_line(std::snprintf(line, sizeof(line),
+	                          "# KyTy op-ring dump (KYTY_OPRING): per-image operation history, "
+	                          "oldest first.\n"
+	                          "# seq is one global operation counter across all images; a/b are "
+	                          "op-specific guest addresses and sizes.\n"));
+	append_line(std::snprintf(line, sizeof(line), "# flip=%llu global_seq=%llu\n",
+	                          static_cast<unsigned long long>(BufferCache::PerfFlipCount()),
+	                          static_cast<unsigned long long>(OpRingCurrentSeq())));
+	m_slot_images.ForEach([&](ImageId id, Image& image) {
+		const auto& ring = image.op_ring;
+		if (ring.total == 0) {
+			return;
+		}
+		append_line(std::snprintf(
+		    line, sizeof(line),
+		    "IMAGE slot=%u gen=%u addr=0x%llx size=0x%llx fmt=%s %ux%u ops=%llu ever_written=%u\n",
+		    id.index, id.generation, static_cast<unsigned long long>(image.info.data.address),
+		    static_cast<unsigned long long>(image.info.data.size),
+		    vk::to_string(image.info.pixel_format).c_str(), image.info.extent.width,
+		    image.info.extent.height, static_cast<unsigned long long>(ring.total),
+		    ring.ever_written ? 1u : 0u));
+		const uint32_t stored =
+		    static_cast<uint32_t>(std::min<uint64_t>(ring.total, OpRing::kSize));
+		for (uint32_t i = 0; i < stored; ++i) {
+			const auto& entry = ring.entries[(ring.next + OpRing::kSize - stored + i) % OpRing::kSize];
+			append_line(std::snprintf(line, sizeof(line), "  seq=%llu kind=%s a=0x%llx b=0x%llx\n",
+			                          static_cast<unsigned long long>(entry.seq),
+			                          OpRingKindName(entry.kind),
+			                          static_cast<unsigned long long>(entry.a),
+			                          static_cast<unsigned long long>(entry.b)));
+		}
+	});
+	return out;
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	// Only images starting at the address change, and every written storage-buffer bind asks:
 	// the start-address filter answers most without the lock and the page walk.
@@ -2791,6 +2863,7 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 			image.ClearGpuModified();
 		}
 		image.MarkBufferModified();
+		image.OpNote(OpRingKind::BufferWrite, address, size);
 	}
 }
 

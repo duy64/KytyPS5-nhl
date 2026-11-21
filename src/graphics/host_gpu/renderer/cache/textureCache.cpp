@@ -2794,6 +2794,35 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	}
 }
 
+void TextureCache::PrepareBufferWrite(uint64_t address, uint64_t size) {
+	// Upstream PR 2225: InvalidateMemoryFromGPU reaches only an image based at the address, so a
+	// copy into the middle of an image left its texels untouched and later samples read the old
+	// contents. CP copies and fills are rare next to storage binds, so the page walk is affordable.
+	if (!GuestRange {address, size}.Valid()) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto id: FindImagesInRegion(address, size, false)) {
+		auto* owner = m_slot_images.try_get(id);
+		if (owner == nullptr) {
+			continue;
+		}
+		auto&       image    = *owner;
+		const auto& data     = image.info.data;
+		const bool  readable = !image.depth_id && CanDownload(image);
+		if (!readable && data.address != address) {
+			continue;
+		}
+		const bool covered = address <= data.address && data.End() <= address + size;
+		// Publish downloads the image into the buffer cache and marks it buffer-modified.
+		if (readable && !covered && image.SafeToDownload() && BcAlias::Publish(*this, image)) {
+			continue;
+		}
+		image.ClearGpuModified();
+		image.MarkBufferModified();
+	}
+}
+
 bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return false;

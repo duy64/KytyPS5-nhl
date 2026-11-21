@@ -124,6 +124,11 @@ public:
 	                                        uint32_t packed_clear);
 	void               InvalidateMemory(uint64_t address, uint64_t size);
 	void               InvalidateMemoryFromGPU(uint64_t address, uint64_t size);
+	// Before a CP DMA copy or fill writes [address, address + size) through the buffer cache:
+	// every image the range overlaps re-uploads from the buffer. A GPU-written image the write
+	// covers only in part first publishes its texels into the buffer, so its other texels survive.
+	// Images that cannot be read back keep the base-address rule of InvalidateMemoryFromGPU.
+	void               PrepareBufferWrite(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionRegistered(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsRegionGpuModified(uint64_t address, uint64_t size);
 	[[nodiscard]] bool HasImagesInRegion(uint64_t address, uint64_t size);

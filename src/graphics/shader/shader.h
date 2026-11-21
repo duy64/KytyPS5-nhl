@@ -60,6 +60,24 @@ inline std::atomic<bool> g_shader_moltenvk_runtime_buffer_arrays {false};
 [[nodiscard]] inline bool ShaderMoltenVkRuntimeBufferArrays() {
 	return g_shader_moltenvk_runtime_buffer_arrays.load(std::memory_order_relaxed);
 }
+// Codegen option: give each buffer-width descriptor array its own binding
+// (IR::NativeBufferBinding) instead of aliasing all widths at the Buffers
+// binding, keeping the arrays fixed-size. The runtime-sized option above does
+// not survive MoltenVK's conversion: set 0 is a push descriptor set, and
+// SPIRV-Cross's discrete path resolves a runtime array's size from the count
+// MoltenVK registered for the binding (the layout's descriptorCount, never
+// zero), so the array reads as fixed-size and the alias check throws anyway
+// (build #221 field test). With distinct bindings no two width variables share
+// a (set, binding), so there is nothing to alias; this option supersedes the
+// runtime-sized one wherever both are set. The descriptor layout and the
+// per-draw descriptor writes follow the same bindings (shaders.cpp,
+// descriptors.cpp). Set at device creation in vulkanWindow.cpp on Apple builds
+// only, where the macOS build always runs on MoltenVK; never set on any other
+// ICD, where codegen, layouts and writes are bit-identical to before.
+inline std::atomic<bool> g_shader_moltenvk_distinct_buffer_bindings {false};
+[[nodiscard]] inline bool ShaderMoltenVkDistinctBufferBindings() {
+	return g_shader_moltenvk_distinct_buffer_bindings.load(std::memory_order_relaxed);
+}
 // Codegen option: experiment ExecSelects (IR::EliminateExecSelects) and its rule set
 // (KYTY_DBG_EXECSEL_MODE, default 16). Part of every stage key: 0 when off.
 [[nodiscard]] inline uint32_t ShaderExecSelects() {

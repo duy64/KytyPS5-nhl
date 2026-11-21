@@ -62,6 +62,19 @@ bool ReadbackStillsEnabled() {
 	return value == nullptr || value[0] != '0';
 }
 
+// KYTY_FULL_UPLOAD=0 restores the base dirty-flag skip behaviour. Default on: a
+// still image is always uploaded completely (UploadImage already copies every
+// level and layer); the gate only removes the paths that can skip that upload --
+// a fresh image whose dirty flags were cleared without an upload, and a guest
+// rewrite the head/tail edge hash cannot see.
+bool FullUploadEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_FULL_UPLOAD");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
 [[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
                                   vk::ClearColorValue& clear) {
 	const auto& metadata = desc.info.metadata;
@@ -229,6 +242,10 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 	return image.usage.storage ? BindingType::Storage : BindingType::Texture;
 }
 
+bool TextureCache::IsStillImage(const Image& image) {
+	return !image.depth_id && UploadBinding(image) == BindingType::Texture;
+}
+
 namespace {
 inline void GenCount(std::atomic<uint64_t>& counter) noexcept {
 	if (FrameBreakdown::Verbose()) counter.fetch_add(1, std::memory_order_relaxed);
@@ -293,6 +310,11 @@ ImageId TextureCache::InsertImage(const ImageInfo& info) {
 	// guest data are never registered, so no T# lookup can find them.
 	GenCount(FrameBreakdown::g_delta.gen_insert);
 	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	if (FullUploadEnabled() && info.samples == 1) {
+		// InitializeImage never uploads multisample images, so only single-sample
+		// images can owe the guaranteed upload.
+		m_full_upload_pending.insert(id);
+	}
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 		BumpGeneration(info.data.address, info.data.address + info.data.size);
@@ -430,6 +452,7 @@ void TextureCache::DeleteImage(ImageId id) {
 		EXIT("TextureCache: deleting a GPU-modified image without resolving its contents\n");
 	}
 	m_download_images.erase(id);
+	m_full_upload_pending.erase(id);
 	if (image->info.metadata.kind == ImageMetadataKind::Htile) {
 		m_surface_metas.erase(image->info.metadata.range.address);
 	}
@@ -958,6 +981,8 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	if (source.IsGpuModified()) {
 		destination.MarkGpuModified();
 	}
+	// A complete image copy defines the destination; no guest upload is owed.
+	m_full_upload_pending.erase(destination_id);
 	destination.ClearBufferModified();
 }
 
@@ -1496,7 +1521,11 @@ void TextureCache::InitializeImage(ImageId id) {
 	if (image.info.samples > 1) {
 		return;
 	}
-	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	const bool dirty = image.IsBufferModified() || image.IsCpuDirty();
+	// KYTY_FULL_UPLOAD: a still uploads even when its dirty flags are already
+	// clear; UploadImage copies every level and layer, so the upload is complete.
+	const bool full_upload = FullUploadEnabled() && IsStillImage(image);
+	const bool upload      = dirty || full_upload;
 	if (upload) {
 		const auto [source, source_offset] =
 		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
@@ -1510,6 +1539,13 @@ void TextureCache::InitializeImage(ImageId id) {
 			FrameDump::NoteTextureUpload(image.info);
 		}
 		image.ClearBufferModified();
+		if (full_upload && m_full_upload_pending.erase(id) != 0 && !dirty) {
+			// The gate, not the dirty flags, produced this upload: without it the
+			// image's first complete upload would have been skipped entirely.
+			std::printf("NHL27FULLUP: addr=0x%llx size=0x%llx\n",
+			            static_cast<unsigned long long>(image.info.data.address),
+			            static_cast<unsigned long long>(image.info.data.size));
+		}
 	}
 	if (image.IsCpuDirty()) {
 		image.RefreshComplete();
@@ -1789,10 +1825,17 @@ void TextureCache::RefreshImage(ImageId id) {
 		return;
 	}
 	TrackImage(id);
-	if (image.IsMaybeCpuDirty()) {
+	const bool maybe_dirty = image.IsMaybeCpuDirty();
+	if (maybe_dirty) {
 		(void)image.ResolveMaybeCpuHash(image.HashGuestEdges());
 	}
 	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
+	if (!cpu_dirty && maybe_dirty && FullUploadEnabled() && IsStillImage(image)) {
+		// The edge hash covers only the first and last page fragments of the guest
+		// range; for a still it cannot prove the interior is current, so a guest
+		// rewrite it cannot see still earns one complete upload.
+		cpu_dirty = true;
+	}
 	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
 		if (cpu_dirty) {
 			EXIT("TextureCache: compressed guest image refresh is unsupported\n");
@@ -1800,6 +1843,19 @@ void TextureCache::RefreshImage(ImageId id) {
 		return;
 	}
 	if (!cpu_dirty) {
+		// KYTY_FULL_UPLOAD: a still created since its last refresh is owed one
+		// complete upload at first bind even when every dirty flag is already
+		// clear -- PrepareImageCopy and CommitGpuWrite clear them for copies and
+		// GPU writes, and a copy that never happens leaves the flags clear with
+		// no guest data ever uploaded. Images first refreshed as a GPU target
+		// are not stills by then and simply drop out of the set.
+		if (FullUploadEnabled() && m_full_upload_pending.contains(id)) {
+			if (IsStillImage(image)) {
+				InitializeImage(id);
+			} else {
+				m_full_upload_pending.erase(id);
+			}
+		}
 		return;
 	}
 	FrameBreakdown::TexAdd(FrameBreakdown::g_tex.uploads);

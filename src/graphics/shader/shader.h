@@ -45,6 +45,21 @@ inline std::atomic<bool> g_shader_moltenvk_scalar_subgroups {false};
 [[nodiscard]] inline bool ShaderMoltenVkScalarSubgroups() {
 	return g_shader_moltenvk_scalar_subgroups.load(std::memory_order_relaxed);
 }
+// Codegen option: emit a program's buffer-width descriptor arrays runtime-sized
+// instead of fixed-size when the program accesses buffers at more than one element
+// width (the buffers_u8 / buffers_u16 / buffers / buffers_u64 views alias one
+// binding). MoltenVK serves the renderer's descriptor set 0 as a push descriptor
+// set, which SPIRV-Cross converts through its discrete-descriptor path; that path
+// rejects two fixed-size arrays aliased at one binding ("Attempting to alias same
+// binding with a descriptor array ... This is unsupported") and pipeline creation
+// fails. Runtime-sized arrays take the pointer-alias route instead and convert.
+// Set at device creation in vulkanWindow.cpp on Apple builds only, where the macOS
+// build always runs on MoltenVK; never set on any other ICD, where codegen is
+// bit-identical to before.
+inline std::atomic<bool> g_shader_moltenvk_runtime_buffer_arrays {false};
+[[nodiscard]] inline bool ShaderMoltenVkRuntimeBufferArrays() {
+	return g_shader_moltenvk_runtime_buffer_arrays.load(std::memory_order_relaxed);
+}
 // Codegen option: experiment ExecSelects (IR::EliminateExecSelects) and its rule set
 // (KYTY_DBG_EXECSEL_MODE, default 16). Part of every stage key: 0 when off.
 [[nodiscard]] inline uint32_t ShaderExecSelects() {

@@ -303,6 +303,19 @@ void DefineDescriptors(EmitterState& state) {
 			    spv::OpTypeArray, type,
 			    ConstantU32(state, counts[index]));
 		};
+		// MoltenVK codegen option (shader.h): a program that accesses buffers at
+		// more than one element width gets one fixed-size descriptor array per
+		// width, all aliased at this kind's binding; SPIRV-Cross's discrete path
+		// (push descriptor sets under MoltenVK) cannot convert that. Emit the
+		// arrays runtime-sized so they convert as pointer aliases. Single-width
+		// programs and every non-MoltenVK run keep the fixed-size array.
+		const auto BufferArrayType = [&](uint32_t type) {
+			if (ShaderMoltenVkRuntimeBufferArrays() &&
+			    (info.buffer_u8 || info.buffer_u16 || info.buffer_int64_atomics)) {
+				return state.builder.Type(spv::OpTypeRuntimeArray, type);
+			}
+			return ArrayType(type);
+		};
 		switch (kind) {
 			case IR::DescriptorBindingKind::Buffers: {
 				// KYTY_READONLY_BUFFERS=1: the array is one variable, so it is NonWritable only if
@@ -330,7 +343,7 @@ void DefineDescriptors(EmitterState& state) {
 					if (!used[alias]) continue;
 					auto& buffer = state.storage_buffers[alias];
 					const auto type = StorageBufferType(state, buffer, 8u << alias);
-					buffer.variable = Define(ArrayType(type), names[alias]);
+					buffer.variable = Define(BufferArrayType(type), names[alias]);
 					if (group_read_only) {
 						state.builder.AddAnnotation(spv::OpDecorate, buffer.variable, spv::DecorationNonWritable);
 					}

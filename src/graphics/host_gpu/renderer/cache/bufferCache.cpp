@@ -499,6 +499,22 @@ bool BufferCache::TryGetGpuFill(uint64_t vaddr, uint64_t size, uint32_t& value) 
 	return false;
 }
 
+// NHL27G5 diagnostic (g5count line): count ObtainMemo hits whose range is GPU-modified at
+// hit time. The memo's hit condition tracks CPU dirtiness and epochs but never GPU writes
+// (coherence audit gap G5); both sibling memos check GPU-write state. Sampled 1-in-64 so
+// the tracker query cannot distort the session. Counting only - the memo still serves
+// every hit exactly as before. KYTY_G5COUNT=0 disables.
+static bool G5CountEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_G5COUNT");
+		return v == nullptr || v[0] != '0';
+	}();
+	return enabled;
+}
+static std::atomic<uint64_t> g_g5_memo_hits{0};
+static std::atomic<uint64_t> g_g5_sampled{0};
+static std::atomic<uint64_t> g_g5_stale{0};
+
 void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 	// Without whole pages the tracker could drop ownership of unrelated bytes. Leave the range
 	// dirty instead; the caller's invalidation then performs the ordinary download.
@@ -2373,6 +2389,30 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    (memo->cpu_epoch == cpu_epoch || !m_memory_tracker.IsRegionCpuModified(vaddr, size))) {
 			memo->cpu_epoch = cpu_epoch;
 			if (texel_read) memo->image_version = image_version;
+			if (G5CountEnabled()) {
+				const uint64_t g5_hit = g_g5_memo_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+				if ((g5_hit & 63u) == 0) {
+					g_g5_sampled.fetch_add(1, std::memory_order_relaxed);
+					if (IsRegionGpuModified(vaddr, size)) {
+						const uint64_t g5_stale =
+						    g_g5_stale.fetch_add(1, std::memory_order_relaxed) + 1;
+						if (g5_stale <= 10) {
+							std::printf("NHL27G5: stale memo hit #%llu vaddr=0x%llx size=%llu hits=%llu "
+							            "sampled=%llu\n",
+							            (unsigned long long)g5_stale, (unsigned long long)vaddr,
+							            (unsigned long long)size, (unsigned long long)g5_hit,
+							            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed));
+							std::fflush(stdout);
+						}
+					}
+				}
+				if ((g5_hit & 0xFFFFu) == 0) {
+					std::printf("NHL27G5: hits=%llu sampled=%llu stale=%llu\n", (unsigned long long)g5_hit,
+					            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed),
+					            (unsigned long long)g_g5_stale.load(std::memory_order_relaxed));
+					std::fflush(stdout);
+				}
+			}
 			auto& buffer = m_slot_buffers[memo->id];
 			TouchBuffer(buffer);
 			return {&buffer, memo->offset};

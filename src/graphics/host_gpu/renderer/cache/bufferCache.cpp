@@ -1884,7 +1884,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			uint64_t download_size  = size;
 			if (is_write && !on_gpu && !lazy &&
 			    Common::Experiments::Enabled(Common::Experiments::WideWriteDownloads)) {
-				constexpr uint64_t Window = 16 * TRACKER_PAGE_SIZE;
+				constexpr uint64_t Window = 64 * TRACKER_PAGE_SIZE;
 				const auto begin = std::max(vaddr & ~(Window - 1), buffer.CpuAddress());
 				const auto end   = std::min((vaddr + size + Window - 1) & ~(Window - 1),
 				                            buffer.CpuAddress() + buffer.Size());

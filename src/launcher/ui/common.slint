@@ -366,8 +366,8 @@ export component Selector inherits Rectangle {
                     item-touch := TouchArea {
                         clicked => {
                             root.current-index = i;
-                            popup.close();
                             root.selected(i);
+                            popup.close();
                         }
                     }
                 }

@@ -521,7 +521,10 @@ private:
 		uint64_t size         = 0;
 		uint64_t buffer_epoch = 0;
 		uint64_t cpu_epoch    = 0;
-		uint64_t offset       = 0;
+		// m_gpu_write_generation when the answer was found; any GPU write since (the
+		// generation every GPU-write path advances) makes the answer stale (gap G5).
+		uint64_t write_generation = 0;
+		uint64_t offset           = 0;
 		BufferId id;
 		bool     texel = false; // a formatted read, while no image started at the address
 		// TextureCache::AddressIndexVersion() when no image started at the address (texel).

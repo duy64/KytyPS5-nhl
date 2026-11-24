@@ -95,6 +95,42 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 
 } // namespace
 
+// NHL27PKT diagnostic (pktsync line): count the guest's GPU sync packets as the command
+// processor executes them, and log the decoded fields of the first few of each kind. On
+// real PS5 hardware, GPU-write visibility is explicit: RELEASE_MEM flushes/writes back
+// the GPU caches named by its GCR_CNTL bits and writes an end-of-pipe fence, ACQUIRE_MEM
+// invalidates for the consumer, and DMA_DATA moves bytes between guest addresses. None
+// of the three carries an address range for the writes it publishes (RELEASE_MEM's
+// address is the fence label, ACQUIRE_MEM carries no range at all) - the roadmap
+// question is whether NHL 27 emits them at all and in what mix, which decides whether a
+// future fix can key invalidation off the packets instead of page faults alone.
+// Counting only - every handler behaves exactly as before. KYTY_PKTSYNC=0 disables.
+static bool PktSyncEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_PKTSYNC");
+		return v == nullptr || v[0] != '0';
+	}();
+	return enabled;
+}
+static std::atomic<uint64_t> g_pkt_release_mem{0};
+static std::atomic<uint64_t> g_pkt_acquire_mem{0};
+static std::atomic<uint64_t> g_pkt_dma_data{0};
+static std::atomic<uint64_t> g_pkt_total{0};
+
+// One summary line per 65,536 executed sync packets of any kind: at the guest's
+// label-release rate (tens of thousands per second in the worst stretches) that is at
+// most about a line a second in bursts, and any real session still yields many lines.
+static void PktSyncSummaryTick() {
+	const uint64_t total = g_pkt_total.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((total & 0xFFFFu) == 0) {
+		std::printf("NHL27PKT: rel=%llu acq=%llu dma=%llu\n",
+		            (unsigned long long)g_pkt_release_mem.load(std::memory_order_relaxed),
+		            (unsigned long long)g_pkt_acquire_mem.load(std::memory_order_relaxed),
+		            (unsigned long long)g_pkt_dma_data.load(std::memory_order_relaxed));
+		std::fflush(stdout);
+	}
+}
+
 static HW::BlendControl DecodeBlendControl(uint32_t value) {
 	HW::BlendControl r {};
 
@@ -1288,6 +1324,19 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800 && cmd_id != 0xc0061050);
+	if (PktSyncEnabled()) {
+		const uint64_t n = g_pkt_acquire_mem.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 10) {
+			// The handler decodes no fields today; log the raw leading payload dwords so
+			// a session shows what the guest actually sends.
+			std::printf("NHL27PKT: acquire_mem #%llu cmd_id=0x%08llx dw0=0x%08llx "
+			            "dw1=0x%08llx\n",
+			            (unsigned long long)n, (unsigned long long)cmd_id,
+			            (unsigned long long)buffer[0], (unsigned long long)buffer[1]);
+			std::fflush(stdout);
+		}
+		PktSyncSummaryTick();
+	}
 	BufferCache::PerfCount(BufferCache::PerfEvent::AcquireMem);
 	if (BufferCache::GuestSyncOnly()) {
 		// Without the automatic per-dispatch barriers, the guest's cache acquire is the point
@@ -1549,6 +1598,10 @@ KYTY_CP_OP_PARSER(CpOpDmaData) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(7, Pm4::IT_DMA_DATA, 0u));
+	if (PktSyncEnabled()) {
+		g_pkt_dma_data.fetch_add(1, std::memory_order_relaxed);
+		PktSyncSummaryTick();
+	}
 
 	const uint32_t control  = buffer[0];
 	const uint32_t control2 = buffer[5];
@@ -2326,6 +2379,23 @@ KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	    reinterpret_cast<void*>(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u));
 	uint64_t value                = buffer[4] | (static_cast<uint64_t>(buffer[5]) << 32u);
 	uint32_t interrupt_context_id = buffer[6] & 0x07ffffffu;
+
+	if (PktSyncEnabled()) {
+		const uint64_t n = g_pkt_release_mem.fetch_add(1, std::memory_order_relaxed) + 1;
+		if (n <= 10) {
+			// No range is logged because the packet carries none: dst is the fence
+			// label address, and gcr names the caches the guest asked to flush.
+			std::printf("NHL27PKT: release_mem #%llu dst=0x%llx value=0x%llx data_sel=%llu "
+			            "gcr=0x%03llx eop=0x%02llx release_dst=%llu int_sel=%llu\n",
+			            (unsigned long long)n,
+			            (unsigned long long)(buffer[2] | (static_cast<uint64_t>(buffer[3]) << 32u)),
+			            (unsigned long long)value, (unsigned long long)data_sel,
+			            (unsigned long long)gcr_cntl, (unsigned long long)eop_event_type,
+			            (unsigned long long)release_dst, (unsigned long long)interrupt_selector);
+			std::fflush(stdout);
+		}
+		PktSyncSummaryTick();
+	}
 
 	constexpr uint32_t ReleaseMemDstMemory = 0;
 	constexpr uint32_t ReleaseMemDstTcL2   = 1;

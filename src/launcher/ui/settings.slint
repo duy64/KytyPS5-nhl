@@ -295,8 +295,8 @@ component GameConfigRowView inherits Rectangle {
                             none-hover := TouchArea {
                                 clicked => {
                                     if (root.game.pinned) {
-                                        emu-popup.close();
                                         root.set-emu-none();
+                                        emu-popup.close();
                                     }
                                 }
                             }
@@ -315,8 +315,8 @@ component GameConfigRowView inherits Rectangle {
                             pick-hover := TouchArea {
                                 clicked => {
                                     if (root.game.can-config) {
-                                        emu-popup.close();
                                         root.set-emu-pick();
+                                        emu-popup.close();
                                     }
                                 }
                             }

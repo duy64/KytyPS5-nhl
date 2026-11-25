@@ -243,6 +243,12 @@ private:
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
+	// NHL27PK2 diagnostic: the CP thread's read of the buffer-cache write generation,
+	// so the acquire counter can tell whether a GPU write intervened since the previous
+	// ACQUIRE_MEM. Same pattern as GetScheduler() above; read-only, no behaviour change.
+	[[nodiscard]] uint64_t GetGpuWriteGeneration() const {
+		return m_renderer.GetBufferCache().GpuWriteGeneration();
+	}
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	// Producer side: operations carry the register state and the CP state they need.

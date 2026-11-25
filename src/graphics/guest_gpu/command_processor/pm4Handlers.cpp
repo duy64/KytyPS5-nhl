@@ -95,6 +95,88 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 
 } // namespace
 
+// NHL27PK2 diagnostic (pktsync2 line): decode the guest's ACQUIRE_MEM packets as the
+// command processor executes them and measure the three unknowns the step-3 fix depends
+// on: (1) what GCR bits the game's acquires carry (buffer[6] was never logged), (2) the
+// size distribution beyond the startup-biased first 10, (3) how often a GPU write
+// intervened since the previous acquire (the gate that decides whether the fix's
+// generation bump is perf-neutral or memo churn). Counter only - every handler behaves
+// exactly as before. KYTY_PKTSYNC2=0 disables.
+//
+// GCR bit positions are NOT decoded into named INV/WB bits here: the Mesa S_586_* map
+// could not be verified against a primary source in the time available, and the
+// RELEASE_MEM map must not be reused (the two packets encode GCR differently - see the
+// design brief). gcr_cntl is logged raw (hex); the summary splits zero vs nonzero only.
+// The fix author decodes the raw values with the session data in hand.
+static bool PktSync2Enabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_PKTSYNC2");
+		return v == nullptr || v[0] != '0';
+	}();
+	return enabled;
+}
+static std::atomic<uint64_t> g_pk2_acquire{0};
+static std::atomic<uint64_t> g_pk2_form_8dw{0};
+static std::atomic<uint64_t> g_pk2_form_7dw{0};
+static std::atomic<uint64_t> g_pk2_form_1050{0};
+static std::atomic<uint64_t> g_pk2_size_le1k{0};
+static std::atomic<uint64_t> g_pk2_size_le1m{0};
+static std::atomic<uint64_t> g_pk2_size_full{0};
+static std::atomic<uint64_t> g_pk2_size_other{0};
+static std::atomic<uint64_t> g_pk2_small_256{0};
+static std::atomic<uint64_t> g_pk2_small_1k{0};
+static std::atomic<uint64_t> g_pk2_small_64k{0};
+static std::atomic<uint64_t> g_pk2_small_1m{0};
+static std::atomic<uint64_t> g_pk2_gcr_zero{0};
+static std::atomic<uint64_t> g_pk2_gcr_nonzero{0};
+static std::atomic<uint64_t> g_pk2_gate_write{0};
+static std::atomic<uint64_t> g_pk2_gate_nowrite{0};
+static std::atomic<uint64_t> g_pk2_last_generation{0};
+static std::atomic<uint64_t> g_pk2_logged_1050{0};
+// Barrier-window baselines. Plain loads, never FrameBreakdown::Take(): Take() zeroes
+// the counters and would steal NHL27PORT's per-frame barrier counts.
+static uint64_t g_pk2_bar_exec_last{0};
+static uint64_t g_pk2_bar_skip_last{0};
+
+// One summary line per 65,536 acquires: at ~15.6k acquires/sec that is about a line
+// every 4 seconds, and any real session still yields many lines. bar_exec/bar_skip are
+// deltas within the window (since the previous NHL27PK2 line).
+static void PktSync2SummaryTick(uint64_t total) {
+	if ((total & 0xFFFFu) != 0) {
+		return;
+	}
+	const uint64_t bar_exec_now =
+	    FrameBreakdown::g_counters.port_guest_barriers.load(std::memory_order_relaxed);
+	const uint64_t bar_skip_now =
+	    FrameBreakdown::g_counters.port_guest_barriers_skipped.load(std::memory_order_relaxed);
+	const uint64_t bar_exec = bar_exec_now - g_pk2_bar_exec_last;
+	const uint64_t bar_skip = bar_skip_now - g_pk2_bar_skip_last;
+	g_pk2_bar_exec_last = bar_exec_now;
+	g_pk2_bar_skip_last = bar_skip_now;
+	std::printf("NHL27PK2: acq=%llu form8=%llu form7=%llu form1050=%llu size_le1k=%llu "
+	            "size_le1m=%llu size_full=%llu size_other=%llu small_256=%llu small_1k=%llu "
+	            "small_64k=%llu small_1m=%llu gcr_zero=%llu gcr_nonzero=%llu gate_write=%llu "
+	            "gate_nowrite=%llu bar_exec=%llu bar_skip=%llu\n",
+	            (unsigned long long)total,
+	            (unsigned long long)g_pk2_form_8dw.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_form_7dw.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_form_1050.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_size_le1k.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_size_le1m.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_size_full.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_size_other.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_small_256.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_small_1k.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_small_64k.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_small_1m.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_gcr_zero.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_gcr_nonzero.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_gate_write.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pk2_gate_nowrite.load(std::memory_order_relaxed),
+	            (unsigned long long)bar_exec, (unsigned long long)bar_skip);
+	std::fflush(stdout);
+}
+
 static HW::BlendControl DecodeBlendControl(uint32_t value) {
 	HW::BlendControl r {};
 
@@ -1288,6 +1370,132 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800 && cmd_id != 0xc0061050);
+	if (PktSync2Enabled()) {
+		const uint64_t n = g_pk2_acquire.fetch_add(1, std::memory_order_relaxed) + 1;
+		// Intervening-write gate: did a GPU write happen since the previous acquire?
+		// Same single-load-and-compare the fix will use; here it only classifies.
+		const uint64_t gen = cp.GetGpuWriteGeneration();
+		const uint64_t last_gen = g_pk2_last_generation.load(std::memory_order_relaxed);
+		bool write_since_prev = false;
+		if (gen != last_gen) {
+			g_pk2_gate_write.fetch_add(1, std::memory_order_relaxed);
+			g_pk2_last_generation.store(gen, std::memory_order_relaxed);
+			write_since_prev = true;
+		} else {
+			g_pk2_gate_nowrite.fetch_add(1, std::memory_order_relaxed);
+		}
+		const bool sample = (n <= 10) || ((n & 0x3FFu) == 0);
+		if (cmd_id == 0xc0065800) {
+			// 8-dword GFX10+ form (AgcDcbAcquireMem, libs/agc.cpp:2935-2964):
+			// buffer[0] = engine<<31 | cb_db_op; [1..2] = CP_COHER_SIZE (256-byte
+			// units, low then high 8); [3..4] = CP_COHER_BASE (same units);
+			// [5] = poll; [6] = gcr_cntl. The header check guarantees 7 payload
+			// dwords, so all reads below are in bounds.
+			g_pk2_form_8dw.fetch_add(1, std::memory_order_relaxed);
+			const uint32_t engine = buffer[0] >> 31u;
+			const uint32_t cb_db_op = buffer[0] & 0x06007fc0u;
+			const uint32_t size_lo = buffer[1];
+			const uint64_t size =
+			    (static_cast<uint64_t>(buffer[1]) |
+			     (static_cast<uint64_t>(buffer[2] & 0xffu) << 32u))
+			    << 8u;
+			const uint64_t base =
+			    (static_cast<uint64_t>(buffer[3]) |
+			     (static_cast<uint64_t>(buffer[4]) << 32u))
+			    << 8u;
+			const uint32_t gcr_cntl = buffer[6] & 0x7ffffu;
+			if (size_lo == 0xffffffffu) {
+				g_pk2_size_full.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= 1024) {
+				g_pk2_size_le1k.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= (1u << 20)) {
+				g_pk2_size_le1m.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				g_pk2_size_other.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (size <= 256) {
+				g_pk2_small_256.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= 1024) {
+				g_pk2_small_1k.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= 65536) {
+				g_pk2_small_64k.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= (1u << 20)) {
+				g_pk2_small_1m.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (gcr_cntl == 0) {
+				g_pk2_gcr_zero.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				g_pk2_gcr_nonzero.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (sample) {
+				std::printf("NHL27PK2: acquire_mem #%llu form=8dw cmd_id=0x%08llx "
+				            "engine=%u cb_db_op=0x%08x base=0x%llx size=0x%llx "
+				            "size_lo=0x%08x gcr=0x%05x poll=%u write_since_prev=%u\n",
+				            (unsigned long long)n, (unsigned long long)cmd_id, engine,
+				            cb_db_op, (unsigned long long)base, (unsigned long long)size,
+				            size_lo, gcr_cntl, buffer[5], write_since_prev ? 1u : 0u);
+				std::fflush(stdout);
+			}
+		} else if (cmd_id == 0xc0055800) {
+			// 7-dword GFX9 form (Mesa ac_emit_cp_acquire_mem, GFX9 branch):
+			// buffer[0] = gcr_cntl; [1..2] = CP_COHER_SIZE; [3..4] = CP_COHER_BASE.
+			// No engine / cb_db_op / poll fields. Not yet observed from this game.
+			g_pk2_form_7dw.fetch_add(1, std::memory_order_relaxed);
+			const uint32_t size_lo = buffer[1];
+			const uint64_t size =
+			    (static_cast<uint64_t>(buffer[1]) |
+			     (static_cast<uint64_t>(buffer[2]) << 32u))
+			    << 8u;
+			const uint64_t base =
+			    (static_cast<uint64_t>(buffer[3]) |
+			     (static_cast<uint64_t>(buffer[4]) << 32u))
+			    << 8u;
+			const uint32_t gcr_cntl = buffer[0];
+			if (size_lo == 0xffffffffu) {
+				g_pk2_size_full.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= 1024) {
+				g_pk2_size_le1k.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= (1u << 20)) {
+				g_pk2_size_le1m.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				g_pk2_size_other.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (size <= 256) {
+				g_pk2_small_256.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= 1024) {
+				g_pk2_small_1k.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= 65536) {
+				g_pk2_small_64k.fetch_add(1, std::memory_order_relaxed);
+			} else if (size <= (1u << 20)) {
+				g_pk2_small_1m.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (gcr_cntl == 0) {
+				g_pk2_gcr_zero.fetch_add(1, std::memory_order_relaxed);
+			} else {
+				g_pk2_gcr_nonzero.fetch_add(1, std::memory_order_relaxed);
+			}
+			if (sample) {
+				std::printf("NHL27PK2: acquire_mem #%llu form=7dw cmd_id=0x%08llx "
+				            "base=0x%llx size=0x%llx size_lo=0x%08x gcr=0x%08x "
+				            "write_since_prev=%u\n",
+				            (unsigned long long)n, (unsigned long long)cmd_id,
+				            (unsigned long long)base, (unsigned long long)size, size_lo,
+				            gcr_cntl, write_since_prev ? 1u : 0u);
+				std::fflush(stdout);
+			}
+		} else {
+			// 0xc0061050: layout unverified; count it, log the first occurrence
+			// only, decode nothing. (Design brief §2.1.)
+			g_pk2_form_1050.fetch_add(1, std::memory_order_relaxed);
+			if (g_pk2_logged_1050.exchange(1, std::memory_order_relaxed) == 0) {
+				std::printf("NHL27PK2: acquire_mem #%llu form=1050 cmd_id=0x%08llx "
+				            "(layout unverified, fields not decoded)\n",
+				            (unsigned long long)n, (unsigned long long)cmd_id);
+				std::fflush(stdout);
+			}
+		}
+		PktSync2SummaryTick(n);
+	}
 	BufferCache::PerfCount(BufferCache::PerfEvent::AcquireMem);
 	if (BufferCache::GuestSyncOnly()) {
 		// Without the automatic per-dispatch barriers, the guest's cache acquire is the point

@@ -445,6 +445,14 @@ private:
 
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
+	// NHL27G5R diagnostic (g5resid line): per-path GPU-mark bookkeeping for the ObtainMemo
+	// residual classification. m_g5_mark_seq[i] advances whenever tracker-setting site i
+	// marks a range (0 = SynchronizeBuffer upload marking, 1 = NoteGpuWrites); the range
+	// sets record which ranges each site marked. Counting only - nothing reads these
+	// for behaviour.
+	std::array<std::atomic<uint64_t>, 2>              m_g5_mark_seq {};
+	RangeSet                                          m_g5_ranges_sync;
+	RangeSet                                          m_g5_ranges_note;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;
@@ -529,6 +537,14 @@ private:
 		bool     texel = false; // a formatted read, while no image started at the address
 		// TextureCache::AddressIndexVersion() when no image started at the address (texel).
 		uint64_t image_version = 0;
+		// NHL27G5R store-time snapshot (g5resid diagnostic), recorded when the answer was
+		// found: the tracker GPU-dirty state, a hash of the guest bytes (ranges of at
+		// most 64 bytes only), and the two BufferCache mark sequences. The sampled-hit
+		// classification compares against these; nothing else reads them.
+		bool     gpu_modified_at_store = false;
+		uint64_t guest_hash            = 0;
+		bool     guest_hash_valid      = false;
+		uint64_t mark_seq_at_store[2]  = {};
 	};
 	// The stream copy a range got within the current draw window (see ObtainBuffer()).
 	struct StreamMemo {

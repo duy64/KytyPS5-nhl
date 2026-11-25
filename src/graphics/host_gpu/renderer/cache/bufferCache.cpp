@@ -515,6 +515,41 @@ static std::atomic<uint64_t> g_g5_memo_hits{0};
 static std::atomic<uint64_t> g_g5_sampled{0};
 static std::atomic<uint64_t> g_g5_stale{0};
 
+// NHL27G5R diagnostic (g5resid line, on top of the g5fix generation guard): the NHL27G5
+// counter above cannot tell whether the tracker flag predates the memo store (sticky
+// flag), was set after it without a generation bump the memo could see (an ordering
+// hole), or whether the overwriting write came through image space, which the buffer
+// tracker never sees. This extension snapshots the flag, two per-path mark sequences
+// and a guest-bytes hash at memo store, and classifies the sampled stale hits against
+// them. Counting only - the memo still serves every hit exactly as before.
+// KYTY_G5RCOUNT=0 disables.
+static bool G5RCountEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_G5RCOUNT");
+		return v == nullptr || v[0] != '0';
+	}();
+	return enabled;
+}
+static std::atomic<uint64_t> g_g5r_preflagged{0};
+static std::atomic<uint64_t> g_g5r_lateflag{0};
+static std::atomic<uint64_t> g_g5r_imgflag{0};
+static std::atomic<uint64_t> g_g5r_guestchg{0};
+static std::atomic<uint64_t> g_g5r_late_sync{0};
+static std::atomic<uint64_t> g_g5r_late_note{0};
+static std::atomic<uint64_t> g_g5r_late_unknown{0};
+
+// FNV-1a over the guest bytes of a range (guest memory is mapped at its virtual
+// address; ObtainBuffer's stream path reads it the same way).
+static uint64_t G5RGuestHash(uint64_t vaddr, uint64_t size) {
+	const auto* bytes = reinterpret_cast<const uint8_t*>(vaddr);
+	uint64_t    hash  = 14695981039346656037ull;
+	for (uint64_t i = 0; i < size; i++) {
+		hash ^= bytes[i];
+		hash *= 1099511628211ull;
+	}
+	return hash;
+}
+
 void BufferCache::DiscardGpuModified(uint64_t vaddr, uint64_t size) {
 	// Without whole pages the tracker could drop ownership of unrelated bytes. Leave the range
 	// dirty instead; the caller's invalidation then performs the ordinary download.
@@ -2229,6 +2264,14 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    FrameBreakdown::Timer stage_timer(bs.sb_stage_ns[bi], bon);
 		    source = UploadCopies(buffer, copies, total_size);
 	    });
+	if (is_written && G5RCountEnabled()) {
+		// NHL27G5R mark site 0: ForEachUploadRange's is_written pass just marked the
+		// whole range GPU modified in the tracker. Record the mark for classification.
+		m_g5_mark_seq[0].fetch_add(1, std::memory_order_relaxed);
+		if (size != 0) {
+			m_g5_ranges_sync.Add(vaddr, size);
+		}
+	}
 	walk_timer.Stop();
 	if (source) {
 		PerfCount(PerfEvent::BufferUpload);
@@ -2404,6 +2447,70 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 							            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed));
 							std::fflush(stdout);
 						}
+						if (G5RCountEnabled()) {
+							if (memo->gpu_modified_at_store) {
+								const uint64_t g5r_n =
+								    g_g5r_preflagged.fetch_add(1, std::memory_order_relaxed) + 1;
+								if (g5r_n <= 10) {
+									std::printf("NHL27G5R: preflagged memo hit #%llu vaddr=0x%llx size=%llu hits=%llu "
+									            "sampled=%llu\n",
+									            (unsigned long long)g5r_n, (unsigned long long)vaddr,
+									            (unsigned long long)size, (unsigned long long)g5_hit,
+									            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed));
+									std::fflush(stdout);
+								}
+							} else {
+								const uint64_t g5r_n =
+								    g_g5r_lateflag.fetch_add(1, std::memory_order_relaxed) + 1;
+								const char* g5r_path;
+								if (m_g5_mark_seq[0].load(std::memory_order_relaxed) != memo->mark_seq_at_store[0] &&
+								    m_g5_ranges_sync.Intersects(vaddr, size)) {
+									g_g5r_late_sync.fetch_add(1, std::memory_order_relaxed);
+									g5r_path = "syncupload";
+								} else if (m_g5_mark_seq[1].load(std::memory_order_relaxed) != memo->mark_seq_at_store[1] &&
+								           m_g5_ranges_note.Intersects(vaddr, size)) {
+									g_g5r_late_note.fetch_add(1, std::memory_order_relaxed);
+									g5r_path = "notegpu";
+								} else {
+									g_g5r_late_unknown.fetch_add(1, std::memory_order_relaxed);
+									g5r_path = "unknown";
+								}
+								if (g5r_n <= 10) {
+									std::printf("NHL27G5R: lateflag memo hit #%llu vaddr=0x%llx size=%llu path=%s hits=%llu "
+									            "sampled=%llu\n",
+									            (unsigned long long)g5r_n, (unsigned long long)vaddr,
+									            (unsigned long long)size, g5r_path, (unsigned long long)g5_hit,
+									            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed));
+									std::fflush(stdout);
+								}
+							}
+						}
+					}
+					if (G5RCountEnabled()) {
+						if (m_texture_cache.IsRegionGpuModified(vaddr, size)) {
+							const uint64_t g5r_n =
+							    g_g5r_imgflag.fetch_add(1, std::memory_order_relaxed) + 1;
+							if (g5r_n <= 10) {
+								std::printf("NHL27G5R: imgflag memo hit #%llu vaddr=0x%llx size=%llu hits=%llu "
+								            "sampled=%llu\n",
+								            (unsigned long long)g5r_n, (unsigned long long)vaddr,
+								            (unsigned long long)size, (unsigned long long)g5_hit,
+								            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed));
+								std::fflush(stdout);
+							}
+						}
+						if (memo->guest_hash_valid && G5RGuestHash(vaddr, size) != memo->guest_hash) {
+							const uint64_t g5r_n =
+							    g_g5r_guestchg.fetch_add(1, std::memory_order_relaxed) + 1;
+							if (g5r_n <= 10) {
+								std::printf("NHL27G5R: guestchg memo hit #%llu vaddr=0x%llx size=%llu hits=%llu "
+								            "sampled=%llu\n",
+								            (unsigned long long)g5r_n, (unsigned long long)vaddr,
+								            (unsigned long long)size, (unsigned long long)g5_hit,
+								            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed));
+								std::fflush(stdout);
+							}
+						}
 					}
 				}
 				if ((g5_hit & 0xFFFFu) == 0) {
@@ -2411,6 +2518,22 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 					            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed),
 					            (unsigned long long)g_g5_stale.load(std::memory_order_relaxed));
 					std::fflush(stdout);
+					if (G5RCountEnabled()) {
+						std::printf("NHL27G5R: hits=%llu sampled=%llu stale=%llu preflagged=%llu lateflag=%llu "
+						            "imgflag=%llu guestchg=%llu\n",
+						            (unsigned long long)g5_hit,
+						            (unsigned long long)g_g5_sampled.load(std::memory_order_relaxed),
+						            (unsigned long long)g_g5_stale.load(std::memory_order_relaxed),
+						            (unsigned long long)g_g5r_preflagged.load(std::memory_order_relaxed),
+						            (unsigned long long)g_g5r_lateflag.load(std::memory_order_relaxed),
+						            (unsigned long long)g_g5r_imgflag.load(std::memory_order_relaxed),
+						            (unsigned long long)g_g5r_guestchg.load(std::memory_order_relaxed));
+						std::printf("NHL27G5P: lateflag syncupload=%llu notegpu=%llu unknown=%llu\n",
+						            (unsigned long long)g_g5r_late_sync.load(std::memory_order_relaxed),
+						            (unsigned long long)g_g5r_late_note.load(std::memory_order_relaxed),
+						            (unsigned long long)g_g5r_late_unknown.load(std::memory_order_relaxed));
+						std::fflush(stdout);
+					}
 				}
 			}
 			auto& buffer = m_slot_buffers[memo->id];
@@ -2472,6 +2595,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	FrameBreakdown::Timer book_timer(bs.ob_book_ns, bon);
 	if (plain_read || (texel_read && !synced_from_image)) {
+		// NHL27G5R store-time snapshot (g5resid diagnostic): the tracker GPU-dirty flag,
+		// a hash of the guest bytes (ranges of at most 64 bytes) and the mark sequences
+		// are recorded with the answer below, for the sampled-hit classification.
+		const bool     g5r_snapshot   = G5RCountEnabled();
+		const bool     g5r_hash_valid = g5r_snapshot && size <= 64;
+		const uint64_t g5r_hash       = g5r_hash_valid ? G5RGuestHash(vaddr, size) : 0;
 		*memo = {.vaddr        = vaddr,
 		         .size         = size,
 		         .buffer_epoch = m_buffer_set_epoch,
@@ -2480,7 +2609,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		         .offset       = buffer.Offset(vaddr),
 		         .id           = id,
 		         .texel        = texel_read,
-		         .image_version = image_version};
+		         .image_version = image_version,
+		         .gpu_modified_at_store = g5r_snapshot && IsRegionGpuModified(vaddr, size),
+		         .guest_hash            = g5r_hash,
+		         .guest_hash_valid      = g5r_hash_valid};
+		memo->mark_seq_at_store[0] = m_g5_mark_seq[0].load(std::memory_order_relaxed);
+		memo->mark_seq_at_store[1] = m_g5_mark_seq[1].load(std::memory_order_relaxed);
 	}
 	if (is_written || is_texel_buffer) {
 		DropGpuFills(vaddr, size);
@@ -3155,6 +3289,13 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 			    {
 				    std::unique_lock ranges_lock(m_gpu_ranges_mutex);
 				    m_gpu_modified_ranges.Add(first, last - first);
+				    if (G5RCountEnabled()) {
+					// NHL27G5R mark site 1: this callback runs once per page run
+					// the tracker just marked GPU modified. Record the mark for
+					// classification (same site and lock as the ranges Add above).
+					m_g5_mark_seq[1].fetch_add(1, std::memory_order_relaxed);
+					m_g5_ranges_note.Add(first, last - first);
+				    }
 				    PublishGpuRangesVersion();
 				    PageWriteSeq::RaiseCurrent(first, last - first);
 			    }

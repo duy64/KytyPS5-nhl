@@ -2628,6 +2628,10 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
 	(void)m_texture_cache.ClearMeta(vaddr);
+	// NHL27METACLEAR counter-only (opt/nhl27-metaclear): the old rule clears metadata here
+	// unconditionally; count how often the strict cover test would have kept the surface marked.
+	// The ClearMeta call above is unchanged.
+	m_texture_cache.CountFillMetaClear(vaddr, size);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Invalidate cached buffers and images for the whole range up front, as the write
 		// faults would page by page, so the fill below does not fault on every tracked page.

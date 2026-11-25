@@ -132,6 +132,12 @@ public:
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
+	// NHL27METACLEAR counter-only (opt/nhl27-metaclear): read-only strict-rule helpers for the
+	// diagnostic counter. GetMetaInfo/MetaCovered port Faceoff v0.40.0's cover test; CountFillMetaClear
+	// only counts/logs. None of them changes drop behaviour.
+	[[nodiscard]] bool GetMetaInfo(uint64_t address, uint64_t* size, uint32_t* layers, bool* owner_alive);
+	[[nodiscard]] bool MetaCovered(uint64_t address, uint64_t bytes);
+	void               CountFillMetaClear(uint64_t vaddr, uint64_t size);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
@@ -154,6 +160,9 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// NHL27METACLEAR counter-only: the depth image that last acquired this HTile range.
+		// Written at registration, read only by the counter helpers above; no behaviour change.
+		ImageId owner;
 	};
 
 	struct OverlapResult {

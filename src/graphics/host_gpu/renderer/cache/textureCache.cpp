@@ -2292,6 +2292,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
+		// NHL27METACLEAR counter-only: record the owner for the counter helpers; no behaviour change.
+		metadata->second.owner = id;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2863,6 +2865,75 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask.set();
 	return true;
+}
+
+// NHL27METACLEAR counter-only (opt/nhl27-metaclear): port of Faceoff v0.40.0's GetMetaInfo /
+// MetaCovered. Read-only with respect to drop behaviour: the counter in renderCompute.cpp calls
+// these to evaluate the strict rule; nothing here marks, clears or drops anything.
+bool TextureCache::GetMetaInfo(uint64_t address, uint64_t* size, uint32_t* layers, bool* owner_alive) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	*owner_alive      = owner != nullptr && owner->registered;
+	*size             = owner != nullptr ? owner->info.metadata.range.size : 0;
+	*layers           = owner != nullptr ? owner->info.resources.layers : 0;
+	return true;
+}
+
+bool TextureCache::MetaCovered(uint64_t address, uint64_t bytes) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	if (owner == nullptr || !owner->registered) {
+		return false;
+	}
+	return bytes >= owner->info.metadata.range.size / std::max<uint64_t>(owner->info.resources.layers, 1);
+}
+
+// NHL27METACLEAR counter-only: KYTY_METACLEAR=0 disables the counter.
+static bool MetaClearCounterEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_METACLEAR");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// NHL27METACLEAR counter-only: the old FillBuffer rule clears metadata unconditionally; count how
+// often the strict cover test would have kept the surface marked. No state is changed here.
+void TextureCache::CountFillMetaClear(uint64_t vaddr, uint64_t size) {
+	if (!MetaClearCounterEnabled() || !IsMeta(vaddr)) {
+		return;
+	}
+	static std::atomic<uint64_t> old_hits {0};
+	static std::atomic<uint64_t> kept {0};
+	static std::atomic<uint64_t> also_clear {0};
+	const bool     covered = MetaCovered(vaddr, size);
+	const uint64_t hit     = old_hits.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (covered) {
+		also_clear.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		kept.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (hit <= 10) {
+		std::printf("NHL27METACLEAR: fill vaddr=0x%llx size=0x%llx old=clear strict=%s\n",
+		            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+		            covered ? "also-clear" : "kept");
+		std::fflush(stdout);
+	}
+	if ((hit & 0xFFFF) == 0) {
+		std::printf("NHL27METACLEAR: fill-summary old=%llu kept=%llu also-clear=%llu\n",
+		            static_cast<unsigned long long>(hit),
+		            static_cast<unsigned long long>(kept.load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(also_clear.load(std::memory_order_relaxed)));
+		std::fflush(stdout);
+	}
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

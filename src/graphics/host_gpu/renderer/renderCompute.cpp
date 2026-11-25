@@ -91,6 +91,137 @@ static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBi
 	return prepared;
 }
 
+// NHL27METACLEAR counter-only (opt/nhl27-metaclear): Faceoff v0.40.0's strict meta-clear rule,
+// evaluated READ-ONLY. The old rule in TryConsumeComputeMetaClear still drops exactly what it
+// dropped before; this only logs what the strict rule would have decided for each dropped dispatch:
+//   also-drop     - the strict rule would drop it too (proven uniform fill of metadata only)
+//   kept-mixed    - some written buffer is not metadata, or an image is written
+//   kept-partial  - a written metadata buffer does not cover a whole layer (owner gone counts here)
+//   kept-not-fill - the shader's proven fill target is not this buffer
+//   kept-oversize - a proven fill larger than the surface: Faceoff marks it cleared but still runs it
+// KYTY_METACLEAR=0 disables the counter.
+static bool MetaClearCounterEnabled() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_METACLEAR");
+		return value == nullptr || value[0] != '0';
+	}();
+	return enabled;
+}
+
+// Strict verdict for one dispatch, mirroring Faceoff v0.40.0 ConsumeMetaClearAt's verdict logic
+// without marking, clearing or dropping anything. Outputs describe the first written metadata buffer.
+static uint32_t EvaluateMetaClearStrict(const ShaderComputeInputInfo& input, TextureCache& cache,
+                                        uint32_t& written_out, uint32_t& meta_out,
+                                        uint32_t& images_written_out, uint64_t& first_base_out,
+                                        uint64_t& first_bytes_out) {
+	const auto& program   = *input.stage.program;
+	const auto& resources = *input.stage.resources;
+	const auto& fill      = resources.uniform_fill;
+	uint32_t    images_written = 0;
+	for (const auto& image: program.info.images) images_written += image.written ? 1u : 0u;
+	uint32_t written    = 0;
+	uint32_t meta       = 0;
+	uint32_t verdict    = 0;
+	bool     oversize   = false;
+	bool     have_first = false;
+	uint64_t first_base  = 0;
+	uint64_t first_bytes = 0;
+	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+		if (!program.info.buffers[i].written) continue;
+		written++;
+		const auto descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+		uint64_t meta_bytes = 0;
+		uint32_t layers     = 0;
+		bool     alive      = false;
+		if (!cache.GetMetaInfo(descriptor.Base48(), &meta_bytes, &layers, &alive)) continue;
+		meta++;
+		if (!have_first) {
+			have_first  = true;
+			first_base  = descriptor.Base48();
+			first_bytes = descriptor.GetSize();
+		}
+		if (verdict == 0) {
+			if (fill.kind != ShaderRecompiler::IR::UniformFillKind::Buffer || fill.resource != i) {
+				verdict = 3;
+			} else if (!cache.MetaCovered(descriptor.Base48(), descriptor.GetSize())) {
+				verdict = 2;
+			} else if (descriptor.GetSize() > meta_bytes) {
+				oversize = true;
+			}
+		}
+	}
+	if (meta != written || images_written != 0) {
+		verdict = 1;
+	}
+	if (verdict == 0 && oversize) {
+		verdict = 4;
+	}
+	written_out        = written;
+	meta_out           = meta;
+	images_written_out = images_written;
+	first_base_out     = first_base;
+	first_bytes_out    = first_bytes;
+	return verdict;
+}
+
+static void NoteMetaClearCounter(const ShaderComputeInputInfo& input, TextureCache& cache) {
+	if (!MetaClearCounterEnabled()) {
+		return;
+	}
+	static constexpr const char* names[] = {"also-drop", "kept-mixed", "kept-partial", "kept-not-fill",
+	                                        "kept-oversize"};
+	static std::atomic<uint64_t> counts[5] {};
+	static std::atomic<uint64_t> drops {0};
+	uint32_t written         = 0;
+	uint32_t meta            = 0;
+	uint32_t images_written  = 0;
+	uint64_t first_base      = 0;
+	uint64_t first_bytes     = 0;
+	const uint32_t verdict  = EvaluateMetaClearStrict(input, cache, written, meta, images_written,
+	                                                   first_base, first_bytes);
+	counts[verdict].fetch_add(1, std::memory_order_relaxed);
+	const uint64_t drop    = drops.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto&    program = *input.stage.program;
+	const auto&    fill    = input.stage.resources->uniform_fill;
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	bool                                first = false;
+	{
+		std::scoped_lock lock {mutex};
+		first = seen.size() < 160 &&
+		        seen.insert((program.shader_hash ^ (first_bytes * 0x9e3779b97f4a7c15ull)) * 8u + verdict).second;
+	}
+	if (first) {
+		uint64_t meta_bytes = 0;
+		uint32_t layers     = 0;
+		bool     alive      = false;
+		(void)cache.GetMetaInfo(first_base, &meta_bytes, &layers, &alive);
+		std::printf("NHL27METACLEAR: shader=0x%016llx %s written=%u meta=%u images_written=%u buf=0x%llx "
+		            "bytes=0x%llx meta_bytes=0x%llx layers=%u owner=%s fill=%d/%u/%u/0x%x "
+		            "groups=%ux%ux%u threads=%ux%ux%u\n",
+		            static_cast<unsigned long long>(program.shader_hash), names[verdict], written, meta,
+		            images_written, static_cast<unsigned long long>(first_base),
+		            static_cast<unsigned long long>(first_bytes),
+		            static_cast<unsigned long long>(meta_bytes), layers, alive ? "alive" : "gone",
+		            static_cast<int>(fill.kind), static_cast<unsigned>(fill.resource),
+		            static_cast<unsigned>(fill.words), static_cast<unsigned>(fill.value),
+		            input.workgroup_counts[0], input.workgroup_counts[1], input.workgroup_counts[2],
+		            input.threads_num[0], input.threads_num[1], input.threads_num[2]);
+		std::fflush(stdout);
+	}
+	if ((drop & 0xFFFF) == 0) {
+		std::printf("NHL27METACLEAR: summary drops=%llu also-drop=%llu kept-mixed=%llu kept-partial=%llu "
+		            "kept-not-fill=%llu kept-oversize=%llu\n",
+		            static_cast<unsigned long long>(drop),
+		            static_cast<unsigned long long>(counts[0].load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(counts[1].load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(counts[2].load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(counts[3].load(std::memory_order_relaxed)),
+		            static_cast<unsigned long long>(counts[4].load(std::memory_order_relaxed)));
+		std::fflush(stdout);
+	}
+}
+
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
 	const auto& program   = *input.stage.program;
@@ -116,6 +247,9 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
 				if (cache.ClearMeta(descriptor.Base48())) {
+					// NHL27METACLEAR counter-only: the old rule drops this dispatch here. Evaluate
+					// Faceoff's strict rule read-only and log the verdict; the drop is unchanged.
+					NoteMetaClearCounter(input, cache);
 					return true;
 				}
 			}

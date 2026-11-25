@@ -227,6 +227,12 @@ public:
 	[[nodiscard]] uint64_t GetSubmitId() const { return m_submit_id; }
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
+	// NHL27PK2 diagnostic: the CP thread's read of the buffer-cache write generation,
+	// so the acquire counter can tell whether a GPU write intervened since the previous
+	// ACQUIRE_MEM. Same pattern as GetScheduler() below; read-only, no behaviour change.
+	[[nodiscard]] uint64_t GetGpuWriteGeneration() const {
+		return m_renderer.GetBufferCache().GpuWriteGeneration();
+	}
 
 private:
 	template <typename T>
@@ -243,12 +249,6 @@ private:
 	uint32_t            NumInstances();
 	const void*         IndexAddress(uint32_t first_index) const;
 	CommandScheduler&   GetScheduler() const { return m_renderer.GetCommandScheduler(); }
-	// NHL27PK2 diagnostic: the CP thread's read of the buffer-cache write generation,
-	// so the acquire counter can tell whether a GPU write intervened since the previous
-	// ACQUIRE_MEM. Same pattern as GetScheduler() above; read-only, no behaviour change.
-	[[nodiscard]] uint64_t GetGpuWriteGeneration() const {
-		return m_renderer.GetBufferCache().GpuWriteGeneration();
-	}
 	CommandBuffer&      CurrentBuffer() { return GetScheduler().Current(); }
 
 	// Producer side: operations carry the register state and the CP state they need.

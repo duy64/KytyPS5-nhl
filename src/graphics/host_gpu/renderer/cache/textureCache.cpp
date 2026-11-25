@@ -2292,6 +2292,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 		if (inserted && image.info.htile_initial_clear) {
 			metadata->second.clear_mask.set();
 		}
+		// Strict meta-clear rule: record the owner for GetMetaInfo/MetaCovered; no behaviour change.
+		metadata->second.owner = id;
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2863,6 +2865,52 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	}
 	found->second.clear_mask.set();
 	return true;
+}
+
+bool TextureCache::GetMetaInfo(uint64_t address, uint64_t* size, uint32_t* layers, bool* owner_alive) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	*owner_alive      = owner != nullptr && owner->registered;
+	*size             = owner != nullptr ? owner->info.metadata.range.size : 0;
+	*layers           = owner != nullptr ? owner->info.resources.layers : 0;
+	return true;
+}
+
+bool TextureCache::MetaCovered(uint64_t address, uint64_t bytes) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	if (owner == nullptr || !owner->registered) {
+		return false;
+	}
+	return bytes >= owner->info.metadata.range.size / std::max<uint64_t>(owner->info.resources.layers, 1);
+}
+
+static bool MetaCoverRule() {
+	static const bool cover = [] {
+		const char* strict = std::getenv("KYTY_META_CLEAR_STRICT");
+		const char* value  = std::getenv("KYTY_META_CLEAR_COVER");
+		return (strict == nullptr || strict[0] != '0') && (value == nullptr || value[0] != '0');
+	}();
+	return cover;
+}
+
+bool TextureCache::ClearMetaCovered(uint64_t address, uint64_t bytes) {
+	if (MetaCoverRule() && !MetaCovered(address, bytes)) {
+		return false;
+	}
+	return ClearMeta(address);
+}
+
+void BufferCache::ClearFillMeta(uint64_t vaddr, uint64_t size) {
+	(void)m_texture_cache.ClearMetaCovered(vaddr, size);
 }
 
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {

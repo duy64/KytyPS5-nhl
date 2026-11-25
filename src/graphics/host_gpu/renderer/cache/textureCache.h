@@ -131,6 +131,16 @@ public:
 	[[nodiscard]] bool IsMeta(uint64_t address);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// The metadata surface registered at this base address: the owner image's metadata size and layer count, and
+	// whether the owner image is still registered. False if no surface is registered there.
+	[[nodiscard]] bool GetMetaInfo(uint64_t address, uint64_t* size, uint32_t* layers, bool* owner_alive);
+	// True if a write of `bytes` from `address` covers at least one whole layer of the metadata surface registered at
+	// `address` and the surface's owner image is still registered. The game's frame-graph pool reuses metadata memory
+	// for other data while the image stays cached, so a shorter write is not a metadata clear.
+	[[nodiscard]] bool MetaCovered(uint64_t address, uint64_t bytes);
+	// ClearMeta under the MetaCovered test. KYTY_META_CLEAR_STRICT=0 or KYTY_META_CLEAR_COVER=0 restores the old
+	// rule (any write at the base address clears).
+	[[nodiscard]] bool ClearMetaCovered(uint64_t address, uint64_t bytes);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -154,6 +164,9 @@ private:
 	struct MetaDataInfo {
 		// PS5 DB_DEPTH_VIEW encodes 13-bit base and last array-slice indices.
 		std::bitset<8192> clear_mask;
+		// The depth image that last acquired this HTile range (Faceoff v0.40.0's field).
+		// Written at registration, read only by the strict-rule helpers below.
+		ImageId owner;
 	};
 
 	struct OverlapResult {

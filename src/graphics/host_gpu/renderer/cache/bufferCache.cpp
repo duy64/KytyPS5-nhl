@@ -3124,6 +3124,51 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	}
 }
 
+// ACQUIRE_MEM GCR_CNTL invalidate bits (Mesa S_586_*, src/amd/registers/pkt3.json
+// "GCR_CNTL" at register address 0x586, type_ref GCR_CNTL; the generated amdgfxregs.h
+// is what sid.h's S_586_* macros expand from):
+//   GLI_INV bits [0,1] (2-bit enum: 0 NOP, 1 ALL, 2 RANGE, 3 FIRST_LAST) -> any nonzero
+//   GLM_INV bit 5, GLK_INV bit 7, GLV_INV bit 8, GL1_INV bit 9, GL2_INV bit 14.
+// Writeback-only bits (GLM_WB 4, GLK_WB 6, GL2_WB 15), GL1_RANGE [2,3], GL2_US 10,
+// GL2_RANGE [11,12], GL2_DISCARD 13, SEQ [16,17] and RANGE_IS_PA 18 are not
+// invalidates. This is NOT the RELEASE_MEM map (S_490_*: GLM_WB 12, GLM_INV 13,
+// GLV_INV 14, GL1_INV 15, GL2_INV 20, GL2_WB 21) - the two packets encode GCR
+// differently, which is why Mesa extracts and re-encodes between them.
+constexpr uint32_t kAcquireMemInvMask = 0x47A3u; // bits 0,1,5,7,8,9,14
+// Small-range flagging cap (design brief §2.2(d)): the counter session's size
+// distribution is bimodal (<= 1 KiB or ~full-range, nothing between), so 1 MiB is
+// nearly free.
+constexpr uint64_t kAcquireMemSmallRangeMax = 1u << 20;
+
+BufferCache::AcquireMemAction BufferCache::NoteAcquireMem(uint64_t base, uint64_t size,
+                                                           uint32_t gcr_cntl) {
+	// (a) GCR gate: a writeback-only or empty acquire changes no host state.
+	if ((gcr_cntl & kAcquireMemInvMask) == 0) {
+		return AcquireMemAction::SkippedGcr;
+	}
+	// (b) Intervening-write gate: nothing new to make visible since the last acquire.
+	if (m_acquire_seen_generation == m_gpu_write_generation) {
+		return AcquireMemAction::SkippedNoWrite;
+	}
+	// (c) Bump first, then record the post-bump generation: recording before the bump
+	// would leave m_acquire_seen_generation != m_gpu_write_generation, so the next
+	// acquire would bump again with no intervening write and the gate would never
+	// collapse (deviation from the brief's §2.2(c) wording, which says "record then
+	// bump" - the brief's own §2.2(b) intent and the pktsync2 counter's measured
+	// semantics, "generation advanced since the previous acquire", both require this
+	// order). The bump is a permission to re-check, not a forced re-upload.
+	m_gpu_write_generation++;
+	m_acquire_seen_generation = m_gpu_write_generation;
+	// (d) Small-range flagging: an empty range flags nothing (fence-only acquires are
+	// ~half the small-range firings in the counter session). Full-range acquires skip
+	// this step entirely.
+	if (size != 0 && size <= kAcquireMemSmallRangeMax) {
+		m_texture_cache.InvalidateMemoryFromGPU(base, size);
+		return AcquireMemAction::BumpedAndFlagged;
+	}
+	return AcquireMemAction::Bumped;
+}
+
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {
 	// Only tracking regions with pending CPU writes can have anything to upload.
 	m_memory_tracker.ForEachCpuDirtySpan(vaddr, size, [&](uint64_t span, uint64_t span_size) {

@@ -301,6 +301,15 @@ public:
 	// bytes of [vaddr, vaddr + size) that a cached buffer holds become GPU modified, except on
 	// pages the CPU dirtied since, whose upload replaces them.
 	void NoteGpuWrites(uint64_t vaddr, uint64_t size);
+	// Outcome of NoteAcquireMem, for the NHL27PKF counters in pm4Handlers.cpp.
+	enum class AcquireMemAction { SkippedGcr, SkippedNoWrite, Bumped, BumpedAndFlagged };
+	// ACQUIRE_MEM (roadmap step 3): translate the guest's visibility declaration into
+	// host-side bookkeeping. (a) No invalidate bit in gcr_cntl -> nothing. (b) No GPU
+	// write since the last acquire -> nothing. (c) Otherwise bump m_gpu_write_generation
+	// so the memo families miss once and re-resolve (no forced upload). (d) Small
+	// non-empty ranges (<= 1 MiB) also flag the images they span for re-validation via
+	// TextureCache::InvalidateMemoryFromGPU. Never downloads; never touches the barrier.
+	AcquireMemAction NoteAcquireMem(uint64_t base, uint64_t size, uint32_t gcr_cntl);
 	// Calls func(address, size) for the runs of [vaddr, vaddr + size) the CPU may have written
 	// since the previous call over them (see MemoryTracker::ConsumeCpuWrites).
 	template <typename Func>
@@ -445,6 +454,9 @@ private:
 
 	MemoryTracker                                     m_memory_tracker;
 	uint64_t                                           m_gpu_write_generation = 0;
+	// Generation as of the last ACQUIRE_MEM NoteAcquireMem acted on (after its own bump):
+	// an acquire whose generation still equals this one has no intervening GPU write.
+	uint64_t                                           m_acquire_seen_generation = 0;
 	StreamBuffer                                      m_staging_buffer;
 	StreamBuffer                                      m_stream_buffer;
 	StreamBuffer                                      m_download_buffer;

@@ -228,6 +228,13 @@ public:
 	void                   SetSubmitId(uint64_t submit_id) { m_submit_id = submit_id; }
 	[[nodiscard]] bool     IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 
+	// ACQUIRE_MEM fix (roadmap step 3): the CP thread's path to the buffer cache, so
+	// CpOpAcquireMem can call BufferCache::NoteAcquireMem. Same pattern as the
+	// renderer's GetBufferCache(); read/write through the cache, no behaviour change
+	// on its own. Must stay in this public section: the handler is a free function
+	// (the #241 compile error was this kind of accessor sitting under private:).
+	BufferCache& GetBufferCache() { return m_renderer.GetBufferCache(); }
+
 private:
 	template <typename T>
 	void WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_write_dest, uint32_t eop_event_type,

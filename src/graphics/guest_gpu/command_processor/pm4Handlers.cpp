@@ -95,6 +95,79 @@ void LogUnknownReleaseMemGcr(uint32_t gcr_cntl) {
 
 } // namespace
 
+// ACQUIRE_MEM fix (pktsyncfix line, roadmap step 3): decode the guest's ACQUIRE_MEM
+// packets and translate the visibility declaration into host-side bookkeeping via
+// BufferCache::NoteAcquireMem - a generation bump when a GPU write intervened since the
+// last acquire, plus small-range image flagging. The Vulkan barrier in the handler
+// below is untouched. Counters (NHL27PKF) judge the mechanism from the session log,
+// per the design brief §4: bumps/acquires <= 0.25, small-range flaggings <= 5%,
+// nonzero firings. KYTY_PKTSYNCFIX=0 disables the whole block (decode, call, counters).
+//
+// GCR INV-bit map, VERIFIED from Mesa (src/amd/registers/pkt3.json, register "GCR_CNTL"
+// at address 0x586 = 1414, the checked-in source the S_586_* macros are generated
+// from; sid.h itself only includes the generated amdgfxregs.h):
+//   GLI_INV bits [0,1] (2-bit enum: 0 NOP, 1 ALL, 2 RANGE, 3 FIRST_LAST) -> nonzero
+//   GLM_INV bit 5, GLK_INV bit 7, GLV_INV bit 8, GL1_INV bit 9, GL2_INV bit 14.
+// Writeback-only bits (GLM_WB 4, GLK_WB 6, GL2_WB 15) and GL1_RANGE [2,3], GL2_US 10,
+// GL2_RANGE [11,12], GL2_DISCARD 13, SEQ [16,17], RANGE_IS_PA 18 are NOT invalidates.
+// Do NOT reuse the RELEASE_MEM map (S_490_*: GLM_WB 12, GLM_INV 13, GLV_INV 14,
+// GL1_INV 15, GL2_INV 20, GL2_WB 21) - the two packets encode GCR differently, which
+// is why Mesa extracts and re-encodes between them (si_barrier.c, GFX10 path).
+// Sampled session values decode cleanly under this map: 0x380 = GLK+GLV+GL1_INV,
+// 0x300 = GLV+GL1_INV, 0x320 = GLM+GLV+GL1_INV, 0x0c320/0x0c200/0x0c220 add GL2_INV
+// (+GL2_WB); 0x9000 = GL2_RANGE + GL2_WB carries NO invalidate bit and is skipped
+// by gate (a). Action codes in the sample lines: 0 SkippedGcr, 1 SkippedNoWrite,
+// 2 Bumped, 3 BumpedAndFlagged.
+static bool PktsyncFixEnabled() {
+	static const bool enabled = [] {
+		const char* v = std::getenv("KYTY_PKTSYNCFIX");
+		return v == nullptr || v[0] != '0';
+	}();
+	return enabled;
+}
+static std::atomic<uint64_t> g_pkf_acquire{0};
+static std::atomic<uint64_t> g_pkf_form_8dw{0};
+static std::atomic<uint64_t> g_pkf_form_7dw{0};
+static std::atomic<uint64_t> g_pkf_form_1050{0};
+static std::atomic<uint64_t> g_pkf_bump{0};
+static std::atomic<uint64_t> g_pkf_flagged{0};
+static std::atomic<uint64_t> g_pkf_skip_gcr{0};
+static std::atomic<uint64_t> g_pkf_skip_nowrite{0};
+static std::atomic<uint64_t> g_pkf_logged_1050{0};
+// Barrier-window baselines. Plain loads, never FrameBreakdown::Take(): Take() zeroes
+// the counters and would steal NHL27PORT's per-frame barrier counts.
+static uint64_t g_pkf_bar_exec_last{0};
+static uint64_t g_pkf_bar_skip_last{0};
+
+// One summary line per 65,536 acquires: at ~15.6k acquires/sec that is about a line
+// every 4 seconds, and any real session still yields many lines. bar_exec/bar_skip are
+// deltas within the window (since the previous NHL27PKF line).
+static void PktsyncFixSummaryTick(uint64_t total) {
+	if ((total & 0xFFFFu) != 0) {
+		return;
+	}
+	const uint64_t bar_exec_now =
+	    FrameBreakdown::g_counters.port_guest_barriers.load(std::memory_order_relaxed);
+	const uint64_t bar_skip_now =
+	    FrameBreakdown::g_counters.port_guest_barriers_skipped.load(std::memory_order_relaxed);
+	const uint64_t bar_exec = bar_exec_now - g_pkf_bar_exec_last;
+	const uint64_t bar_skip = bar_skip_now - g_pkf_bar_skip_last;
+	g_pkf_bar_exec_last = bar_exec_now;
+	g_pkf_bar_skip_last = bar_skip_now;
+	std::printf("NHL27PKF: acq=%llu form8=%llu form7=%llu form1050=%llu bump=%llu "
+	            "flagged=%llu skip_gcr=%llu skip_nowrite=%llu bar_exec=%llu bar_skip=%llu\n",
+	            (unsigned long long)total,
+	            (unsigned long long)g_pkf_form_8dw.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pkf_form_7dw.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pkf_form_1050.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pkf_bump.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pkf_flagged.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pkf_skip_gcr.load(std::memory_order_relaxed),
+	            (unsigned long long)g_pkf_skip_nowrite.load(std::memory_order_relaxed),
+	            (unsigned long long)bar_exec, (unsigned long long)bar_skip);
+	std::fflush(stdout);
+}
+
 static HW::BlendControl DecodeBlendControl(uint32_t value) {
 	HW::BlendControl r {};
 
@@ -1288,6 +1361,95 @@ KYTY_CP_OP_PARSER(CpOpAcquireMem) {
 	KYTY_PROFILER_FUNCTION();
 
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0055800 && cmd_id != 0xc0065800 && cmd_id != 0xc0061050);
+	if (PktsyncFixEnabled()) {
+		const uint64_t n = g_pkf_acquire.fetch_add(1, std::memory_order_relaxed) + 1;
+		const bool sample = (n <= 10) || ((n & 0x3FFu) == 0);
+		BufferCache::AcquireMemAction action = BufferCache::AcquireMemAction::SkippedGcr;
+		bool decoded = false;
+		uint64_t base = 0;
+		uint64_t size = 0;
+		uint32_t gcr_cntl = 0;
+		if (cmd_id == 0xc0065800) {
+			// 8-dword GFX10+ form (AgcDcbAcquireMem, libs/agc.cpp:2935-2964):
+			// buffer[0] = engine<<31 | cb_db_op; [1..2] = CP_COHER_SIZE (256-byte
+			// units, low then high 8); [3..4] = CP_COHER_BASE (same units);
+			// [5] = poll; [6] = gcr_cntl. The header check guarantees 7 payload
+			// dwords, so all reads below are in bounds.
+			g_pkf_form_8dw.fetch_add(1, std::memory_order_relaxed);
+			const uint32_t engine = buffer[0] >> 31u;
+			const uint32_t cb_db_op = buffer[0] & 0x06007fc0u;
+			size = (static_cast<uint64_t>(buffer[1]) |
+			        (static_cast<uint64_t>(buffer[2] & 0xffu) << 32u))
+			       << 8u;
+			base = (static_cast<uint64_t>(buffer[3]) |
+			        (static_cast<uint64_t>(buffer[4]) << 32u))
+			       << 8u;
+			gcr_cntl = buffer[6] & 0x7ffffu;
+			action = cp.GetBufferCache().NoteAcquireMem(base, size, gcr_cntl);
+			decoded = true;
+			if (sample) {
+				std::printf("NHL27PKF: acquire_mem #%llu form=8dw cmd_id=0x%08llx "
+				            "engine=%u cb_db_op=0x%08x base=0x%llx size=0x%llx "
+				            "gcr=0x%05x action=%u\n",
+				            (unsigned long long)n, (unsigned long long)cmd_id, engine,
+				            cb_db_op, (unsigned long long)base, (unsigned long long)size,
+				            gcr_cntl, static_cast<unsigned>(action));
+				std::fflush(stdout);
+			}
+		} else if (cmd_id == 0xc0055800) {
+			// 7-dword GFX9 form (Mesa ac_emit_cp_acquire_mem, GFX9 branch):
+			// buffer[0] = gcr_cntl; [1..2] = CP_COHER_SIZE; [3..4] = CP_COHER_BASE.
+			// No engine / cb_db_op / poll fields. Not yet observed from this game;
+			// the S_586 INV mask is applied to buffer[0] the same way (unverified
+			// for this form, no session effect while it never fires).
+			g_pkf_form_7dw.fetch_add(1, std::memory_order_relaxed);
+			size = (static_cast<uint64_t>(buffer[1]) |
+			        (static_cast<uint64_t>(buffer[2]) << 32u))
+			       << 8u;
+			base = (static_cast<uint64_t>(buffer[3]) |
+			        (static_cast<uint64_t>(buffer[4]) << 32u))
+			       << 8u;
+			gcr_cntl = buffer[0] & 0x7ffffu;
+			action = cp.GetBufferCache().NoteAcquireMem(base, size, gcr_cntl);
+			decoded = true;
+			if (sample) {
+				std::printf("NHL27PKF: acquire_mem #%llu form=7dw cmd_id=0x%08llx "
+				            "base=0x%llx size=0x%llx gcr=0x%05x action=%u\n",
+				            (unsigned long long)n, (unsigned long long)cmd_id,
+				            (unsigned long long)base, (unsigned long long)size, gcr_cntl,
+				            static_cast<unsigned>(action));
+				std::fflush(stdout);
+			}
+		} else {
+			// 0xc0061050: layout unverified; count it, log the first occurrence
+			// only, decode nothing, no host-side effect. (Design brief §2.1.)
+			g_pkf_form_1050.fetch_add(1, std::memory_order_relaxed);
+			if (g_pkf_logged_1050.exchange(1, std::memory_order_relaxed) == 0) {
+				std::printf("NHL27PKF: acquire_mem #%llu form=1050 cmd_id=0x%08llx "
+				            "(layout unverified, fields not decoded)\n",
+				            (unsigned long long)n, (unsigned long long)cmd_id);
+				std::fflush(stdout);
+			}
+		}
+		if (decoded) {
+			switch (action) {
+			case BufferCache::AcquireMemAction::SkippedGcr:
+				g_pkf_skip_gcr.fetch_add(1, std::memory_order_relaxed);
+				break;
+			case BufferCache::AcquireMemAction::SkippedNoWrite:
+				g_pkf_skip_nowrite.fetch_add(1, std::memory_order_relaxed);
+				break;
+			case BufferCache::AcquireMemAction::Bumped:
+				g_pkf_bump.fetch_add(1, std::memory_order_relaxed);
+				break;
+			case BufferCache::AcquireMemAction::BumpedAndFlagged:
+				g_pkf_bump.fetch_add(1, std::memory_order_relaxed);
+				g_pkf_flagged.fetch_add(1, std::memory_order_relaxed);
+				break;
+			}
+		}
+		PktsyncFixSummaryTick(n);
+	}
 	BufferCache::PerfCount(BufferCache::PerfEvent::AcquireMem);
 	if (BufferCache::GuestSyncOnly()) {
 		// Without the automatic per-dispatch barriers, the guest's cache acquire is the point

@@ -2776,15 +2776,19 @@ void TextureCache::LogReadbackWindow() {
 }
 
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
-	// Only images starting at the address change, and every written storage-buffer bind asks:
-	// the start-address filter answers most without the lock and the page walk.
+	// Images starting inside the written range change, and every written storage-buffer
+	// bind asks: the start-address filter answers most without the lock and the page walk.
 	if (!GuestRange {address, size}.Valid() || !AddressFilterHit(address)) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	const uint64_t end = address + size;
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.info.data.address != address) {
+		// A write can span images stored back to back (e.g. the planes of one buffer):
+		// flag every image starting inside the range, not only the one at its start,
+		// or the later images keep serving stale bytes. (shadPS4 #5599)
+		if (image.info.data.address < address || image.info.data.address >= end) {
 			continue;
 		}
 		if (image.IsGpuModified()) {

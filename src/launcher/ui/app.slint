@@ -434,6 +434,13 @@ export component AppWindow inherits Window {
     in-out property <string> height-text;
     in-out property <string> extra-args;
     in-out property <int> present-mode: 1;
+    // The settings page's quick controls, derived from the environment rows by the C++ side.
+    in-out property <int> upscaler-index: 0;
+    in-out property <bool> opt-frame-dump;
+    in-out property <bool> opt-unmap-discard;
+    in-out property <bool> opt-spin-yield;
+    in-out property <bool> opt-fault-coalesce;
+    in-out property <bool> opt-res-scale;
     in-out property <string> vblank-text: "60";
     in-out property <int> shader-opt: 0;
     in-out property <string> gpu-text;
@@ -1099,6 +1106,12 @@ export component AppWindow inherits Window {
         check-updates <=> root.check-updates;
         microphone <=> root.microphone;
         present-mode <=> root.present-mode;
+        upscaler-index <=> root.upscaler-index;
+        opt-frame-dump <=> root.opt-frame-dump;
+        opt-unmap-discard <=> root.opt-unmap-discard;
+        opt-spin-yield <=> root.opt-spin-yield;
+        opt-fault-coalesce <=> root.opt-fault-coalesce;
+        opt-res-scale <=> root.opt-res-scale;
         printf-dir <=> root.printf-dir;
         printf-file <=> root.printf-file;
         profiler <=> root.profiler;

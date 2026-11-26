@@ -47,6 +47,9 @@ export global EnvEditor {
     callback edited(int, string, string); // row, name, value (both as typed: C++ only trims on save)
     callback removed(int);
     callback added();
+    // The quick controls (upscaler dropdown, option checkboxes) edit the same rows by name.
+    callback set(string, string); // name, value: replace the row with this name, or append it
+    callback unset(string);       // name: remove the row with this name, if there is one
 }
 
 // STEP6:6e: the microphone and GPU pickers. C++ fills these when the page opens and on Refresh; empty lists
@@ -292,8 +295,8 @@ component GameConfigRowView inherits Rectangle {
                             none-hover := TouchArea {
                                 clicked => {
                                     if (root.game.pinned) {
-                                        emu-popup.close();
                                         root.set-emu-none();
+                                        emu-popup.close();
                                     }
                                 }
                             }
@@ -312,8 +315,8 @@ component GameConfigRowView inherits Rectangle {
                             pick-hover := TouchArea {
                                 clicked => {
                                     if (root.game.can-config) {
-                                        emu-popup.close();
                                         root.set-emu-pick();
+                                        emu-popup.close();
                                     }
                                 }
                             }
@@ -451,6 +454,12 @@ export component SettingsPage inherits VerticalLayout {
     in-out property <bool> readback;
     in-out property <bool> readback-tiled;
     in-out property <bool> network-connected;
+    // The quick controls' state, derived from the environment rows by the C++ side.
+    in-out property <bool> opt-fault-coalesce;
+    in-out property <bool> opt-frame-dump;
+    in-out property <bool> opt-res-scale;
+    in-out property <bool> opt-spin-yield;
+    in-out property <bool> opt-unmap-discard;
     in-out property <string> addons-dir;
     in-out property <bool> red-zone;
     in-out property <bool> renderdoc;
@@ -465,6 +474,7 @@ export component SettingsPage inherits VerticalLayout {
     in-out property <bool> tessellation;
     in-out property <string> user-id-text;
     in-out property <string> user-name;
+    in-out property <int> upscaler-index;
     in-out property <string> vblank-text;
     in-out property <bool> vulkan-validation;
     in property <int> recommended-size; // the Window size preset that matches the monitor (-1: none)
@@ -938,6 +948,41 @@ export component SettingsPage inherits VerticalLayout {
                             current-index <=> root.present-mode;
                         }
                     }
+                    // The upscaler choice is a group of environment rows (the Advanced tab's table shows
+                    // them): the picked backend's variable, plus the present copy every backend needs
+                    // or its output never reaches the screen.
+                    FormRow {
+                        label: "Upscaler";
+                        Selector {
+                            horizontal-stretch: 1;
+                            model: ["None", "FSR 4", "DLSS", "XeSS"];
+                            current-index <=> root.upscaler-index;
+                            selected(value) => {
+                                if (value == 1) {
+                                    EnvEditor.set("KYTY_FSR4", "1");
+                                    EnvEditor.unset("KYTY_DLSS");
+                                    EnvEditor.unset("KYTY_XESS");
+                                } else if (value == 2) {
+                                    EnvEditor.set("KYTY_DLSS", "1");
+                                    EnvEditor.unset("KYTY_FSR4");
+                                    EnvEditor.unset("KYTY_XESS");
+                                } else if (value == 3) {
+                                    EnvEditor.set("KYTY_XESS", "1");
+                                    EnvEditor.unset("KYTY_FSR4");
+                                    EnvEditor.unset("KYTY_DLSS");
+                                } else {
+                                    EnvEditor.unset("KYTY_FSR4");
+                                    EnvEditor.unset("KYTY_DLSS");
+                                    EnvEditor.unset("KYTY_XESS");
+                                }
+                                if (value == 0) {
+                                    EnvEditor.unset("KYTY_FSR3_NHL27_PRESENT");
+                                } else {
+                                    EnvEditor.set("KYTY_FSR3_NHL27_PRESENT", "1");
+                                }
+                            }
+                        }
+                    }
                     Field {
                         label: "Vblank frequency";
                         placeholder: "60";
@@ -1021,6 +1066,42 @@ export component SettingsPage inherits VerticalLayout {
                         label: "Extra arguments";
                         placeholder: "e.g. --no-async-pipelines";
                         text <=> root.extra-args;
+                    }
+                }
+                // A friendlier face on the rows of the table below: each control sets or removes its
+                // variable, and the table (the same rows) shows exactly what changed.
+                Card {
+                    title: "Quick options";
+                    hint: "Shortcuts for the variables people change most. They edit the table below; settings apply at launch.";
+                    ToggleRow {
+                        item: { env: "KYTY_DBG_FRAME_DUMP", label: "Frame capture (F2)", hint: "Captures go to the folder in the KYTY_DBG_FRAME_DUMP_DIR row of the table below (the emulator's default folder when that row is not set).", on: root.opt-frame-dump };
+                        toggled(on) => {
+                            if (on) { EnvEditor.set("KYTY_DBG_FRAME_DUMP", "1"); } else { EnvEditor.unset("KYTY_DBG_FRAME_DUMP"); }
+                        }
+                    }
+                    ToggleRow {
+                        item: { env: "KYTY_UNMAP_DISCARD", label: "Unmap discard", hint: "GPU-written bytes in memory the game unmaps are dead: skip downloading them.", on: root.opt-unmap-discard };
+                        toggled(on) => {
+                            if (on) { EnvEditor.set("KYTY_UNMAP_DISCARD", "1"); } else { EnvEditor.unset("KYTY_UNMAP_DISCARD"); }
+                        }
+                    }
+                    ToggleRow {
+                        item: { env: "KYTY_SPIN_YIELD", label: "Spin yield", hint: "Threads that wait for the GPU yield the processor instead of only spinning.", on: root.opt-spin-yield };
+                        toggled(on) => {
+                            if (on) { EnvEditor.set("KYTY_SPIN_YIELD", "1"); } else { EnvEditor.unset("KYTY_SPIN_YIELD"); }
+                        }
+                    }
+                    ToggleRow {
+                        item: { env: "KYTY_FAULT_COALESCE_PAGES", label: "Fault coalesce window (64 pages)", hint: "One write fault releases a 64-page window at once. Without the row the emulator uses 16 pages.", on: root.opt-fault-coalesce };
+                        toggled(on) => {
+                            if (on) { EnvEditor.set("KYTY_FAULT_COALESCE_PAGES", "64"); } else { EnvEditor.unset("KYTY_FAULT_COALESCE_PAGES"); }
+                        }
+                    }
+                    ToggleRow {
+                        item: { env: "KYTY_NHL_RES_SCALE", label: "Native resolution scale (NHL 27)", hint: "Render at the game's full scale (1) instead of the shipped preset (0.6667).", on: root.opt-res-scale };
+                        toggled(on) => {
+                            if (on) { EnvEditor.set("KYTY_NHL_RES_SCALE", "1"); } else { EnvEditor.unset("KYTY_NHL_RES_SCALE"); }
+                        }
                     }
                 }
                 // STEP6:6e: the env table of the emulator process (kyty.json "emu" / "env"), in global and

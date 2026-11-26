@@ -696,11 +696,65 @@ int main(int argc, char** argv)
 	ui->global<EnvEditor>().set_vars(env_model);
 	ui->global<Devices>().set_audio_inputs(audio_model);
 	ui->global<Devices>().set_gpu_choices(gpu_model);
+	// The quick controls of the settings page (the Graphics tab's upscaler dropdown and the Advanced
+	// tab's option checkboxes) are a second view of these rows: they upsert and erase rows by name
+	// through the editor's set/unset callbacks, and sync_quick_controls re-derives what they show
+	// from the model after every change, so the controls and the table can never disagree at save
+	// time. Names match exactly, like the table's own save path reads them.
+	auto env_row_of = [env_model](const std::string& name) -> int
+	{
+		for (size_t i = 0; i < env_model->row_count(); i++)
+		{
+			const auto row = env_model->row_data(i);
+			if (row.has_value() && ToStd(row->name) == name)
+			{
+				return static_cast<int>(i);
+			}
+		}
+		return -1;
+	};
+	auto env_value_of = [env_model, env_row_of](const char* name) -> std::optional<std::string>
+	{
+		const int row = env_row_of(name);
+		if (row < 0)
+		{
+			return std::nullopt;
+		}
+		return ToStd(env_model->row_data(static_cast<size_t>(row))->value);
+	};
+	auto sync_quick_controls = [&]
+	{
+		// The winner mirrors the emulator's per-frame choice (nhl27Fsr3.cpp): DLSS first, then
+		// XeSS, then FSR 4, each on only when its variable is exactly "1".
+		int upscaler = 0;
+		if (env_value_of("KYTY_DLSS").value_or("") == "1")
+		{
+			upscaler = 2;
+		} else if (env_value_of("KYTY_XESS").value_or("") == "1")
+		{
+			upscaler = 3;
+		} else if (env_value_of("KYTY_FSR4").value_or("") == "1")
+		{
+			upscaler = 1;
+		}
+		ui->set_upscaler_index(upscaler);
+		// The "on" tests mirror how the emulator itself reads each variable.
+		const auto frame_dump = env_value_of("KYTY_DBG_FRAME_DUMP");
+		ui->set_opt_frame_dump(frame_dump.has_value() && !frame_dump->empty() && (*frame_dump)[0] != '0');
+		const auto unmap_discard = env_value_of("KYTY_UNMAP_DISCARD");
+		ui->set_opt_unmap_discard(unmap_discard.has_value() && !unmap_discard->empty() && *unmap_discard != "0");
+		const auto spin_yield = env_value_of("KYTY_SPIN_YIELD");
+		ui->set_opt_spin_yield(spin_yield.has_value() && !spin_yield->empty() && (*spin_yield)[0] == '1');
+		const auto fault_coalesce = env_value_of("KYTY_FAULT_COALESCE_PAGES");
+		ui->set_opt_fault_coalesce(fault_coalesce.has_value() && !fault_coalesce->empty() && *fault_coalesce != "0");
+		const auto res_scale = env_value_of("KYTY_NHL_RES_SCALE");
+		ui->set_opt_res_scale(res_scale.has_value() && (*res_scale == "1" || *res_scale == "1.0"));
+	};
 	{
 		// A row edit (the page sends the whole row on every keystroke, so both fields stay in step).
 		auto& env_editor = ui->global<EnvEditor>();
 		env_editor.on_edited(
-		    [env_model](int row, const slint::SharedString& name, const slint::SharedString& value)
+		    [env_model, &sync_quick_controls](int row, const slint::SharedString& name, const slint::SharedString& value)
 		    {
 			    if (row < 0 || static_cast<size_t>(row) >= env_model->row_count())
 			    {
@@ -710,16 +764,50 @@ int main(int argc, char** argv)
 			    v.name  = name;
 			    v.value = value;
 			    env_model->set_row_data(static_cast<size_t>(row), v);
+			    sync_quick_controls();
 		    });
 		env_editor.on_removed(
-		    [env_model](int row)
+		    [env_model, &sync_quick_controls](int row)
 		    {
 			    if (row >= 0 && static_cast<size_t>(row) < env_model->row_count())
 			    {
 				    env_model->erase(static_cast<size_t>(row));
 			    }
+			    sync_quick_controls();
 		    });
-		env_editor.on_added([env_model] { env_model->push_back(EnvVar {}); });
+		env_editor.on_added(
+		    [env_model, &sync_quick_controls]
+		    {
+			    env_model->push_back(EnvVar {});
+			    sync_quick_controls();
+		    });
+		// The quick controls' writes: replace the row with this name, or append it when new.
+		env_editor.on_set(
+		    [env_model, env_row_of, &sync_quick_controls](const slint::SharedString& name, const slint::SharedString& value)
+		    {
+			    EnvVar v;
+			    v.name  = name;
+			    v.value = value;
+			    const int row = env_row_of(ToStd(name));
+			    if (row >= 0)
+			    {
+				    env_model->set_row_data(static_cast<size_t>(row), v);
+			    } else
+			    {
+				    env_model->push_back(v);
+			    }
+			    sync_quick_controls();
+		    });
+		env_editor.on_unset(
+		    [env_model, env_row_of, &sync_quick_controls](const slint::SharedString& name)
+		    {
+			    const int row = env_row_of(ToStd(name));
+			    if (row >= 0)
+			    {
+				    env_model->erase(static_cast<size_t>(row));
+			    }
+			    sync_quick_controls();
+		    });
 	}
 	{
 		// STEP6:6e: the microphone and GPU lists are enumerated at most once per session (a few ms), again when
@@ -824,6 +912,7 @@ int main(int argc, char** argv)
 				rows.push_back(std::move(row));
 			}
 			env_model->set_vector(rows);
+			sync_quick_controls();
 		}
 		ui->global<Devices>().set_gpu_choice(v.gpu_index + 1);
 	};

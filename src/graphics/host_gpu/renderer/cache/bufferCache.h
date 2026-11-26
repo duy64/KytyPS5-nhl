@@ -253,6 +253,11 @@ public:
 	// host copy thread (see CommandScheduler::HostCopies()).
 	void StreamGuestData(uint8_t* destination, uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	// FillBuffer's metadata clear: TextureCache::ClearMetaCovered(vaddr, size). It is defined in textureCache.cpp, not
+	// in bufferCache.cpp, so that FillBuffer keeps its PGO profile: LLVM's call-site splitting copies FillBuffer's
+	// IsRegionGpuModified block only while the code before it costs less than 5, and a call with 3 parameters on
+	// m_texture_cache costs 5.
+	void ClearFillMeta(uint64_t vaddr, uint64_t size);
 	void CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
 	                bool src_gds);
 	// Cache-index and exact dirty-range queries require GPU-thread serialization.

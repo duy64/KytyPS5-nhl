@@ -2627,7 +2627,7 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMeta(vaddr);
+	ClearFillMeta(vaddr, size);
 	if (!IsRegionGpuModified(vaddr, size)) {
 		// Invalidate cached buffers and images for the whole range up front, as the write
 		// faults would page by page, so the fill below does not fault on every tracked page.

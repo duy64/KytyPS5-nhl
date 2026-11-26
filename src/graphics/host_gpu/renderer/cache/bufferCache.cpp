@@ -1487,6 +1487,49 @@ static bool SharedWritesDebug() {
 	return enabled;
 }
 
+// NHL27LAZYFAULT: roadmap step 4 (lazy fault resolution) counters. The fix carries its own
+// counter, same discipline as NHL27METACLEAR: a summary every 65,536 write faults, so the
+// session's last summary line is the final. Fields: write_faults (guest write faults through
+// ReadMemory), flushing (of those, the faulting page holds GPU-dirty bytes), eligible (passed
+// the lazy gate), taken (the async download was recorded and the page registered),
+// fallback_download (eligible but the async download failed, sync path taken), completed
+// (lazy records finished by FinishPendingGuestReads), contention_flush (the park guard fired),
+// slow_completion (a lazy completion took more than the 25 ms readwait bar — the park
+// detector), pending_max (high-water mark of the pending lazy records).
+struct LazyFaultStats {
+	std::atomic<uint64_t> write_faults {0};
+	std::atomic<uint64_t> flushing {0};
+	std::atomic<uint64_t> eligible {0};
+	std::atomic<uint64_t> taken {0};
+	std::atomic<uint64_t> fallback_download {0};
+	std::atomic<uint64_t> completed {0};
+	std::atomic<uint64_t> contention_flush {0};
+	std::atomic<uint64_t> slow_completion {0};
+	std::atomic<uint64_t> pending_max {0};
+};
+static LazyFaultStats g_lazyfault;
+static void NoteLazyFaultSummary() {
+	std::printf("NHL27LAZYFAULT: summary write_faults=%llu flushing=%llu eligible=%llu taken=%llu "
+	            "fallback_download=%llu completed=%llu contention_flush=%llu slow_completion=%llu "
+	            "pending_max=%llu\n",
+	            static_cast<unsigned long long>(g_lazyfault.write_faults.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_lazyfault.flushing.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_lazyfault.eligible.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_lazyfault.taken.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_lazyfault.fallback_download.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_lazyfault.completed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_lazyfault.contention_flush.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_lazyfault.slow_completion.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(g_lazyfault.pending_max.load(std::memory_order_relaxed)));
+	std::fflush(stdout);
+}
+static void NoteLazyFaultWriteFault(bool flushing, bool eligible) {
+	const uint64_t n = g_lazyfault.write_faults.fetch_add(1, std::memory_order_relaxed) + 1;
+	if (flushing) g_lazyfault.flushing.fetch_add(1, std::memory_order_relaxed);
+	if (eligible) g_lazyfault.eligible.fetch_add(1, std::memory_order_relaxed);
+	if (n % 65536 == 0) NoteLazyFaultSummary();
+}
+
 // Where a lazy shared write may be taken. One player's game crashed in the Edit / Create Player
 // screens (30 Hz) while scrolling through equipment with lazy writes on, and stopped crashing with
 // them off; the crash was never reproduced and left no log. So by default only play (the game asks
@@ -1517,6 +1560,53 @@ bool BufferCache::LazySharedWriteEligible(uint64_t vaddr, uint64_t size) {
 	m_gpu_modified_ranges.ForEachInRange(first, last - first,
 	                                     [&](uint64_t start, uint64_t end) { dirty += end - start; });
 	return dirty != 0 && dirty <= 256;
+}
+
+// Roadmap step 4 (lazy fault resolution): the guarded lazy write-fault path. Like
+// LazySharedWrites it records the GPU's byte-exact copies asynchronously and returns
+// without waiting — but unlike that path it registers the faulting page in the
+// pending-read guard FIRST, so any emulator-mediated read overlapping it completes the
+// resolution before serving bytes (FinishPendingGuestReads). The faulting thread never
+// waits: the record's tick is the current tick, recorded WITHOUT flushing the open
+// command buffer (one submit per fault would cost what the sync wait costs); the park
+// guard in FinishPendingGuestReads flushes on contention instead.
+// Returns false when the async download could not be recorded (no GPU-dirty bytes left
+// to copy, or the staging buffer was unavailable): the caller falls back to the sync
+// path, and the registration is already undone here.
+bool BufferCache::TryLazyFaultDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	// The deferred unit is the faulting page's GPU-dirty sub-ranges (byte-exact), not the
+	// whole page and not the 64 KiB WideWriteDownloads window.
+	const auto first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+	const auto last  = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+	std::vector<std::pair<uint64_t, uint64_t>> bytes;
+	m_gpu_modified_ranges.ForEachInRange(first, last - first,
+	                                     [&](uint64_t begin, uint64_t end) { bytes.emplace_back(begin, end); });
+	// Shared queries stay conservative while downloads move bytes out of the ordinary dirty
+	// ranges. Publish before DownloadBufferMemory removes those ranges (same ordering as
+	// the async guest-read path).
+	m_pending_guest_read_count.fetch_add(1, std::memory_order_release);
+	{
+		std::unique_lock ranges_lock(m_gpu_ranges_mutex);
+		m_pending_read_ranges.Add(first, last - first);
+		PublishGpuRangesVersion();
+	}
+	if (DownloadBufferMemory<true, true>(buffer, vaddr, size)) {
+		// The record's tick is the current tick; the faulting thread does NOT wait on it
+		// (async_tick stays 0 — the post-lambda wait in ReadMemory is for guest reads
+		// only). The deferred publish runs when the tick completes on the priority thread.
+		const uint64_t lazy_tick = m_scheduler.CurrentTick();
+		m_pending_guest_reads.push_back({first, last - first, lazy_tick, std::move(bytes), true});
+		const uint64_t depth = m_pending_guest_reads.size();
+		uint64_t         prev  = g_lazyfault.pending_max.load(std::memory_order_relaxed);
+		while (depth > prev &&
+		       !g_lazyfault.pending_max.compare_exchange_weak(prev, depth, std::memory_order_relaxed)) {
+		}
+		Common::Timeline::Mark("lazy-fault", vaddr);
+		return true;
+	}
+	m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
+	RebuildPendingReadRanges();
+	return false;
 }
 
 bool BufferCache::OverlapsPendingGuestBytes(uint64_t vaddr, uint64_t size) const {
@@ -1561,9 +1651,28 @@ void BufferCache::FinishPendingGuestReads(uint64_t vaddr, uint64_t size) {
 			continue;
 		}
 		m_pending_guest_reads.erase(m_pending_guest_reads.begin() + static_cast<ptrdiff_t>(i));
+		// Roadmap step 4 (lazy fault resolution): a lazy record's tick may still be in the
+		// open command buffer — the lazy path records without flushing, so a read that
+		// arrives before the next submit would wait on a tick only the execution thread can
+		// submit, while the execution thread is the one waiting. Flush the open buffer first
+		// when the writer is still in it (the retry gate's exact condition in ReadMemory).
+		// Async-read records already flushed at record time, so this is a no-op for them;
+		// the gate on read.lazy makes that structural, not empirical. The timer starts
+		// before the flush so slow_completion measures total completion time.
+		const auto lazy_wait_start = std::chrono::steady_clock::now();
+		if (read.lazy && !m_scheduler.IsFree(read.tick) && read.tick >= m_scheduler.CurrentTick()) {
+			m_scheduler.Flush();
+			g_lazyfault.contention_flush.fetch_add(1, std::memory_order_relaxed);
+		}
+		m_scheduler.WaitPriorityOperations(read.tick);
+		if (read.lazy) {
+			g_lazyfault.completed.fetch_add(1, std::memory_order_relaxed);
+			if (std::chrono::steady_clock::now() - lazy_wait_start > std::chrono::milliseconds(25)) {
+				g_lazyfault.slow_completion.fetch_add(1, std::memory_order_relaxed);
+			}
+		}
 		// The publish wrote the downloaded bytes to guest memory. Pages the GPU wrote again since
 		// keep their protection, like ForgetGpuWrite.
-		m_scheduler.WaitPriorityOperations(read.tick);
 		m_pending_guest_read_count.fetch_sub(1, std::memory_order_release);
 		rebuild.finished = true;
 		const auto first = read.vaddr & ~(TRACKER_PAGE_SIZE - 1);
@@ -1834,9 +1943,25 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			// (NHL 27 builds command buffers in pages a compute shader wrote 16 bytes of) need not wait
 			// for that shader. The download is queued and merged later, keeping any bytes the CPU
 			// changes meanwhile, which are newer.
-			const bool lazy = is_write && !on_gpu &&
-			                  Common::Experiments::Enabled(Common::Experiments::LazySharedWrites) &&
-			                  LazySharedWriteRateOk() && LazySharedWriteEligible(vaddr, size);
+			// Roadmap step 4 (lazy fault resolution): the same eligibility, but the deferred
+			// download is registered in the pending-read guard first (TryLazyFaultDownload), so
+			// any emulator-mediated read overlapping it completes the resolution before serving
+			// bytes. KYTY_LAZY_FAULT=0 restores today's behaviour exactly. The eligibility walk
+			// is computed once and shared by both paths.
+			const bool lazy_eligible = is_write && !on_gpu && LazySharedWriteRateOk() &&
+			                           LazySharedWriteEligible(vaddr, size);
+			const bool lazy_fault = lazy_eligible &&
+			                        Common::Experiments::Enabled(Common::Experiments::LazyFaultResolution);
+			const bool lazy = lazy_eligible &&
+			                  (Common::Experiments::Enabled(Common::Experiments::LazyFaultResolution) ||
+			                   Common::Experiments::Enabled(Common::Experiments::LazySharedWrites));
+			if (is_write && caller == ReadCaller::Fault) {
+				// flushing is page-granular like the download and the eligibility test: the
+				// faulting page holds GPU-dirty bytes (ForEachModifiedRange rounds to pages).
+				const auto page_first = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+				const auto page_last = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+				NoteLazyFaultWriteFault(HasGpuDirtyBytes(page_first, page_last - page_first), lazy_fault);
+			}
 			if (CpReadDebugEnabled()) {
 				g_readback_origin = origin;
 				g_readback_exact  = !is_write                          ? (HasGpuDirtyBytes(vaddr, size) ? 1u : 0u)
@@ -1911,8 +2036,21 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, ReadC
 			const auto gpu_write_start = gpu_write_debug ? std::chrono::steady_clock::now()
 			                                             : std::chrono::steady_clock::time_point {};
 			const auto gpu_write_tick  = buffer.last_write_tick;
-			const bool downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
-			                             : DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
+			bool downloaded = false;
+			if (lazy_fault) {
+				downloaded = TryLazyFaultDownload(buffer, vaddr, size);
+				if (downloaded) {
+					g_lazyfault.taken.fetch_add(1, std::memory_order_relaxed);
+				} else {
+					// Eligible but the async download could not be recorded: fall back to the
+					// sync path. The registration was already undone in TryLazyFaultDownload.
+					g_lazyfault.fallback_download.fetch_add(1, std::memory_order_relaxed);
+					downloaded = DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
+				}
+			} else {
+				downloaded = lazy ? DownloadBufferMemory<true, true>(buffer, vaddr, size)
+				                  : DownloadBufferMemory<false>(buffer, download_vaddr, download_size);
+			}
 			if (gpu_write_debug && downloaded) {
 				const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
 				                                                           gpu_write_start).count();

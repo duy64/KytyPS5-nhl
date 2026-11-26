@@ -49,6 +49,7 @@ enum Bit : uint64_t {
 	CleanFromDirect      = 1u << 18u, // KYTY_CLEAN_FROM_DIRECT (default on; strict evaluator reuses direct SRT words)
 	AsyncSubmit          = 1u << 21u, // KYTY_ASYNC_SUBMIT (default off; SubmitSplitRefresh in graphicsRun.cpp reads it to pick the submit-split thresholds; the recording thread still submits)
 	LazySharedWrites     = 1u << 22u, // KYTY_LAZY_SHARED_WRITES (default on; CPU stores next to few GPU-written bytes do not wait)
+	LazyFaultResolution  = uint64_t {1} << 58u, // KYTY_LAZY_FAULT (default on; a guest write fault next to few GPU-written bytes defers its download and registers the page in the pending-read guard instead of waiting)
 	NativeFp16           = 1u << 23u, // KYTY_NATIVE_FP16 (default off; f16vec2 math for packed f16 ops, needs shaderFloat16)
 	FaultPageReads       = 1u << 24u, // KYTY_FAULT_PAGE_READS (default on; SRT reads of pages that faulted before use the backing)
 	GpuColorClear        = 1u << 26u, // KYTY_GPU_COLOR_CLEAR (default on; fast-clear checks of GPU-written metadata on the GPU)

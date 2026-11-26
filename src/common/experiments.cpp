@@ -60,6 +60,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_WIDE_WRITE_DOWNLOADS", WideWriteDownloads, true);
 	set("KYTY_ASYNC_SUBMIT", AsyncSubmit, false);
 	set("KYTY_LAZY_SHARED_WRITES", LazySharedWrites, true);
+	set("KYTY_LAZY_FAULT", LazyFaultResolution, true);
 	set("KYTY_NATIVE_FP16", NativeFp16, false);
 	set("KYTY_FAULT_PAGE_READS", FaultPageReads, true);
 	set("KYTY_EXEC_SELECTS", ExecSelects, false);

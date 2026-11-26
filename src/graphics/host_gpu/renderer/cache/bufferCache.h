@@ -404,6 +404,10 @@ private:
 	template <bool async, bool merge = false>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool LazySharedWriteEligible(uint64_t vaddr, uint64_t size);
+	// Roadmap step 4 (lazy fault resolution): like LazySharedWrites, but the deferred
+	// download is registered in the pending-read guard first (see FinishPendingGuestReads).
+	// Returns true when the async download was recorded and the page registered.
+	[[nodiscard]] bool TryLazyFaultDownload(Buffer& buffer, uint64_t vaddr, uint64_t size);
 	// Experiment AsyncGuestReads (GPU thread): waits for the asynchronous guest reads overlapping
 	// the range and releases their pages that hold no newer GPU-written bytes.
 	void FinishPendingGuestReads(uint64_t vaddr, uint64_t size);
@@ -497,6 +501,11 @@ private:
 		uint64_t                                     size;
 		uint64_t                                     tick;
 		std::vector<std::pair<uint64_t, uint64_t>> bytes;
+		// Roadmap step 4 (lazy fault resolution): true when the record is a deferred
+		// write-fault download, not an async guest read. The park guard in
+		// FinishPendingGuestReads only flushes for lazy records (async-read records
+		// already flushed at record time).
+		bool                                         lazy = false;
 	};
 	std::vector<PendingGuestRead>                     m_pending_guest_reads;
 	std::atomic<size_t>                               m_pending_guest_read_count {0};

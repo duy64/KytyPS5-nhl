@@ -552,17 +552,126 @@ void TextureCache::TouchImage(Image& image) {
 	}
 }
 
+// NHL27G1 edge-verify counter totals (G1 fix); declared in textureCache.h.
+std::atomic<uint64_t> TextureCache::s_g1_track_calls {0};
+std::atomic<uint64_t> TextureCache::s_g1_head_checked {0};
+std::atomic<uint64_t> TextureCache::s_g1_tail_checked {0};
+std::atomic<uint64_t> TextureCache::s_g1_head_acquitted {0};
+std::atomic<uint64_t> TextureCache::s_g1_tail_acquitted {0};
+std::atomic<uint64_t> TextureCache::s_g1_head_mismatch {0};
+std::atomic<uint64_t> TextureCache::s_g1_tail_mismatch {0};
+std::atomic<uint64_t> TextureCache::s_g1_head_mismatch_compressed {0};
+std::atomic<uint64_t> TextureCache::s_g1_tail_mismatch_compressed {0};
+std::atomic<uint64_t> TextureCache::s_g1_oversize_maybe_seen {0};
+std::atomic<uint64_t> TextureCache::s_g1_oversize_promoted {0};
+std::atomic<uint64_t> TextureCache::s_g1_oversize_promoted_compressed {0};
+std::atomic<uint64_t> TextureCache::s_g1_hash_bytes {0};
+
+void TextureCache::G1NoteTrackCall() {
+	// Summary every 65,536 TrackImage calls, from TrackImage itself: the instrument-alive
+	// proof. A session log with no NHL27G1 summary line means the counter is dead.
+	const uint64_t calls = s_g1_track_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((calls & 0xFFFF) != 0) {
+		return;
+	}
+	std::printf("NHL27G1: summary track_calls=%llu head_checked=%llu head_acquitted=%llu "
+	            "head_mismatch=%llu head_mismatch_compressed=%llu tail_checked=%llu "
+	            "tail_acquitted=%llu tail_mismatch=%llu tail_mismatch_compressed=%llu "
+	            "oversize_maybe_seen=%llu oversize_promoted=%llu "
+	            "oversize_promoted_compressed=%llu hash_bytes=%llu\n",
+	            static_cast<unsigned long long>(calls),
+	            static_cast<unsigned long long>(s_g1_head_checked.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(s_g1_head_acquitted.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(s_g1_head_mismatch.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g1_head_mismatch_compressed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(s_g1_tail_checked.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(s_g1_tail_acquitted.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(s_g1_tail_mismatch.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g1_tail_mismatch_compressed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g1_oversize_maybe_seen.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g1_oversize_promoted.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g1_oversize_promoted_compressed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(s_g1_hash_bytes.load(std::memory_order_relaxed)));
+	std::fflush(stdout);
+}
+
+void TextureCache::G1NoteFirstSeen(G1Cause cause, const Image& image, uint64_t stored_hash,
+                                   uint64_t now_hash) {
+	static constexpr const char* names[] = {"head_mismatch", "tail_mismatch",
+	                                        "head_mismatch_compressed", "tail_mismatch_compressed",
+	                                        "oversize_promoted", "oversize_promoted_compressed"};
+	static std::mutex                               mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> seen;
+	static std::array<std::atomic<uint64_t>, 6>    counts {};
+	const auto                                      index = static_cast<size_t>(cause);
+	bool                                            first = false;
+	{
+		std::scoped_lock lock {mutex};
+		if (counts[index].load(std::memory_order_relaxed) < 16 &&
+		    seen.insert({image.info.data.address, static_cast<uint64_t>(index)}).second) {
+			counts[index].fetch_add(1, std::memory_order_relaxed);
+			first = true;
+		}
+	}
+	if (!first) {
+		return;
+	}
+	const auto compressed =
+	    image.info.metadata.compression != VideoOutCompression::Uncompressed;
+	if (cause == G1Cause::HeadMismatch || cause == G1Cause::TailMismatch ||
+	    cause == G1Cause::HeadMismatchCompressed || cause == G1Cause::TailMismatchCompressed) {
+		std::printf("NHL27G1: first-seen cause=%s addr=0x%llx size=0x%llx fmt=%s compressed=%d "
+		            "stored=0x%llx now=0x%llx\n",
+		            names[index], static_cast<unsigned long long>(image.info.data.address),
+		            static_cast<unsigned long long>(image.info.data.size),
+		            vk::to_string(image.info.pixel_format).c_str(), compressed ? 1 : 0,
+		            static_cast<unsigned long long>(stored_hash),
+		            static_cast<unsigned long long>(now_hash));
+	} else {
+		std::printf("NHL27G1: first-seen cause=%s addr=0x%llx size=0x%llx fmt=%s compressed=%d\n",
+		            names[index], static_cast<unsigned long long>(image.info.data.address),
+		            static_cast<unsigned long long>(image.info.data.size),
+		            vk::to_string(image.info.pixel_format).c_str(), compressed ? 1 : 0);
+	}
+	std::fflush(stdout);
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	// Generation is intentionally NOT bumped here (KYTY_DRAWPREP_DELTA): this only changes CPU-dirty and page-watch
 	// state (flags, maybe-cpu hash, watcher ranges). FindImage selects images from info/registration only
 	// (SameBacking, ResolveOverlap) and never reads those; dirtiness is acted on later by RefreshImage.
 	// Registration/free changes still bump via Unregister/Delete/Free.
 	GenCount(FrameBreakdown::g_delta.gen_dirty_skipped);
+	// NHL27G1: the edge hash covers at most the first and last page. An image spanning more
+	// than two pages cannot be acquitted by it, so the edge hash must not issue the verdict.
+	// Uncompressed images are promoted to definite dirty (the next RefreshImage re-uploads
+	// them); compressed images are counted only, never promoted: RefreshImage hard-exits
+	// on a compressed cpu-dirty image, so promoting one would turn speckle into a crash.
+	if (!image.EdgesCoverWholeImage()) {
+		s_g1_oversize_maybe_seen.fetch_add(1, std::memory_order_relaxed);
+		if (Common::Experiments::Enabled(Common::Experiments::G1EdgeVerify)) {
+			if (image.info.metadata.compression == VideoOutCompression::Uncompressed) {
+				image.MarkCpuDirty();
+				s_g1_oversize_promoted.fetch_add(1, std::memory_order_relaxed);
+				G1NoteFirstSeen(G1Cause::OversizePromoted, image, 0, 0);
+				UntrackImage(id);
+				return;
+			}
+			s_g1_oversize_promoted_compressed.fetch_add(1, std::memory_order_relaxed);
+			G1NoteFirstSeen(G1Cause::OversizePromotedCompressed, image, 0, 0);
+		}
+	}
 	image.MarkMaybeCpuDirty();
 	UntrackImage(id);
 }
 
 void TextureCache::TrackImage(ImageId id) {
+	G1NoteTrackCall();
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
@@ -576,6 +685,7 @@ void TextureCache::TrackImage(ImageId id) {
 		image.track_addr     = image_begin;
 		image.track_addr_end = image_end;
 		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
+		MarkDirtyIfEdgesModified(image);
 		return;
 	}
 	if (image_begin < image.track_addr) {
@@ -601,6 +711,7 @@ void TextureCache::TrackImageHead(ImageId id) {
 	const auto size  = image.track_addr - image_begin;
 	image.track_addr = image_begin;
 	m_page_manager.UpdatePageWatchers<true>(image_begin, size);
+	MarkDirtyIfEdgesModified(image);
 }
 
 void TextureCache::TrackImageTail(ImageId id) {
@@ -619,6 +730,63 @@ void TextureCache::TrackImageTail(ImageId id) {
 	const auto size      = image_end - address;
 	image.track_addr_end = image_end;
 	m_page_manager.UpdatePageWatchers<true>(address, size);
+	MarkDirtyIfEdgesModified(image);
+}
+
+void TextureCache::MarkDirtyIfEdgesModified(Image& image) {
+	// NHL27G1: re-hash the fragments UntrackImageHead/UntrackImageTail recorded, after the
+	// re-arm at the call site (arm-then-verify: a write landing after the re-arm faults on
+	// the armed watcher, while a write landing before it is caught by this comparison).
+	// A valid hash is cleared regardless of outcome: the fragment is protected again.
+	// With the experiment bit off no hash was ever recorded, so nothing is verified here;
+	// any stale hash is dropped without counting or promoting.
+	if (!Common::Experiments::Enabled(Common::Experiments::G1EdgeVerify)) {
+		image.ClearHeadHash();
+		image.ClearTailHash();
+		return;
+	}
+	const auto uncompressed =
+	    image.info.metadata.compression == VideoOutCompression::Uncompressed;
+	if (image.HeadHashValid()) {
+		const auto begin   = image.info.data.address;
+		const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+		const auto size    = address - begin;
+		const auto now     = image.HashGuestFragment(begin, size);
+		const auto stored  = image.HeadHash();
+		image.ClearHeadHash();
+		s_g1_head_checked.fetch_add(1, std::memory_order_relaxed);
+		s_g1_hash_bytes.fetch_add(size, std::memory_order_relaxed);
+		if (now == stored) {
+			s_g1_head_acquitted.fetch_add(1, std::memory_order_relaxed);
+		} else if (uncompressed) {
+			s_g1_head_mismatch.fetch_add(1, std::memory_order_relaxed);
+			G1NoteFirstSeen(G1Cause::HeadMismatch, image, stored, now);
+			image.MarkCpuDirty();
+		} else {
+			s_g1_head_mismatch_compressed.fetch_add(1, std::memory_order_relaxed);
+			G1NoteFirstSeen(G1Cause::HeadMismatchCompressed, image, stored, now);
+		}
+	}
+	if (image.TailHashValid()) {
+		const auto end     = image.info.data.End();
+		const auto address = Common::AlignDown(end, TRACKER_PAGE_SIZE);
+		const auto size    = end - address;
+		const auto now     = image.HashGuestFragment(address, size);
+		const auto stored  = image.TailHash();
+		image.ClearTailHash();
+		s_g1_tail_checked.fetch_add(1, std::memory_order_relaxed);
+		s_g1_hash_bytes.fetch_add(size, std::memory_order_relaxed);
+		if (now == stored) {
+			s_g1_tail_acquitted.fetch_add(1, std::memory_order_relaxed);
+		} else if (uncompressed) {
+			s_g1_tail_mismatch.fetch_add(1, std::memory_order_relaxed);
+			G1NoteFirstSeen(G1Cause::TailMismatch, image, stored, now);
+			image.MarkCpuDirty();
+		} else {
+			s_g1_tail_mismatch_compressed.fetch_add(1, std::memory_order_relaxed);
+			G1NoteFirstSeen(G1Cause::TailMismatchCompressed, image, stored, now);
+		}
+	}
 }
 
 void TextureCache::UntrackImage(ImageId id) {
@@ -647,6 +815,12 @@ void TextureCache::UntrackImageHead(ImageId id) {
 	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
 	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
 	const auto size    = address - begin;
+	// NHL27G1: record the hash of the fragment this call unprotects, before the collapse
+	// check below (MarkAsMaybeDirty may fully untrack, and the hash must survive that).
+	if (Common::Experiments::Enabled(Common::Experiments::G1EdgeVerify) && size != 0) {
+		image.RecordHeadHash(image.HashGuestFragment(begin, size));
+		s_g1_hash_bytes.fetch_add(size, std::memory_order_relaxed);
+	}
 	image.track_addr   = address;
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {
@@ -667,6 +841,12 @@ void TextureCache::UntrackImageTail(ImageId id) {
 	GenCount(FrameBreakdown::g_delta.gen_untrack_skipped);
 	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
 	const auto size      = end - address;
+	// NHL27G1: record the hash of the fragment this call unprotects (when end is
+	// page-aligned size is 0, no bytes are unprotected, so no hash is recorded).
+	if (Common::Experiments::Enabled(Common::Experiments::G1EdgeVerify) && size != 0) {
+		image.RecordTailHash(image.HashGuestFragment(address, size));
+		s_g1_hash_bytes.fetch_add(size, std::memory_order_relaxed);
+	}
 	image.track_addr_end = address;
 	image.HeapChanged();
 	if (image.track_addr == image.track_addr_end) {

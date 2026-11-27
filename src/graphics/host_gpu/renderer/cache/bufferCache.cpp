@@ -33,6 +33,7 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -2190,7 +2191,7 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 }
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
-                                    bool is_texel_buffer) {
+                                    bool is_texel_buffer, uint64_t* uploaded_bytes) {
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size = 0;
 	vk::Buffer                  source;
@@ -2214,6 +2215,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 		    source = UploadCopies(buffer, copies, total_size);
 	    });
 	walk_timer.Stop();
+	if (uploaded_bytes != nullptr) {
+		*uploaded_bytes = total_size;
+	}
 	if (source) {
 		PerfCount(PerfEvent::BufferUpload);
 		FrameBreakdown::Add(FrameBreakdown::g_counters.sync_uploads);
@@ -2586,6 +2590,30 @@ uint64_t BufferCache::TexelImageVersion(uint64_t vaddr) const {
 	return m_texture_cache.AddressBucketVersion(vaddr);
 }
 
+// NHL27G4PROV: first-obtain provenance logging (G1 build, instrumentation only). One line
+// per distinct (vaddr, size) range, cap 2,048 ranges; no behaviour change. The line is
+// written at the obtain, before the caller uploads.
+void NoteG4Prov(uint64_t vaddr, uint64_t size, int path, uint64_t dirty_bytes,
+                uint64_t resident_bytes) {
+	static std::mutex                   mutex;
+	static std::unordered_set<uint64_t> seen;
+	bool                                first = false;
+	{
+		std::scoped_lock lock {mutex};
+		if (seen.size() < 2048) {
+			first = seen.insert(vaddr * 0x9e3779b97f4a7c15ull ^ (size + 0x1000193ull)).second;
+		}
+	}
+	if (!first) {
+		return;
+	}
+	std::printf("NHL27G4PROV: addr=0x%llx size=0x%llx path=%d dirty_bytes=%llu resident_bytes=%llu\n",
+	            static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size), path,
+	            static_cast<unsigned long long>(dirty_bytes),
+	            static_cast<unsigned long long>(resident_bytes));
+	std::fflush(stdout);
+}
+
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid image source\n");
@@ -2595,13 +2623,18 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 		auto& buffer = m_slot_buffers[*owner];
 		if (buffer.IsInBounds(vaddr, size)) {
 			TouchBuffer(buffer);
-			(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+			uint64_t uploaded_bytes = 0;
+			(void)SynchronizeBuffer(buffer, vaddr, size, false, false, &uploaded_bytes);
+			NoteG4Prov(vaddr, size, 1, uploaded_bytes, size - uploaded_bytes);
 			return {&buffer, buffer.Offset(vaddr)};
 		}
 	}
 	if (IsRegionGpuModified(vaddr, size)) {
+		NoteG4Prov(vaddr, size, 2, size, 0);
 		return ObtainBuffer(vaddr, size, false, false);
 	}
+
+	NoteG4Prov(vaddr, size, 3, 0, size);
 
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,

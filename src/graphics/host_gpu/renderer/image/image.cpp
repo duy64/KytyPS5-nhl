@@ -857,6 +857,28 @@ uint64_t Image::HashGuestEdges() const {
 	return XXH3_64bits(bytes.data(), static_cast<size_t>(head_size + tail_size));
 }
 
+uint64_t Image::HashGuestFragment(uint64_t address, uint64_t size) const {
+	// A fragment is at most one page by construction (the untracked head/tail piece).
+	EXIT_IF(size > TRACKER_PAGE_SIZE);
+	std::array<uint8_t, TRACKER_PAGE_SIZE> bytes {};
+	if (size != 0 && !LibKernel::Memory::TryReadBacking(address, bytes.data(), size)) {
+		EXIT("Image: failed to hash guest backing\n");
+	}
+	return XXH3_64bits(bytes.data(), static_cast<size_t>(size));
+}
+
+bool Image::EdgesCoverWholeImage() const {
+	// Same head_end/tail_begin expressions as HashGuestEdges, so the test and the hash
+	// agree by construction: the edge hash covers every byte exactly when the head and
+	// tail fragments meet or overlap.
+	const auto         range      = info.data;
+	const uint64_t head_end =
+	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
+	const uint64_t tail_begin =
+	    std::max(range.address, Common::AlignDown(range.End(), TRACKER_PAGE_SIZE));
+	return tail_begin <= head_end;
+}
+
 Image::ShadowLevel& Image::ShadowLevelAt(uint32_t level) {
 	EXIT_IF(level >= backing.mip_levels);
 	if (m_shadow == nullptr) {

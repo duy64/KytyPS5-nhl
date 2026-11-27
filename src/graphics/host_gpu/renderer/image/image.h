@@ -89,6 +89,10 @@ public:
 	void MarkCpuDirty() {
 		m_cpu_dirty       = true;
 		m_maybe_cpu_dirty = false;
+		m_head_hash       = 0;
+		m_tail_hash       = 0;
+		m_head_hash_valid = false;
+		m_tail_hash_valid = false;
 		HeapChanged();
 	}
 
@@ -102,6 +106,18 @@ public:
 			HeapChanged();
 		}
 	}
+	// NHL27G1 edge verification: hash of the head/tail fragment last unprotected by
+	// UntrackImageHead/UntrackImageTail; valid only while that fragment is unprotected.
+	// The fields are private; TextureCache records and verifies through these accessors.
+	void               RecordHeadHash(uint64_t hash) { m_head_hash = hash; m_head_hash_valid = true; }
+	void               RecordTailHash(uint64_t hash) { m_tail_hash = hash; m_tail_hash_valid = true; }
+	[[nodiscard]] bool HeadHashValid() const { return m_head_hash_valid; }
+	[[nodiscard]] bool TailHashValid() const { return m_tail_hash_valid; }
+	[[nodiscard]] uint64_t HeadHash() const { return m_head_hash; }
+	[[nodiscard]] uint64_t TailHash() const { return m_tail_hash; }
+	void               ClearHeadHash() { m_head_hash = 0; m_head_hash_valid = false; }
+	void               ClearTailHash() { m_tail_hash = 0; m_tail_hash_valid = false; }
+
 	[[nodiscard]] bool ResolveMaybeCpuHash(uint64_t hash) {
 		if (!m_maybe_cpu_dirty || m_cpu_dirty) {
 			EXIT("image cannot resolve maybe-dirty hash\n");
@@ -117,6 +133,10 @@ public:
 		}
 		m_cpu_dirty       = false;
 		m_maybe_cpu_dirty = false;
+		m_head_hash       = 0;
+		m_tail_hash       = 0;
+		m_head_hash_valid = false;
+		m_tail_hash_valid = false;
 	}
 
 	[[nodiscard]] bool IsGpuModified() const noexcept { return m_gpu_modified; }
@@ -143,6 +163,8 @@ public:
 		return backing.image == nullptr ? 0 : Common::AlignUp(info.data.size, 1024);
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
+	[[nodiscard]] uint64_t HashGuestFragment(uint64_t address, uint64_t size) const;
+	[[nodiscard]] bool     EdgesCoverWholeImage() const;
 	[[nodiscard]] vk::ImageLayout ReadLayout() const noexcept {
 		return info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
 		                      : vk::ImageLayout::eShaderReadOnlyOptimal;
@@ -210,6 +232,10 @@ private:
 	GraphicContext&   m_graphics;
 	CommandScheduler& m_scheduler;
 	uint64_t          m_maybe_cpu_hash  = 0;
+	uint64_t          m_head_hash       = 0;
+	uint64_t          m_tail_hash       = 0;
+	bool              m_head_hash_valid = false;
+	bool              m_tail_hash_valid = false;
 	bool              m_cpu_dirty       = false;
 	bool              m_maybe_cpu_dirty = false;
 	bool              m_gpu_modified    = false;

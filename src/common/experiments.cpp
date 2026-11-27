@@ -108,6 +108,7 @@ uint64_t EnvironmentMask() {
 	set("KYTY_GUEST_OFF_COPY_CORE", GuestOffCopyCore, false);
 	set("KYTY_GUEST_OFF_CP_CORES", GuestOffCpCores, false);
 	set("KYTY_SPECULATE_STRICT", SpeculateStrict, false);
+	set("KYTY_G1_EDGE_VERIFY", G1EdgeVerify, true);
 	set("KYTY_ASYNC_READBACK", AsyncReadback, false);
 	set("KYTY_DIRECT_GPU_READS", DirectGpuReads, false);
 	set("KYTY_PROGRAM_LOCK_SPLIT", ProgramLockSplit, false);

@@ -71,6 +71,7 @@ enum Bit : uint64_t {
 	DirectGpuReads       = uint64_t {1} << 55u, // KYTY_DIRECT_GPU_READS (default off; downloads of bytes whose GPU writer already finished read the mapped game buffer, needs the same variable at startup; moved from bit 41 in the 2026-10-27 collision fix, was aliased to DispatchResolver)
 	AsyncReadback        = uint64_t {1} << 56u, // KYTY_ASYNC_READBACK (default off; guest and command-processor downloads wait on their own thread, not the execution thread; moved from bit 42 in the 2026-10-27 collision fix, was aliased to BdaLoadGroups)
 	SpeculateStrict      = uint64_t {1} << 57u, // KYTY_SPECULATE_STRICT (default off; with SpeculateDirtyReads, never guess bytes that changed twice or were guessed wrong once; moved from bit 43 in the 2026-10-27 collision fix, was aliased to DrawResolver)
+	G1EdgeVerify        = uint64_t {1} << 58u, // KYTY_G1_EDGE_VERIFY (default on; untracked image head/tail fragments are hash-verified at re-track and oversize images are promoted from maybe-dirty to definite dirty)
 	// A/B only (no environment variable): selects the code a pending change replaces.
 	AbLegacy = 1u << 31u,
 	// A/B only, like AbLegacy, for the changes made after it was taken (AbLegacy also turns off

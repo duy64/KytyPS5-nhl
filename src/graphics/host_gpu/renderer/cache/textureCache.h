@@ -210,6 +210,7 @@ private:
 	void                      UntrackImageHead(ImageId id);
 	void                      UntrackImageTail(ImageId id);
 	void                      MarkAsMaybeDirty(ImageId id, Image& image);
+	void                      MarkDirtyIfEdgesModified(Image& image);
 	void                      TrackImageDownload(ImageId id, Image& image, bool storage);
 	[[nodiscard]] static bool SameBacking(const ImageInfo& cached, const ImageInfo& requested,
 	                                      bool exact_format);
@@ -262,6 +263,20 @@ private:
 	void ValidateImageViewDesc(const ImageDesc& desc) const;
 	void ValidateImageDesc(const ImageDesc& desc) const;
 	[[nodiscard]] ImageId GetNullImage(const ImageDesc& desc);
+
+	// NHL27G1 edge-verify counter (G1 fix): first-seen causes and emission helpers.
+	// Counter totals are static members; definitions are in textureCache.cpp.
+	enum class G1Cause : uint8_t {
+		HeadMismatch,
+		TailMismatch,
+		HeadMismatchCompressed,
+		TailMismatchCompressed,
+		OversizePromoted,
+		OversizePromotedCompressed,
+	};
+	static void G1NoteTrackCall();
+	static void G1NoteFirstSeen(G1Cause cause, const Image& image, uint64_t stored_hash,
+	                            uint64_t now_hash);
 
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	// tolerant_write: the deferred guest write skips (instead of exiting) if the range was unmapped.
@@ -325,6 +340,20 @@ private:
 	// Set while an overlap/alias resolution frees an image; only those frees write back.
 	bool             m_alias_free_in_progress = false;
 	std::atomic<uint64_t> m_generation {0};
+	// NHL27G1 edge-verify counter totals (G1 fix); definitions in textureCache.cpp.
+	static std::atomic<uint64_t> s_g1_track_calls;
+	static std::atomic<uint64_t> s_g1_head_checked;
+	static std::atomic<uint64_t> s_g1_tail_checked;
+	static std::atomic<uint64_t> s_g1_head_acquitted;
+	static std::atomic<uint64_t> s_g1_tail_acquitted;
+	static std::atomic<uint64_t> s_g1_head_mismatch;
+	static std::atomic<uint64_t> s_g1_tail_mismatch;
+	static std::atomic<uint64_t> s_g1_head_mismatch_compressed;
+	static std::atomic<uint64_t> s_g1_tail_mismatch_compressed;
+	static std::atomic<uint64_t> s_g1_oversize_maybe_seen;
+	static std::atomic<uint64_t> s_g1_oversize_promoted;
+	static std::atomic<uint64_t> s_g1_oversize_promoted_compressed;
+	static std::atomic<uint64_t> s_g1_hash_bytes;
 	struct GenLogEntry {
 		uint64_t generation = 0;
 		uint64_t begin      = 0;

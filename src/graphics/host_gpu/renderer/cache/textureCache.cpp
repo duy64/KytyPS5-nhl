@@ -552,6 +552,109 @@ void TextureCache::TouchImage(Image& image) {
 	}
 }
 
+// NHL27G2 copy-credit counter totals (G2 fix); declared in textureCache.h.
+std::atomic<uint64_t> TextureCache::s_g2_track_calls {0};
+std::atomic<uint64_t> TextureCache::s_g2_copy_calls {0};
+std::atomic<uint64_t> TextureCache::s_g2_copy_skip_total {0};
+std::atomic<uint64_t> TextureCache::s_g2_copy_skip_ranges_differ {0};
+std::atomic<uint64_t> TextureCache::s_g2_copy_skip_same_range {0};
+std::atomic<uint64_t> TextureCache::s_g2_copy_skip_dest_dirty_preserved {0};
+std::atomic<uint64_t> TextureCache::s_g2_copy_skip_dest_dirty_compressed {0};
+std::atomic<uint64_t> TextureCache::s_g2_copy_skip_dest_dirty_cleared {0};
+std::atomic<uint64_t> TextureCache::s_g2_copy_skip_dest_clean {0};
+
+void TextureCache::G2NoteTrackCall() {
+	// Summary every 65,536 TrackImage calls, from TrackImage itself: the instrument-alive
+	// proof. A session log with no NHL27G2 summary line means the counter is dead.
+	const uint64_t calls = s_g2_track_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((calls & 0xFFFF) != 0) {
+		return;
+	}
+	std::printf("NHL27G2: summary copy_calls=%llu copy_skip_total=%llu "
+	            "copy_skip_ranges_differ=%llu copy_skip_same_range=%llu "
+	            "copy_skip_dest_dirty_preserved=%llu copy_skip_dest_dirty_compressed=%llu "
+	            "copy_skip_dest_dirty_cleared=%llu copy_skip_dest_clean=%llu\n",
+	            static_cast<unsigned long long>(s_g2_copy_calls.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g2_copy_skip_total.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g2_copy_skip_ranges_differ.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g2_copy_skip_same_range.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g2_copy_skip_dest_dirty_preserved.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g2_copy_skip_dest_dirty_compressed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g2_copy_skip_dest_dirty_cleared.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g2_copy_skip_dest_clean.load(std::memory_order_relaxed)));
+	std::fflush(stdout);
+}
+
+void TextureCache::G2NoteFirstSeen(G2Cause cause, const Image& destination, const Image& source) {
+	static constexpr const char* names[] = {"dest_dirty_preserved", "dest_dirty_compressed",
+	                                        "dest_dirty_cleared"};
+	static std::mutex                               mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> seen;
+	static std::array<std::atomic<uint64_t>, 3>    counts {};
+	const auto                                      index = static_cast<size_t>(cause);
+	bool                                            first = false;
+	{
+		std::scoped_lock lock {mutex};
+		if (counts[index].load(std::memory_order_relaxed) < 16 &&
+		    seen.insert({destination.info.data.address, static_cast<uint64_t>(index)}).second) {
+			counts[index].fetch_add(1, std::memory_order_relaxed);
+			first = true;
+		}
+	}
+	if (!first) {
+		return;
+	}
+	const auto dest_compressed =
+	    destination.info.metadata.compression != VideoOutCompression::Uncompressed;
+	std::printf("NHL27G2: first-seen cause=%s dest_addr=0x%llx dest_size=0x%llx dest_fmt=%s "
+	            "dest_compressed=%d src_addr=0x%llx src_size=0x%llx\n",
+	            names[index],
+	            static_cast<unsigned long long>(destination.info.data.address),
+	            static_cast<unsigned long long>(destination.info.data.size),
+	            vk::to_string(destination.info.pixel_format).c_str(), dest_compressed ? 1 : 0,
+	            static_cast<unsigned long long>(source.info.data.address),
+	            static_cast<unsigned long long>(source.info.data.size));
+	std::fflush(stdout);
+}
+
+void TextureCache::G2NoteCopySkip(const Image& destination, const Image& source, bool dest_was_dirty,
+                                  bool preserved) {
+	// Count the skip and its sub-cause. `dest_was_dirty` was captured in CopyImage before any
+	// clearing, so it is the true pre-copy state in both orders. `preserved` is true only when
+	// the fix is on and the destination is uncompressed. Every skip ends in exactly one
+	// sub-total: same_range, dest_dirty_preserved, dest_dirty_compressed, dest_dirty_cleared,
+	// or dest_clean.
+	s_g2_copy_skip_total.fetch_add(1, std::memory_order_relaxed);
+	if (source.info.data == destination.info.data) {
+		s_g2_copy_skip_same_range.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	s_g2_copy_skip_ranges_differ.fetch_add(1, std::memory_order_relaxed);
+	if (!dest_was_dirty) {
+		s_g2_copy_skip_dest_clean.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	if (preserved) {
+		s_g2_copy_skip_dest_dirty_preserved.fetch_add(1, std::memory_order_relaxed);
+		G2NoteFirstSeen(G2Cause::DestDirtyPreserved, destination, source);
+		return;
+	}
+	if (destination.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		s_g2_copy_skip_dest_dirty_compressed.fetch_add(1, std::memory_order_relaxed);
+		G2NoteFirstSeen(G2Cause::DestDirtyCompressed, destination, source);
+		return;
+	}
+	s_g2_copy_skip_dest_dirty_cleared.fetch_add(1, std::memory_order_relaxed);
+	G2NoteFirstSeen(G2Cause::DestDirtyCleared, destination, source);
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	// Generation is intentionally NOT bumped here (KYTY_DRAWPREP_DELTA): this only changes CPU-dirty and page-watch
 	// state (flags, maybe-cpu hash, watcher ranges). FindImage selects images from info/registration only
@@ -563,6 +666,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 }
 
 void TextureCache::TrackImage(ImageId id) {
+	G2NoteTrackCall();
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
@@ -922,6 +1026,7 @@ bool TextureCache::CopyD16(Image& destination, Image& source) {
 }
 
 void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
+	s_g2_copy_calls.fetch_add(1, std::memory_order_relaxed);
 	RefreshCopySource(source_id);
 	auto& destination = m_slot_images[destination_id];
 	auto& source      = m_slot_images[source_id];
@@ -929,12 +1034,31 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	if (source.backing.samples != destination.backing.samples) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
-	PrepareImageCopy(destination);
+	// NHL27G2: capture the destination's dirty state before any clearing, so the counter
+	// can tell whether a skipped copy held a dirty destination (the old code cleared it
+	// on credit before the check, which is exactly the bug).
+	const bool dest_was_dirty = destination.IsCpuDirty();
+	// NHL27G2: with the fix on, the destination's dirty state is cleared only when the
+	// copy actually happens (after the early-return check below). With the fix off,
+	// today's order is kept (cleared on credit before the check). A compressed
+	// destination always keeps today's order: preserving a cpu-dirty flag on it would
+	// exit at the next RefreshImage (compressed refresh is unsupported), so compressed
+	// destinations are counted, not preserved (the G1 §0.2 rule).
+	const bool g2_on = Common::Experiments::Enabled(Common::Experiments::G2CopyDirtyPreserve);
+	const bool dest_compressed =
+	    destination.info.metadata.compression != VideoOutCompression::Uncompressed;
+	if (!g2_on || dest_compressed) {
+		PrepareImageCopy(destination);
+	}
 	if (source.IsBufferModified()) {
+		G2NoteCopySkip(destination, source, dest_was_dirty, g2_on && !dest_compressed);
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
 		}
 		return;
+	}
+	if (g2_on && !dest_compressed) {
+		PrepareImageCopy(destination);
 	}
 	const bool source_depth = source.info.IsDepth();
 	const bool dest_depth   = destination.info.IsDepth();

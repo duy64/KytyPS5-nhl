@@ -263,6 +263,18 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 	[[nodiscard]] ImageId GetNullImage(const ImageDesc& desc);
 
+	// NHL27G2 copy-credit counter (G2 fix): first-seen causes and emission helpers.
+	// Counter totals are static members; definitions are in textureCache.cpp.
+	enum class G2Cause : uint8_t {
+		DestDirtyPreserved,
+		DestDirtyCompressed,
+		DestDirtyCleared,
+	};
+	static void G2NoteTrackCall();
+	static void G2NoteFirstSeen(G2Cause cause, const Image& destination, const Image& source);
+	static void G2NoteCopySkip(const Image& destination, const Image& source, bool dest_was_dirty,
+	                           bool preserved);
+
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	// tolerant_write: the deferred guest write skips (instead of exiting) if the range was unmapped.
 	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool tolerant_write = false);
@@ -325,6 +337,16 @@ private:
 	// Set while an overlap/alias resolution frees an image; only those frees write back.
 	bool             m_alias_free_in_progress = false;
 	std::atomic<uint64_t> m_generation {0};
+	// NHL27G2 copy-credit counter totals (G2 fix); definitions in textureCache.cpp.
+	static std::atomic<uint64_t> s_g2_track_calls;
+	static std::atomic<uint64_t> s_g2_copy_calls;
+	static std::atomic<uint64_t> s_g2_copy_skip_total;
+	static std::atomic<uint64_t> s_g2_copy_skip_ranges_differ;
+	static std::atomic<uint64_t> s_g2_copy_skip_same_range;
+	static std::atomic<uint64_t> s_g2_copy_skip_dest_dirty_preserved;
+	static std::atomic<uint64_t> s_g2_copy_skip_dest_dirty_compressed;
+	static std::atomic<uint64_t> s_g2_copy_skip_dest_dirty_cleared;
+	static std::atomic<uint64_t> s_g2_copy_skip_dest_clean;
 	struct GenLogEntry {
 		uint64_t generation = 0;
 		uint64_t begin      = 0;

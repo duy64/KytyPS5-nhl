@@ -552,6 +552,112 @@ void TextureCache::TouchImage(Image& image) {
 	}
 }
 
+// NHL27G3 overlap fall-through counter totals (G3, counter-only); declared in textureCache.h.
+std::atomic<uint64_t> TextureCache::s_g3_track_calls {0};
+std::atomic<uint64_t> TextureCache::s_g3_overlap_calls {0};
+std::atomic<uint64_t> TextureCache::s_g3_fallthrough_total {0};
+std::atomic<uint64_t> TextureCache::s_g3_fallthrough_partial {0};
+std::atomic<uint64_t> TextureCache::s_g3_fallthrough_equal_addr {0};
+std::atomic<uint64_t> TextureCache::s_g3_fallthrough_req_compressed {0};
+std::atomic<uint64_t> TextureCache::s_g3_fallthrough_req_uncompressed {0};
+std::atomic<uint64_t> TextureCache::s_g3_fallthrough_cached_freed {0};
+std::atomic<uint64_t> TextureCache::s_g3_fallthrough_cached_kept {0};
+
+void TextureCache::G3NoteTrackCall() {
+	// Summary every 65,536 TrackImage calls, from TrackImage itself: the instrument-alive
+	// proof. A session log with no NHL27G3 summary line means the counter is dead.
+	const uint64_t calls = s_g3_track_calls.fetch_add(1, std::memory_order_relaxed) + 1;
+	if ((calls & 0xFFFF) != 0) {
+		return;
+	}
+	std::printf("NHL27G3: summary overlap_calls=%llu fallthrough_total=%llu "
+	            "fallthrough_partial=%llu fallthrough_equal_addr=%llu "
+	            "fallthrough_req_compressed=%llu fallthrough_req_uncompressed=%llu "
+	            "fallthrough_cached_freed=%llu fallthrough_cached_kept=%llu\n",
+	            static_cast<unsigned long long>(s_g3_overlap_calls.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g3_fallthrough_total.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g3_fallthrough_partial.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g3_fallthrough_equal_addr.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g3_fallthrough_req_compressed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g3_fallthrough_req_uncompressed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g3_fallthrough_cached_freed.load(std::memory_order_relaxed)),
+	            static_cast<unsigned long long>(
+	                s_g3_fallthrough_cached_kept.load(std::memory_order_relaxed)));
+	std::fflush(stdout);
+}
+
+void TextureCache::G3NoteFirstSeen(G3Cause cause, const ImageInfo& requested, const Image& cached,
+                                   G3Site site, bool freed) {
+	// The bit gates the first-seen printf only; the totals in G3NoteFallthrough are ungated,
+	// so a bit-off run still shows the summary (wiring control) with first-seen lines absent.
+	if (!Common::Experiments::Enabled(Common::Experiments::G3OverlapContent)) {
+		return;
+	}
+	static constexpr const char* names[] = {"req_compressed", "cached_freed"};
+	static constexpr const char* sites[] = {"equal_addr", "partial"};
+	static std::mutex                               mutex;
+	static std::set<std::pair<uint64_t, uint64_t>> seen;
+	static std::array<std::atomic<uint64_t>, 2>    counts {};
+	const auto                                      index = static_cast<size_t>(cause);
+	bool                                            first = false;
+	{
+		std::scoped_lock lock {mutex};
+		if (counts[index].load(std::memory_order_relaxed) < 16 &&
+		    seen.insert({requested.data.address, static_cast<uint64_t>(index)}).second) {
+			counts[index].fetch_add(1, std::memory_order_relaxed);
+			first = true;
+		}
+	}
+	if (!first) {
+		return;
+	}
+	const auto req_compressed =
+	    requested.metadata.compression != VideoOutCompression::Uncompressed;
+	std::printf("NHL27G3: first-seen cause=%s site=%s req_addr=0x%llx req_size=0x%llx "
+	            "req_fmt=%s req_compressed=%d cached_addr=0x%llx cached_size=0x%llx "
+	            "cached_fmt=%s freed=%d\n",
+	            names[index], sites[static_cast<size_t>(site)],
+	            static_cast<unsigned long long>(requested.data.address),
+	            static_cast<unsigned long long>(requested.data.size),
+	            vk::to_string(requested.pixel_format).c_str(), req_compressed ? 1 : 0,
+	            static_cast<unsigned long long>(cached.info.data.address),
+	            static_cast<unsigned long long>(cached.info.data.size),
+	            vk::to_string(cached.info.pixel_format).c_str(), freed ? 1 : 0);
+	std::fflush(stdout);
+}
+
+void TextureCache::G3NoteFallthrough(const ImageInfo& requested, const Image& cached, G3Site site,
+                                     bool freed) {
+	// Count the fall-through and its sub-causes. Every fall-through ends in exactly one
+	// sub-total of each partition: partial/equal_addr, req_compressed/req_uncompressed,
+	// cached_freed/cached_kept. `freed` is the free decision at the site, passed before any
+	// FreeImage runs, so the cached image is still valid to read here.
+	s_g3_fallthrough_total.fetch_add(1, std::memory_order_relaxed);
+	if (site == G3Site::Partial) {
+		s_g3_fallthrough_partial.fetch_add(1, std::memory_order_relaxed);
+	} else {
+		s_g3_fallthrough_equal_addr.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (requested.metadata.compression != VideoOutCompression::Uncompressed) {
+		s_g3_fallthrough_req_compressed.fetch_add(1, std::memory_order_relaxed);
+		G3NoteFirstSeen(G3Cause::ReqCompressed, requested, cached, site, freed);
+	} else {
+		s_g3_fallthrough_req_uncompressed.fetch_add(1, std::memory_order_relaxed);
+	}
+	if (freed) {
+		s_g3_fallthrough_cached_freed.fetch_add(1, std::memory_order_relaxed);
+		G3NoteFirstSeen(G3Cause::CachedFreed, requested, cached, site, freed);
+	} else {
+		s_g3_fallthrough_cached_kept.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+
 void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 	// Generation is intentionally NOT bumped here (KYTY_DRAWPREP_DELTA): this only changes CPU-dirty and page-watch
 	// state (flags, maybe-cpu hash, watcher ranges). FindImage selects images from info/registration only
@@ -563,6 +669,7 @@ void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
 }
 
 void TextureCache::TrackImage(ImageId id) {
+	G3NoteTrackCall();
 	auto& image = m_slot_images[id];
 	if (!image.registered) {
 		return;
@@ -1233,6 +1340,8 @@ void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
 TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
                                                          BindingType binding, ImageId cached_id,
                                                          ImageId merged_id, bool speculative) {
+	// NHL27G3: count every overlap resolution (the denominator for the fall-through rate).
+	s_g3_overlap_calls.fetch_add(1, std::memory_order_relaxed);
 	auto owner = m_slot_images.try_get(cached_id);
 	if (owner == nullptr || !owner->registered) {
 		return {merged_id};
@@ -1272,6 +1381,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
 			                        left.surface_z == right.surface_z;
 		                 }))) {
+			// NHL27G3: equal-address fall-through (tile/mip-layout differ) — no content
+			// transfer. Note before the free: the cached image must still be valid to read.
+			G3NoteFallthrough(requested, cached, G3Site::EqualAddr, safe_to_delete);
 			if (safe_to_delete) {
 				FreeImage(cached_id);
 			}
@@ -1316,16 +1428,24 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			return {ExpandImage(requested, cached_id)};
 		}
 		if (requested.type != cached.info.type) {
+			// NHL27G3: equal-address fall-through (type differs) — no content transfer.
+			G3NoteFallthrough(requested, cached, G3Site::EqualAddr, false);
 			return {merged_id};
 		}
 		if (requested.pixel_format != cached.info.pixel_format ||
 		    requested.data.size <= cached.info.data.size) {
 			const auto result_id = merged_id ? merged_id : cached_id;
 			const auto result    = m_slot_images.try_get(result_id);
-			return {result != nullptr && ImageViewOps::FormatsCompatible(result->info.pixel_format,
-			                                                             requested.pixel_format)
-			            ? result_id
-			            : ImageId {}};
+			const bool compatible =
+			    result != nullptr &&
+			    ImageViewOps::FormatsCompatible(result->info.pixel_format,
+			                                    requested.pixel_format);
+			if (!compatible) {
+				// NHL27G3: equal-address fall-through (incompatible format) — no content
+				// transfer.
+				G3NoteFallthrough(requested, cached, G3Site::EqualAddr, false);
+			}
+			return {compatible ? result_id : ImageId {}};
 		}
 		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
 		     " requested=%ux%u "
@@ -1374,7 +1494,12 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		            vk::to_string(cached.info.pixel_format).c_str(),
 		            (requested.data.address >= cached.info.data.address && safe_to_delete) ? 1 : 0);
 	}
-	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
+	// NHL27G3: partial-overlap fall-through — no content transfer. Note before the free:
+	// the cached image must still be valid to read. The free condition is unchanged.
+	const bool g3_freed =
+	    requested.data.address >= cached.info.data.address && safe_to_delete;
+	G3NoteFallthrough(requested, cached, G3Site::Partial, g3_freed);
+	if (g3_freed) {
 		FreeImage(cached_id);
 	}
 	return {merged_id};

@@ -263,6 +263,22 @@ private:
 	void ValidateImageDesc(const ImageDesc& desc) const;
 	[[nodiscard]] ImageId GetNullImage(const ImageDesc& desc);
 
+	// NHL27G3 overlap fall-through counter (G3, counter-only): first-seen causes and emission
+	// helpers. Counter totals are static members; definitions are in textureCache.cpp.
+	enum class G3Site : uint8_t {
+		EqualAddr,
+		Partial,
+	};
+	enum class G3Cause : uint8_t {
+		ReqCompressed,
+		CachedFreed,
+	};
+	static void G3NoteTrackCall();
+	static void G3NoteFirstSeen(G3Cause cause, const ImageInfo& requested, const Image& cached,
+	                            G3Site site, bool freed);
+	static void G3NoteFallthrough(const ImageInfo& requested, const Image& cached, G3Site site,
+	                              bool freed);
+
 	void               InvalidateCpuAliases(uint64_t address, uint64_t size);
 	// tolerant_write: the deferred guest write skips (instead of exiting) if the range was unmapped.
 	[[nodiscard]] bool DownloadImageMemory(ImageId id, bool tolerant_write = false);
@@ -325,6 +341,16 @@ private:
 	// Set while an overlap/alias resolution frees an image; only those frees write back.
 	bool             m_alias_free_in_progress = false;
 	std::atomic<uint64_t> m_generation {0};
+	// NHL27G3 overlap fall-through counter totals (G3, counter-only); definitions in textureCache.cpp.
+	static std::atomic<uint64_t> s_g3_track_calls;
+	static std::atomic<uint64_t> s_g3_overlap_calls;
+	static std::atomic<uint64_t> s_g3_fallthrough_total;
+	static std::atomic<uint64_t> s_g3_fallthrough_partial;
+	static std::atomic<uint64_t> s_g3_fallthrough_equal_addr;
+	static std::atomic<uint64_t> s_g3_fallthrough_req_compressed;
+	static std::atomic<uint64_t> s_g3_fallthrough_req_uncompressed;
+	static std::atomic<uint64_t> s_g3_fallthrough_cached_freed;
+	static std::atomic<uint64_t> s_g3_fallthrough_cached_kept;
 	struct GenLogEntry {
 		uint64_t generation = 0;
 		uint64_t begin      = 0;
